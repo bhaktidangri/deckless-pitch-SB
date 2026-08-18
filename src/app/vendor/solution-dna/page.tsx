@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, ArrowRight, CheckCircle2, Dna, Loader2, PartyPopper } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
@@ -16,12 +16,19 @@ import {
   type PublishApprovedVendorSolutionDnaResponse,
   type SavedCapability,
 } from "@/lib/api/vendor-dna";
-import { getStoredVendorId, setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
+import {
+  clearPendingSubmission,
+  getPendingSubmission,
+  getStoredVendorId,
+  setStoredVendorId,
+  setStoredVendorName,
+} from "@/lib/vendor-session";
 import {
   findPendingApprovalForCapability,
   respondToApprovalRequest,
   type ApprovalOptionId,
 } from "@/lib/api/vendor-dna-approvals";
+import { pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
 
 type Stage = "need-vendor-id" | "loading" | "error" | "reviewing" | "publishing" | "published";
 
@@ -38,12 +45,61 @@ export default function SolutionDnaPage() {
   const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
   const [publishResult, setPublishResult] = useState<PublishApprovedVendorSolutionDnaResponse | null>(null);
 
+  // True while this page is auto-polling for a Milestone 1 submission that
+  // hadn't finished yet when the vendor navigated here (see vendor-session's
+  // pending-submission handoff and vendor-poll.ts) — lets "need-vendor-id"
+  // show a live status instead of dead-ending on the manual paste field.
+  const [autoPolling, setAutoPolling] = useState(false);
+  const pollHandleRef = useRef<PollHandle | null>(null);
+
   useEffect(() => {
     const stored = getStoredVendorId();
-    if (stored) loadCapabilities(stored);
+    if (stored) {
+      loadCapabilities(stored);
+      return;
+    }
+
+    const pending = getPendingSubmission();
+    if (!pending || Date.now() >= pending.deadline) {
+      if (pending) clearPendingSubmission();
+      return;
+    }
+
+    setAutoPolling(true);
+    if (pending.kind === "new-vendor") {
+      pollHandleRef.current = pollForNewVendorId(
+        pending.companyName,
+        pending.afterIso,
+        pending.deadline,
+        (foundVendorId) => {
+          setStoredVendorId(foundVendorId);
+          loadCapabilities(foundVendorId);
+        },
+        () => {
+          clearPendingSubmission();
+          setAutoPolling(false);
+        }
+      );
+    } else {
+      pollHandleRef.current = pollForNewCapabilities(
+        pending.vendorId,
+        pending.baseline,
+        pending.deadline,
+        () => loadCapabilities(pending.vendorId),
+        () => {
+          clearPendingSubmission();
+          setAutoPolling(false);
+        }
+      );
+    }
+
+    return () => pollHandleRef.current?.cancel();
   }, []);
 
   async function loadCapabilities(id: string) {
+    pollHandleRef.current?.cancel();
+    setAutoPolling(false);
+    clearPendingSubmission();
     setStage("loading");
     setError(null);
     try {
@@ -124,13 +180,23 @@ export default function SolutionDnaPage() {
         />
         <Card className="max-w-md">
           <CardContent className="space-y-4 pt-5">
-            <p className="text-sm text-muted">
-              No vendor is loaded in this browser yet. If you already registered via{" "}
-              <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
-                the intake form
-              </Link>
-              , paste your vendor ID below to resume review.
-            </p>
+            {autoPolling ? (
+              <div className="flex items-start gap-2.5 rounded-lg border border-brand-200 bg-brand-50/50 px-3 py-2.5 text-sm text-foreground dark:border-brand-900 dark:bg-brand-950/20">
+                <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-brand-600 dark:text-brand-400" />
+                <span>
+                  Your Milestone 1 submission is still processing — this screen checks automatically and loads your
+                  draft the moment it&apos;s ready.
+                </span>
+              </div>
+            ) : (
+              <p className="text-sm text-muted">
+                No vendor is loaded in this browser yet. If you already registered via{" "}
+                <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
+                  the intake form
+                </Link>
+                , paste your vendor ID below to resume review.
+              </p>
+            )}
             <div>
               <Label htmlFor="vendorId">Vendor ID</Label>
               <Input
