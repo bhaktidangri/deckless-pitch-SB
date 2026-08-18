@@ -12,10 +12,18 @@ const roles = [
   { key: "admin", label: "Platform Admin", sub: "Deck-less Pitch", href: "/admin", icon: ShieldCheck },
 ] as const;
 
-export function RoleSwitcher({ current }: { current: "vendor" | "buyer" | "admin" }) {
+export function RoleSwitcher({
+  current,
+  vendorSubLabel,
+}: {
+  current: "vendor" | "buyer" | "admin";
+  /** Overrides the vendor row's demo "CloudNova" sub-label with the real registered vendor, once known. */
+  vendorSubLabel?: string;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const active = roles.find((r) => r.key === current)!;
+  const activeSub = current === "vendor" && vendorSubLabel ? vendorSubLabel : active.sub;
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -36,7 +44,7 @@ export function RoleSwitcher({ current }: { current: "vendor" | "buyer" | "admin
         </div>
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold text-foreground">{active.label}</p>
-          <p className="truncate text-xs text-muted">{active.sub}</p>
+          <p className="truncate text-xs text-muted">{activeSub}</p>
         </div>
         <ChevronsUpDown className="h-4 w-4 shrink-0 text-subtle" />
       </button>

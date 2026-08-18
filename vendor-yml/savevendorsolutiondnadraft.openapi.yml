@@ -1,0 +1,357 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Vendor Solution DNA Draft
+  version: 2.1.0
+  description: >-
+    Registers a vendor's Solution DNA draft from an intake submission. This is
+    the platform's vendor registration step: by default every call registers
+    a new vendor (and its own organization) from vendor.companyName, then
+    saves the extracted Capability and Evidence records under it. The
+    returned vendor.id only exists after registration — it is an output of
+    this call, not something the caller invents. Only pass vendor.id on the
+    request when this submission is a follow-up for a vendor that already
+    registered earlier (for example, a second document upload after the
+    initial website crawl) — in that case the existing vendor record is
+    reused instead of creating a duplicate.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-vendor-solution-dna-draft:
+    post:
+      operationId: saveVendorSolutionDnaDraft
+      summary: Register a vendor (if needed) and save extracted capabilities and evidence as its draft Solution DNA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - vendor
+                - capabilities
+              properties:
+                vendor:
+                  type: object
+                  required:
+                    - companyName
+                  description: >-
+                    The vendor this draft belongs to. Omit id entirely for a
+                    vendor's first submission — that is what registers them
+                    as a new vendor. Only include id for a returning vendor
+                    that already has a vendor record from an earlier
+                    submission.
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                      description: >-
+                        Only for a returning vendor already registered from
+                        an earlier submission. Leave this out to register a
+                        new vendor — do not invent a value here, it can only
+                        ever be one this API previously returned. If supplied
+                        but no such vendor exists, a new vendor is registered
+                        from companyName instead.
+                    companyName:
+                      type: string
+                      description: >-
+                        The vendor's legal or trading name, always supplied
+                        by the intake trigger. Used to register a new vendor.
+                        If id is also supplied and matches an existing
+                        vendor, this field is accepted but ignored (the
+                        vendor's name on file is not overwritten).
+                      example: "Example Vendor Inc."
+                    website:
+                      type: string
+                      description: The vendor's website, used only when registering a new vendor.
+                      example: "https://www.example-vendor.com/"
+                    industry:
+                      type: string
+                      description: The vendor's primary industry, used only when registering a new vendor.
+                      example: "Business software"
+                    description:
+                      type: string
+                      description: A short description of the vendor, used only when registering a new vendor.
+                      example: "Example description of what this vendor offers."
+                capabilities:
+                  type: array
+                  minItems: 1
+                  description: The extracted Capability records to save.
+                  example:
+                    - name: 24/7 incident response
+                      description: Round-the-clock incident response with a 15-minute SLA.
+                      category: service
+                      verificationStatus: verified
+                      sourceLocation: "Pricing sheet, page 3"
+                      tags:
+                        - support
+                      evidence:
+                        - sourceLabel: Example_Pricing_Sheet.pdf
+                          sourceType: pdf
+                          sourceText: "Enterprise plans include 24/7 incident response with a 15-minute SLA."
+                          sourceLocation: "Page 3"
+                          evidenceType: SLA
+                    - name: Third-party CRM integration
+                      description: Pre-built connector for syncing customer records with common CRM platforms.
+                      category: integration
+                      verificationStatus: modelled
+                      sourceLocation: "https://www.example-vendor.com/integrations"
+                      tags:
+                        - CRM
+                        - integration
+                      evidence:
+                        - sourceLabel: Example Vendor Integrations Page
+                          sourceType: website
+                          sourceText: "Connect your CRM in minutes with our native integration."
+                          sourceLocation: "https://www.example-vendor.com/integrations"
+                          evidenceType: integration listing
+                    - name: Onboarding and training sessions
+                      description: Guided onboarding and live training sessions included with every plan.
+                      category: service
+                      verificationStatus: unverified
+                      sourceLocation: "https://www.example-vendor.com/onboarding"
+                      tags:
+                        - onboarding
+                        - training
+                      evidence:
+                        - sourceLabel: Example Vendor Onboarding Page
+                          sourceType: website
+                          sourceText: "Every customer gets a dedicated onboarding specialist and live training."
+                          sourceLocation: "https://www.example-vendor.com/onboarding"
+                          evidenceType: service listing
+                  items:
+                    type: object
+                    required:
+                      - name
+                      - category
+                      - verificationStatus
+                    properties:
+                      name:
+                        type: string
+                        description: Short capability name or claim.
+                      description:
+                        type: string
+                        description: Fuller description of the capability.
+                      category:
+                        type: string
+                        enum:
+                          - product
+                          - service
+                          - solution
+                          - feature
+                          - integration
+                          - industry
+                          - consulting
+                          - use_case
+                          - constraint
+                        description: The CapabilityCategory this claim belongs to.
+                      verificationStatus:
+                        type: string
+                        enum:
+                          - verified
+                          - modelled
+                          - unverified
+                          - pending
+                        description: How confidently this claim is supported by its source.
+                      sourceId:
+                        type: string
+                        format: uuid
+                        description: The VendorSource this capability was extracted from, if any.
+                      sourceLocation:
+                        type: string
+                        description: Page, section, or URL fragment the claim was found at.
+                      tags:
+                        type: array
+                        items:
+                          type: string
+                        description: Optional free-form labels for the capability.
+                      evidence:
+                        type: array
+                        description: Verbatim source excerpts supporting this capability.
+                        items:
+                          type: object
+                          properties:
+                            sourceLabel:
+                              type: string
+                              description: Human-readable label for the source (e.g. page title, filename).
+                            sourceType:
+                              type: string
+                              enum:
+                                - website
+                                - pdf
+                                - ppt
+                                - doc
+                                - spreadsheet
+                                - manual
+                                - other
+                            sourceText:
+                              type: string
+                              description: Verbatim excerpt from the source, not a paraphrase.
+                            sourceLocation:
+                              type: string
+                              description: Page, section, or URL fragment the excerpt was found at.
+                            evidenceType:
+                              type: string
+                              description: Free-form classification of the evidence (e.g. "pricing", "SLA").
+      responses:
+        "200":
+          description: >-
+            The vendor was registered (or matched, for a returning vendor)
+            and the draft capabilities and their evidence were saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - vendor
+                  - savedCapabilityIds
+                  - capabilities
+                  - capabilityCount
+                  - evidenceCount
+                  - savedAt
+                properties:
+                  vendor:
+                    type: object
+                    required:
+                      - id
+                      - created
+                    description: The vendor this draft was saved under, now that registration has completed.
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        description: >-
+                          The vendor's id — either the one just registered, or
+                          the existing one reused because request.vendor.id
+                          matched a real vendor. Use this id for subsequent
+                          calls (e.g. 'Publish Approved Vendor Solution DNA',
+                          or a later follow-up submission's vendor.id).
+                      created:
+                        type: boolean
+                        description: True if a new vendor was registered for this request.
+                  savedCapabilityIds:
+                    type: array
+                    description: Bare ids of every capability just saved, in the same order as capabilities.
+                    items:
+                      type: string
+                      format: uuid
+                  capabilities:
+                    type: array
+                    description: >-
+                      The full saved record for every capability from this
+                      request — id, name, evidence, and current
+                      verificationStatus. This is the authoritative source
+                      for the vendor-facing DNA review screen and for the
+                      'Request Vendor DNA Approval' / 'Publish Approved
+                      Vendor Solution DNA' steps that follow: do not rely on
+                      savedCapabilityIds alone, since it has no name, status,
+                      or evidence to show the vendor.
+                    items:
+                      type: object
+                      required:
+                        - id
+                        - name
+                        - category
+                        - verificationStatus
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          description: The capabilityId to use in 'Request Vendor DNA Approval' and 'Publish Approved Vendor Solution DNA'.
+                        name:
+                          type: string
+                        description:
+                          type: string
+                        category:
+                          type: string
+                          enum:
+                            - product
+                            - service
+                            - solution
+                            - feature
+                            - integration
+                            - industry
+                            - consulting
+                            - use_case
+                            - constraint
+                        verificationStatus:
+                          type: string
+                          enum:
+                            - verified
+                            - modelled
+                            - unverified
+                            - pending
+                        sourceLocation:
+                          type: string
+                        tags:
+                          type: array
+                          items:
+                            type: string
+                        evidence:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                                format: uuid
+                              sourceLabel:
+                                type: string
+                              sourceType:
+                                type: string
+                                enum:
+                                  - website
+                                  - pdf
+                                  - ppt
+                                  - doc
+                                  - spreadsheet
+                                  - manual
+                                  - other
+                              sourceText:
+                                type: string
+                              sourceLocation:
+                                type: string
+                              evidenceType:
+                                type: string
+                  capabilityCount:
+                    type: integer
+                  evidenceCount:
+                    type: integer
+                  savedAt:
+                    type: string
+                    format: date-time
+        "400":
+          description: One or more required request fields were not supplied or were invalid.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The vendor could not be registered, or the draft could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

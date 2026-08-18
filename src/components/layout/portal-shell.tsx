@@ -21,12 +21,15 @@ export function PortalShell({
   sections,
   userName,
   userRole,
+  vendorSubLabel,
   children,
 }: {
   role: "vendor" | "buyer" | "admin";
   sections: NavSection[];
   userName: string;
   userRole: string;
+  /** Real registered vendor name, once known — overrides the role switcher's "CloudNova" demo placeholder. */
+  vendorSubLabel?: string;
   children: React.ReactNode;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -41,7 +44,7 @@ export function PortalShell({
       </div>
 
       <div className="px-3">
-        <RoleSwitcher current={role} />
+        <RoleSwitcher current={role} vendorSubLabel={vendorSubLabel} />
       </div>
 
       <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-5">

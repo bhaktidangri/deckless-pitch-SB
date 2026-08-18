@@ -1,0 +1,172 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Query Draft Vendor Capabilities
+  version: 1.0.0
+  description: >-
+    Retrieves the full draft Capability and Evidence records saved for a
+    vendor by 'Save Vendor Solution DNA Draft'. Call this first in the
+    review-and-publish milestone, before 'Request Vendor DNA Approval' —
+    that approval tool can only present one capability at a time (name,
+    evidence, current verificationStatus), and this is the only tool that
+    supplies that data. The prior milestone's save call only returns bare
+    capability ids, not enough to run approval from.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/query-draft-vendor-capabilities:
+    post:
+      operationId: queryDraftVendorCapabilities
+      summary: Fetch a vendor's draft capabilities and their evidence, for use before approval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - vendorId
+              properties:
+                vendorId:
+                  type: string
+                  format: uuid
+                  description: >-
+                    The vendor whose draft capabilities should be retrieved.
+                    This is the vendor.id returned by 'Save Vendor Solution
+                    DNA Draft'.
+                  example: "11111111-1111-1111-1111-111111111111"
+      responses:
+        "200":
+          description: The vendor's draft capabilities and evidence, ready for per-capability approval.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - vendorId
+                  - companyName
+                  - capabilityCount
+                  - capabilities
+                properties:
+                  vendorId:
+                    type: string
+                    format: uuid
+                  companyName:
+                    type: string
+                  capabilityCount:
+                    type: integer
+                  capabilities:
+                    type: array
+                    description: Every draft capability on file for this vendor, oldest first.
+                    items:
+                      type: object
+                      required:
+                        - id
+                        - name
+                        - category
+                        - verificationStatus
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          description: The capabilityId to use in 'Request Vendor DNA Approval' and 'Publish Approved Vendor Solution DNA'.
+                        name:
+                          type: string
+                        description:
+                          type: string
+                        category:
+                          type: string
+                          enum:
+                            - product
+                            - service
+                            - solution
+                            - feature
+                            - integration
+                            - industry
+                            - consulting
+                            - use_case
+                            - constraint
+                        verificationStatus:
+                          type: string
+                          enum:
+                            - verified
+                            - modelled
+                            - unverified
+                            - pending
+                          description: The capability's current status, before any vendor approval decision.
+                        sourceLocation:
+                          type: string
+                        tags:
+                          type: array
+                          items:
+                            type: string
+                        evidence:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                                format: uuid
+                              sourceLabel:
+                                type: string
+                              sourceType:
+                                type: string
+                                enum:
+                                  - website
+                                  - pdf
+                                  - ppt
+                                  - doc
+                                  - spreadsheet
+                                  - manual
+                                  - other
+                              sourceText:
+                                type: string
+                              sourceLocation:
+                                type: string
+                              evidenceType:
+                                type: string
+        "400":
+          description: vendorId was not supplied or was invalid.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No vendor exists for the supplied vendorId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The vendor's draft capabilities could not be retrieved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
