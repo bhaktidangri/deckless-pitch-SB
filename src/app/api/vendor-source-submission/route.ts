@@ -7,15 +7,14 @@ interface SubmissionBody {
   website?: string;
   industry?: string;
   description?: string;
+  directText?: string;
 }
 
 // Server-side trigger for vendor_source_submission (PRD Section 5.1). Kept
 // server-only because YOXA_DEPLOYMENT_SECRET must not reach the browser.
 // Composes the intake form's fields into the trigger_text the Yoxa
-// deployment actually accepts. The "Ingest Vendor Documents and Direct
-// Inputs" tool has been removed from the redeployed workflow — Milestone 1
-// is now crawl-only, so there's no direct-text/document channel to compose
-// here anymore; a website URL is the sole capability source.
+// deployment actually accepts (its only confirmed input channel — file
+// upload input 500s on Yoxa's side, so isn't sent here; see yoxa-trigger.ts).
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as SubmissionBody;
 
@@ -29,12 +28,12 @@ export async function POST(req: Request) {
   if (body.website) lines.push(`Website: ${body.website}`);
   if (body.industry) lines.push(`Primary industry: ${body.industry}`);
   if (body.description) lines.push(`Description: ${body.description}`);
-
-  if (!body.website?.trim()) {
-    return NextResponse.json({ error: "A website URL is required — crawling is the only intake source." }, { status: 400 });
-  }
+  if (body.directText) lines.push(`\nDirect capability input:\n${body.directText}`);
 
   const triggerText = lines.join("\n").trim();
+  if (!triggerText) {
+    return NextResponse.json({ error: "Provide at least a website, direct text, or company details." }, { status: 400 });
+  }
 
   try {
     const result = await triggerVendorSourceSubmission(triggerText);
