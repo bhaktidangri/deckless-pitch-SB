@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, ArrowRight, CheckCircle2, Dna, Loader2, PartyPopper } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, Dna, Loader2, MessageCircleQuestion, PartyPopper } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,12 +16,22 @@ import {
   type PublishApprovedVendorSolutionDnaResponse,
   type SavedCapability,
 } from "@/lib/api/vendor-dna";
-import { getStoredVendorId, setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
+import {
+  clearPendingSubmission,
+  getPendingSubmission,
+  getStoredVendorId,
+  getStoredWorkflowRunIds,
+  setStoredVendorId,
+  setStoredVendorName,
+} from "@/lib/vendor-session";
 import {
   findPendingApprovalForCapability,
+  findPendingApprovalsForWorkflowRuns,
   respondToApprovalRequest,
   type ApprovalOptionId,
+  type PendingApprovalRequest,
 } from "@/lib/api/vendor-dna-approvals";
+import { POLL_INTERVAL_MS, pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
 
 type Stage = "need-vendor-id" | "loading" | "error" | "reviewing" | "publishing" | "published";
 
@@ -38,12 +48,98 @@ export default function SolutionDnaPage() {
   const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
   const [publishResult, setPublishResult] = useState<PublishApprovedVendorSolutionDnaResponse | null>(null);
 
+  // Real HITL sync, not the capability-card piggyback below: workflow_run_id
+  // is reliably present on every approval-request row Yoxa's webhook ever
+  // produces (capability_id often isn't — see api/webhooks/yoxa-hitl and
+  // vendor-dna-approvals.ts), so this is scoped to every run this browser
+  // has actually triggered and answers go straight back through respond/.
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApprovalRequest[]>([]);
+  const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
+
+  const refreshPendingApprovals = useCallback(async () => {
+    const runIds = getStoredWorkflowRunIds();
+    if (runIds.length === 0) {
+      setPendingApprovals([]);
+      return;
+    }
+    const rows = await findPendingApprovalsForWorkflowRuns(runIds);
+    setPendingApprovals(rows);
+  }, []);
+
+  useEffect(() => {
+    refreshPendingApprovals();
+    const interval = setInterval(refreshPendingApprovals, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [refreshPendingApprovals]);
+
+  async function handleAnswerPendingApproval(requestId: string, optionId: ApprovalOptionId) {
+    setRespondingRequestId(requestId);
+    try {
+      await respondToApprovalRequest(requestId, optionId);
+    } finally {
+      setRespondingRequestId(null);
+      // Remove immediately regardless of yoxaNotified — resolve-vendor-dna-
+      // approval-request already marked it resolved in Supabase either way,
+      // so leaving it listed as pending would be its own sync bug.
+      setPendingApprovals((rows) => rows.filter((r) => r.requestId !== requestId));
+    }
+  }
+
+  // True while this page is auto-polling for a Milestone 1 submission that
+  // hadn't finished yet when the vendor navigated here (see vendor-session's
+  // pending-submission handoff and vendor-poll.ts) — lets "need-vendor-id"
+  // show a live status instead of dead-ending on the manual paste field.
+  const [autoPolling, setAutoPolling] = useState(false);
+  const pollHandleRef = useRef<PollHandle | null>(null);
+
   useEffect(() => {
     const stored = getStoredVendorId();
-    if (stored) loadCapabilities(stored);
+    if (stored) {
+      loadCapabilities(stored);
+      return;
+    }
+
+    const pending = getPendingSubmission();
+    if (!pending || Date.now() >= pending.deadline) {
+      if (pending) clearPendingSubmission();
+      return;
+    }
+
+    setAutoPolling(true);
+    if (pending.kind === "new-vendor") {
+      pollHandleRef.current = pollForNewVendorId(
+        pending.companyName,
+        pending.afterIso,
+        pending.deadline,
+        (foundVendorId) => {
+          setStoredVendorId(foundVendorId);
+          loadCapabilities(foundVendorId);
+        },
+        () => {
+          clearPendingSubmission();
+          setAutoPolling(false);
+        }
+      );
+    } else {
+      pollHandleRef.current = pollForNewCapabilities(
+        pending.vendorId,
+        pending.baseline,
+        pending.deadline,
+        () => loadCapabilities(pending.vendorId),
+        () => {
+          clearPendingSubmission();
+          setAutoPolling(false);
+        }
+      );
+    }
+
+    return () => pollHandleRef.current?.cancel();
   }, []);
 
   async function loadCapabilities(id: string) {
+    pollHandleRef.current?.cancel();
+    setAutoPolling(false);
+    clearPendingSubmission();
     setStage("loading");
     setError(null);
     try {
@@ -122,15 +218,32 @@ export default function SolutionDnaPage() {
           title="Solution DNA review"
           description="Once your sources are submitted and a vendor is registered, this screen loads your draft capabilities for review."
         />
+        {pendingApprovals.length > 0 && (
+          <PendingApprovalsPanel
+            requests={pendingApprovals}
+            respondingRequestId={respondingRequestId}
+            onAnswer={handleAnswerPendingApproval}
+          />
+        )}
         <Card className="max-w-md">
           <CardContent className="space-y-4 pt-5">
-            <p className="text-sm text-muted">
-              No vendor is loaded in this browser yet. If you already registered via{" "}
-              <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
-                the intake form
-              </Link>
-              , paste your vendor ID below to resume review.
-            </p>
+            {autoPolling ? (
+              <div className="flex items-start gap-2.5 rounded-lg border border-brand-200 bg-brand-50/50 px-3 py-2.5 text-sm text-foreground dark:border-brand-900 dark:bg-brand-950/20">
+                <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-brand-600 dark:text-brand-400" />
+                <span>
+                  Your Milestone 1 submission is still processing — this screen checks automatically and loads your
+                  draft the moment it&apos;s ready.
+                </span>
+              </div>
+            ) : (
+              <p className="text-sm text-muted">
+                No vendor is loaded in this browser yet. If you already registered via{" "}
+                <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
+                  the intake form
+                </Link>
+                , paste your vendor ID below to resume review.
+              </p>
+            )}
             <div>
               <Label htmlFor="vendorId">Vendor ID</Label>
               <Input
@@ -213,6 +326,14 @@ export default function SolutionDnaPage() {
         description="One capability at a time — approve, revise, reject, or leave pending. Publish once you're ready."
       />
 
+      {pendingApprovals.length > 0 && (
+        <PendingApprovalsPanel
+          requests={pendingApprovals}
+          respondingRequestId={respondingRequestId}
+          onAnswer={handleAnswerPendingApproval}
+        />
+      )}
+
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <StatPill icon={Dna} label="Total" value={capabilities.length} />
         <StatPill icon={CheckCircle2} label="Decided" value={decisions.length} tone="verified" />
@@ -292,5 +413,59 @@ function StatPill({
     <div className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium ${toneClass[tone]}`}>
       <Icon className="h-3.5 w-3.5" /> {value} {label}
     </div>
+  );
+}
+
+// Direct answers to Yoxa's paused "Request Vendor DNA Approval" HITL calls —
+// separate from the capability review loop above, which only piggybacks a
+// notification when a card's capability_id happens to match one of these.
+// These are matched by workflow_run_id instead (see
+// findPendingApprovalsForWorkflowRuns), so they show up reliably even when
+// capability_id is null or points at a capability not in the current draft.
+function PendingApprovalsPanel({
+  requests,
+  respondingRequestId,
+  onAnswer,
+}: {
+  requests: PendingApprovalRequest[];
+  respondingRequestId: string | null;
+  onAnswer: (requestId: string, optionId: ApprovalOptionId) => void;
+}) {
+  return (
+    <Card className="mb-6 border-brand-200 bg-brand-50/50 dark:border-brand-900 dark:bg-brand-950/20">
+      <CardContent className="space-y-4 pt-5">
+        <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+          <MessageCircleQuestion className="h-4 w-4 text-brand-600 dark:text-brand-400" />
+          Your Vendor Intelligence Agent is waiting on {requests.length} question{requests.length === 1 ? "" : "s"}
+        </div>
+        {requests.map((request) => {
+          const busy = respondingRequestId === request.requestId;
+          return (
+            <div key={request.requestId} className="rounded-lg border border-border bg-surface p-4">
+              {request.title && <p className="text-sm font-medium text-foreground">{request.title}</p>}
+              {request.description && <p className="mt-1 text-sm text-muted">{request.description}</p>}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {request.options.length > 0 ? (
+                  request.options.map((option) => (
+                    <Button
+                      key={option.option_id}
+                      size="sm"
+                      variant={option.decision === "rejected" ? "outline" : "secondary"}
+                      disabled={busy}
+                      loading={busy}
+                      onClick={() => onAnswer(request.requestId, option.option_id as ApprovalOptionId)}
+                    >
+                      {option.title}
+                    </Button>
+                  ))
+                ) : (
+                  <p className="text-xs text-escalated">No response options were captured for this request.</p>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
   );
 }

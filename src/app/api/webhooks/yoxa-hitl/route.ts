@@ -37,7 +37,26 @@ export async function POST(req: Request) {
     | string
     | undefined;
   const options = (body.approval_options ?? body.options ?? payload.approval_options) as unknown;
-  const responseUrl = (body.response_url ?? body.responseUrl ?? body.respond_url ?? body.callback_url) as
+  // Previously only checked top-level fields — every stored row had a null
+  // response_url as a result, so a vendor's decision could never actually be
+  // forwarded back to Yoxa to resume the paused run. Now also falls back to
+  // request_payload, matching the pattern already used for title/description/
+  // options above.
+  const responseUrl = (body.response_url ??
+    body.responseUrl ??
+    body.respond_url ??
+    body.callback_url ??
+    payload.response_url ??
+    payload.responseUrl ??
+    payload.respond_url ??
+    payload.callback_url) as string | undefined;
+  // capability_id isn't part of the "Request Vendor DNA Approval" tool's
+  // observed args (request_title/request_description/options only), so this
+  // is almost always going to end up null — kept as best-effort in case a
+  // future payload shape includes it. workflow_run_id is the reliable
+  // correlation key (see findPendingApprovalsForWorkflowRuns) and was
+  // previously silently dropped here instead of being forwarded at all.
+  const capabilityId = (body.capability_id ?? body.capabilityId ?? payload.capability_id ?? payload.capabilityId) as
     | string
     | undefined;
   const deploymentId = (body.deployment_id ?? body.deploymentId) as string | undefined;
@@ -55,7 +74,21 @@ export async function POST(req: Request) {
   const res = await fetch(`${functionsUrl}/functions/v1/save-vendor-dna-approval-request`, {
     method: "POST",
     headers: { "Content-Type": "application/json", apikey: anonKey, Authorization: `Bearer ${anonKey}` },
-    body: JSON.stringify({ requestId, workflowRunId, deploymentId, title, description, options, responseUrl }),
+    body: JSON.stringify({
+      requestId,
+      workflowRunId,
+      deploymentId,
+      capabilityId,
+      title,
+      description,
+      options,
+      responseUrl,
+      // Raw body kept for forensics — the real Yoxa payload shape has never
+      // been directly observed, only inferred from operator-log rendering.
+      // If response_url/capability_id still show up null on new rows after
+      // this change, inspect raw_payload to find the actual field names.
+      rawPayload: body,
+    }),
   });
   const data = await res.json().catch(() => ({}) as Record<string, unknown>);
   return NextResponse.json(data, { status: res.status });
