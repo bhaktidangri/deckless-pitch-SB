@@ -1,0 +1,138 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Run Solution Scenarios
+  version: 1.0.0
+  description: >-
+    Finds or creates the buyer's draft SolutionModel for a vendor and saves
+    its baseline RoiProjection. This computes and persists the first, current
+    ROI figures before any what-if scenario is explored.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-solution-baseline-workspace:
+    post:
+      operationId: saveSolutionBaselineWorkspace
+      summary: Save a buyer's baseline ROI projection for a vendor's draft solution model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - vendorId
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                vendorId:
+                  type: string
+                  format: uuid
+                currentAnnualCost:
+                  type: number
+                projectedAnnualCost:
+                  type: number
+                savingsPercent:
+                  type: number
+                paybackMonths:
+                  type: number
+                threeYearSavings:
+                  type: number
+                chart:
+                  type: object
+                  description: Free-form year-by-year chart payload.
+                assumptions:
+                  type: object
+                  description: >-
+                    Free-form assumptions payload. When supplied, replaces the
+                    solution model's stored assumptions.
+      responses:
+        "200":
+          description: The draft solution model's baseline ROI projection was saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - solutionModelId
+                  - buyerId
+                  - vendorId
+                  - roiProjectionId
+                properties:
+                  solutionModelId:
+                    type: string
+                    format: uuid
+                    description: >-
+                      The buyer/vendor draft SolutionModel id. Use this for
+                      'Save Updated Scenario Projection'.
+                  buyerId:
+                    type: string
+                    format: uuid
+                  vendorId:
+                    type: string
+                    format: uuid
+                  roiProjectionId:
+                    type: string
+                    format: uuid
+                  currentAnnualCost:
+                    type:
+                      - number
+                      - "null"
+                  projectedAnnualCost:
+                    type:
+                      - number
+                      - "null"
+                  savingsPercent:
+                    type:
+                      - number
+                      - "null"
+                  paybackMonths:
+                    type:
+                      - number
+                      - "null"
+                  threeYearSavings:
+                    type:
+                      - number
+                      - "null"
+                  chart:
+                    type:
+                      - object
+                      - "null"
+                    description: Free-form year-by-year chart payload.
+        "400":
+          description: The request body was not valid JSON, or buyerId/vendorId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The baseline ROI projection could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

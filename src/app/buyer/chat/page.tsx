@@ -1,21 +1,27 @@
+"use client";
+
 import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ChatPanel } from "@/components/shared/chat-panel";
-import { conversation, primaryVendor } from "@/lib/dummy-data";
+import { LiveChatPanel } from "@/components/shared/live-chat-panel";
+import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredCompanyName, getStoredSelectedVendorName } from "@/lib/buyer-session";
 
 export default function BuyerChatPage() {
+  const buyerId = getStoredBuyerId();
+  const vendorName = getStoredSelectedVendorName();
+  const companyName = getStoredCompanyName();
+
   return (
     <div>
       <PageHeader
-        eyebrow="Agentic Chat"
-        title="Ask CloudNova's AI"
-        description="Grounded in CloudNova's Solution DNA and your Client Reality Profile — never a generic chatbot."
+        eyebrow="Grounded Exploration"
+        title={vendorName ? `Ask ${vendorName}'s AI` : "Ask AI"}
+        description="Grounded in your selected vendor's Solution DNA and your Client Reality Profile — never a generic chatbot."
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
         <Card className="h-[640px] lg:col-span-2">
-          <ChatPanel initialMessages={conversation} />
+          <LiveChatPanel buyerId={buyerId} workflowRunIds={getStoredBuyerWorkflowRunIds()} nodeKey="query_workspace_evidence" />
         </Card>
 
         <div className="space-y-4">
@@ -26,9 +32,9 @@ export default function BuyerChatPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-2.5 pt-2">
-              <ContextRow icon={Database} label={`${primaryVendor.name} Solution DNA`} detail="6 sources, 10 capabilities" />
-              <ContextRow icon={ShoppingBag} label="Client Reality Profile" detail="Meridian Retail Group" />
-              <ContextRow icon={FileCheck2} label="Solution Model v3" detail="Updated today" />
+              <ContextRow icon={Database} label={`${vendorName ?? "Vendor"} Solution DNA`} detail="Published capabilities + evidence" />
+              <ContextRow icon={ShoppingBag} label="Client Reality Profile" detail={companyName ?? "Your company"} />
+              <ContextRow icon={FileCheck2} label="Current solution model" detail="Latest ROI projection" />
             </CardContent>
           </Card>
 
@@ -37,7 +43,7 @@ export default function BuyerChatPage() {
               <p className="text-sm font-semibold text-foreground">How this stays honest</p>
               <p className="mt-2 text-sm text-muted">
                 Every answer is checked against verified evidence before it reaches you. If nothing supports a
-                confident answer, the AI says so — and routes it to a CloudNova specialist instead of guessing.
+                confident answer, the AI says so — and routes it to a specialist instead of guessing.
               </p>
             </CardContent>
           </Card>

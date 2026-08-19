@@ -1,27 +1,63 @@
 "use client";
 
-import { useState } from "react";
-import { Plus } from "lucide-react";
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { buttonVariants } from "@/components/ui/button";
 import { RequirementCard } from "@/components/shared/requirement-card";
-import { clientRealityProfile, requirements as initialRequirements } from "@/lib/dummy-data";
+import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
+import { getStoredBuyerId } from "@/lib/buyer-session";
+import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
 import type { Requirement } from "@/lib/types";
-import { formatCurrencyINR, formatNumber } from "@/lib/utils";
 
+// Read-only, matching the workflow exactly — Capture Initial Requirement
+// Summary runs once on submission with no later "append a requirement"
+// tool, so there's nothing for a manual-add box here to actually persist.
 export default function RequirementsPage() {
-  const [requirements, setRequirements] = useState<Requirement[]>(initialRequirements);
-  const [newReq, setNewReq] = useState("");
+  const buyerId = getStoredBuyerId();
+  const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
+  const [profile, setProfile] = useState<ClientRealityProfileRow | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  function addRequirement() {
-    if (!newReq.trim()) return;
-    setRequirements((r) => [
-      { id: `req-local-${Date.now()}`, text: newReq.trim(), priority: "medium", status: "captured", source: "buyer_input" },
-      ...r,
-    ]);
-    setNewReq("");
+  useEffect(() => {
+    if (!buyerId) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      try {
+        const [reqs, p] = await Promise.all([getBuyerRequirements(buyerId!), getClientRealityProfile(buyerId!)]);
+        if (!cancelled) {
+          setRequirements(reqs);
+          setProfile(p);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    const interval = setInterval(load, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [buyerId]);
+
+  if (!buyerId) {
+    return (
+      <div>
+        <PageHeader eyebrow="Discovery" title="Requirements" description="Start a discovery submission first." />
+        <Card className="max-w-md p-6 text-center">
+          <p className="text-sm text-muted">No buyer session found in this browser yet.</p>
+          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
+            Go to Discover
+          </Link>
+        </Card>
+      </div>
+    );
   }
 
   return (
@@ -29,47 +65,48 @@ export default function RequirementsPage() {
       <PageHeader
         eyebrow="Discovery"
         title="Requirements"
-        description="Everything captured from your discovery conversation and current business context."
+        description="Everything captured from your submission, atomic so each one matches independently against vendor capabilities."
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
-        <div className="space-y-4 lg:col-span-2">
-          <Card>
-            <CardContent className="flex gap-2 py-4">
-              <Input placeholder="Add a requirement manually..." value={newReq} onChange={(e) => setNewReq(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addRequirement()} />
-              <Button onClick={addRequirement}>
-                <Plus className="h-4 w-4" /> Add
-              </Button>
-            </CardContent>
-          </Card>
-
-          <div className="space-y-2.5">
-            {requirements.map((r) => (
-              <RequirementCard key={r.id} requirement={r} />
-            ))}
-          </div>
+        <div className="space-y-2.5 lg:col-span-2">
+          {loading && requirements.length === 0 ? (
+            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
+          ) : requirements.length === 0 ? (
+            <Card className="p-6 text-center text-sm text-muted">No requirements captured yet.</Card>
+          ) : (
+            requirements.map((r) => (
+              <RequirementCard
+                key={r.id}
+                requirement={{ id: r.id, text: r.text, priority: r.priority, status: r.status, source: r.source } satisfies Requirement}
+              />
+            ))
+          )}
         </div>
 
         <div className="space-y-6">
           <Card>
-            <CardHeader>
-              <CardTitle>Client Reality Profile</CardTitle>
-              <CardDescription>Auto-built from discovery</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4 pt-2">
-              <Row label="Current cost" value={formatCurrencyINR(clientRealityProfile.currentCostAnnual)} />
-              <Row label="Users" value={formatNumber(clientRealityProfile.users)} />
-              <Row label="Timeline" value={`${clientRealityProfile.timelineMonths} months`} />
-              <div>
-                <p className="mb-1.5 text-xs font-medium text-subtle">Current technology</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {clientRealityProfile.currentTechnology.map((t) => (
-                    <span key={t} className="rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs text-muted">
-                      {t}
-                    </span>
-                  ))}
-                </div>
-              </div>
+            <CardContent className="space-y-4 pt-5">
+              <p className="text-sm font-semibold text-foreground">Client Reality Profile</p>
+              {!profile ? (
+                <p className="text-sm text-subtle">Not built yet — this fills in once you&apos;ve selected a vendor.</p>
+              ) : (
+                <>
+                  {profile.currentCostAnnual !== null && <Row label="Current cost" value={formatCurrencyINR(profile.currentCostAnnual)} />}
+                  {profile.users !== null && <Row label="Users" value={formatNumber(profile.users)} />}
+                  {profile.timelineMonths !== null && <Row label="Timeline" value={`${profile.timelineMonths} months`} />}
+                  {profile.currentTechnology.length > 0 && (
+                    <div>
+                      <p className="mb-1.5 text-xs font-medium text-subtle">Current technology</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {profile.currentTechnology.map((t) => (
+                          <span key={t} className="rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs text-muted">{t}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </CardContent>
           </Card>
         </div>

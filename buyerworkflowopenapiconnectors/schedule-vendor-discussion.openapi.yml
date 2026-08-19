@@ -1,0 +1,122 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Schedule Vendor Discussion
+  version: 1.0.0
+  description: >-
+    Creates a MeetingRequest for a buyer and vendor to resolve outstanding
+    CapabilityFrontierItems, and moves those items to vendor_review.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/schedule-vendor-discussion:
+    post:
+      operationId: scheduleVendorDiscussion
+      summary: Request a vendor discussion to resolve open frontier items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - vendorId
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                vendorId:
+                  type: string
+                  format: uuid
+                frontierItemIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: >-
+                    CapabilityFrontierItem ids to move to vendor_review as
+                    part of this request.
+                proposedDate:
+                  type: string
+                  format: date-time
+                expert:
+                  type: string
+                  description: Which type of vendor expert this discussion needs.
+                contextPackage:
+                  type: object
+                  description: >-
+                    Free-form context payload for the discussion. Defaults to
+                    { frontierItemIds } when omitted.
+      responses:
+        "200":
+          description: The vendor discussion was requested.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - meetingRequestId
+                  - buyerId
+                  - vendorId
+                  - status
+                  - unresolvedCount
+                properties:
+                  meetingRequestId:
+                    type: string
+                    format: uuid
+                  buyerId:
+                    type: string
+                    format: uuid
+                  vendorId:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [requested, scheduled, completed, cancelled]
+                  proposedDate:
+                    type:
+                      - string
+                      - "null"
+                    format: date-time
+                  expert:
+                    type:
+                      - string
+                      - "null"
+                  unresolvedCount:
+                    type: integer
+        "400":
+          description: The request body was not valid JSON, or buyerId/vendorId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The vendor discussion could not be requested.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

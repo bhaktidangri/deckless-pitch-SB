@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Create Capability Frontier Item
+  version: 1.0.0
+  description: >-
+    Records a buyer question that fell outside the vendor's grounded
+    knowledge base as an open CapabilityFrontierItem, for vendor review.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/create-capability-frontier-item:
+    post:
+      operationId: createCapabilityFrontierItem
+      summary: Create an open capability frontier item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - vendorId
+                - question
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                vendorId:
+                  type: string
+                  format: uuid
+                question:
+                  type: string
+                  description: The buyer's ungrounded question, verbatim.
+                solutionModelId:
+                  type: string
+                  format: uuid
+                requirement:
+                  type: string
+                  description: The buyer requirement this question relates to, if any.
+                context:
+                  type: string
+                evidenceChecked:
+                  type: array
+                  items:
+                    type: string
+                  description: Labels of the evidence sources that were checked and found insufficient.
+                reasonUnresolved:
+                  type: string
+                recommendedExpert:
+                  type: string
+                  description: Which type of vendor expert should answer this.
+      responses:
+        "200":
+          description: The capability frontier item was created with status open.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - frontierItemId
+                  - buyerId
+                  - vendorId
+                  - question
+                  - status
+                properties:
+                  frontierItemId:
+                    type: string
+                    format: uuid
+                  buyerId:
+                    type: string
+                    format: uuid
+                  vendorId:
+                    type: string
+                    format: uuid
+                  question:
+                    type: string
+                  status:
+                    type: string
+                    enum: [open, vendor_review, vendor_answered, resolved, closed]
+                  reasonUnresolved:
+                    type:
+                      - string
+                      - "null"
+        "400":
+          description: The request body was not valid JSON, or buyerId/vendorId/question was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The capability frontier item could not be created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

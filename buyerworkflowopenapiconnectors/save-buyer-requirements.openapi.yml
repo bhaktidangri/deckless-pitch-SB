@@ -1,0 +1,166 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Capture Initial Requirement Summary
+  version: 1.0.0
+  description: >-
+    Registers a buyer (by companyName, or reuses an existing buyer/organization
+    by buyerId) and saves the buyer's initial Requirement records parsed from
+    their intake submission.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-buyer-requirements:
+    post:
+      operationId: saveBuyerRequirements
+      summary: Register a buyer (if needed) and save initial requirements
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >-
+                Either companyName or buyerId must be supplied. Omit buyerId
+                for a buyer's first submission -- that registers a new buyer.
+                Only supply buyerId for a returning buyer that already has a
+                buyer record from an earlier submission.
+              properties:
+                companyName:
+                  type: string
+                  description: >-
+                    The buyer's company name. Used to find or register the
+                    buyer when buyerId is not supplied.
+                  example: "Meridian Retail Group"
+                buyerId:
+                  type: string
+                  format: uuid
+                  description: >-
+                    An existing buyer's id, for a returning buyer only. Do not
+                    invent a value here; it can only ever be one this API
+                    previously returned.
+                industry:
+                  type: string
+                  description: The buyer's industry, used only when registering a new buyer.
+                companySize:
+                  type: integer
+                  description: The buyer's company size, used only when registering a new buyer.
+                contactName:
+                  type: string
+                  description: The submitting contact's name, used only when registering a new buyer.
+                contactRole:
+                  type: string
+                  description: The submitting contact's role, used only when registering a new buyer.
+                requirements:
+                  type: array
+                  description: The Requirement records to save for this buyer.
+                  example:
+                    - text: "Redesign the customer-facing SaaS product interface"
+                      priority: high
+                      source: buyer_input
+                  items:
+                    type: object
+                    required:
+                      - text
+                    properties:
+                      text:
+                        type: string
+                        description: The requirement text. Entries with empty text are skipped.
+                      priority:
+                        type: string
+                        enum: [high, medium, low]
+                        description: Defaults to medium if omitted or invalid.
+                      source:
+                        type: string
+                        enum: [buyer_input, ai_inferred]
+                        description: Defaults to buyer_input if omitted or invalid.
+      responses:
+        "200":
+          description: The buyer was registered (or matched) and the requirements were saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - buyerId
+                  - companyName
+                  - savedRequirementIds
+                  - requirements
+                properties:
+                  buyerId:
+                    type: string
+                    format: uuid
+                    description: Use this id for subsequent calls in the workflow.
+                  companyName:
+                    type:
+                      - string
+                      - "null"
+                  savedRequirementIds:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                  requirements:
+                    type: array
+                    description: The full saved record for every requirement from this request.
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        requirement_text:
+                          type: string
+                        priority:
+                          type: string
+                          enum: [high, medium, low]
+                        source:
+                          type: string
+                          enum: [buyer_input, ai_inferred]
+                        status:
+                          type: string
+                          enum: [captured, clarifying, confirmed]
+        "400":
+          description: The request body was not valid JSON, or neither companyName nor buyerId was supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No buyer exists for the supplied buyerId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The buyer could not be registered, or the requirements could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

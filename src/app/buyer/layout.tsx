@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   LayoutDashboard,
   Search,
@@ -11,6 +12,7 @@ import {
   CalendarClock,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+import { getStoredCompanyName } from "@/lib/buyer-session";
 
 const sections: NavSection[] = [
   {
@@ -39,8 +41,14 @@ const sections: NavSection[] = [
 ];
 
 export default function BuyerLayout({ children }: { children: React.ReactNode }) {
+  // Mirrors vendor/layout.tsx: no real auth session exists yet, so this
+  // reflects whichever buyer actually submitted a discovery form in this
+  // browser (src/lib/buyer-session.ts) instead of a static demo placeholder.
+  const [companyName, setCompanyName] = useState<string | null>(null);
+  useEffect(() => setCompanyName(getStoredCompanyName()), []);
+
   return (
-    <PortalShell role="buyer" sections={sections} userName="Priya Sharma" userRole="VP of Technology">
+    <PortalShell role="buyer" sections={sections} userName={companyName ?? "Not started yet"} userRole="Buyer">
       {children}
     </PortalShell>
   );

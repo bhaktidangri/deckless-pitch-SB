@@ -1,0 +1,155 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Client Reality Profile
+  version: 1.0.0
+  description: >-
+    Creates or updates the buyer's ClientRealityProfile. Only fields supplied
+    on the request are changed; omitted fields keep their current saved value.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-client-reality-profile:
+    post:
+      operationId: saveClientRealityProfile
+      summary: Create or update a buyer's Client Reality Profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                  description: The buyer this profile belongs to.
+                currentTechnology:
+                  type: array
+                  items:
+                    type: string
+                currentCostAnnual:
+                  type: number
+                users:
+                  type: integer
+                processes:
+                  type: array
+                  items:
+                    type: string
+                painPoints:
+                  type: array
+                  items:
+                    type: string
+                goals:
+                  type: array
+                  items:
+                    type: string
+                constraints:
+                  type: array
+                  items:
+                    type: string
+                timelineMonths:
+                  type: integer
+                dataSources:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: The Client Reality Profile was saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - profileId
+                  - buyerId
+                properties:
+                  profileId:
+                    type: string
+                    format: uuid
+                  buyerId:
+                    type: string
+                    format: uuid
+                  currentTechnology:
+                    type: array
+                    items:
+                      type: string
+                  currentCostAnnual:
+                    type:
+                      - number
+                      - "null"
+                  users:
+                    type:
+                      - integer
+                      - "null"
+                  processes:
+                    type: array
+                    items:
+                      type: string
+                  painPoints:
+                    type: array
+                    items:
+                      type: string
+                  goals:
+                    type: array
+                    items:
+                      type: string
+                  constraints:
+                    type: array
+                    items:
+                      type: string
+                  timelineMonths:
+                    type:
+                      - integer
+                      - "null"
+                  dataSources:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: The request body was not valid JSON, or buyerId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No buyer exists for the supplied buyerId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The Client Reality Profile could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

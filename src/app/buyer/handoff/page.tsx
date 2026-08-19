@@ -1,111 +1,163 @@
 "use client";
 
-import { useState } from "react";
-import { CalendarCheck2, CheckCircle2, Clock, UserCheck, Video } from "lucide-react";
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { CalendarCheck2, CheckCircle2, Loader2, MessageSquareText } from "lucide-react";
 import { motion } from "motion/react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { buttonVariants } from "@/components/ui/button";
+import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { FrontierCard } from "@/components/shared/frontier-card";
-import { capabilityFrontierItems, primaryVendor } from "@/lib/dummy-data";
+import { getCapabilityFrontierItems, getMeetingRequests, type CapabilityFrontierRow, type MeetingRequestRow } from "@/lib/api/buyer-lookup";
+import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredSelectedVendorName } from "@/lib/buyer-session";
+import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
+import type { CapabilityFrontierItem } from "@/lib/types";
 
-const slots = [
-  { id: "s1", label: "Wed, Aug 19", time: "10:00 AM IST" },
-  { id: "s2", label: "Wed, Aug 19", time: "3:30 PM IST" },
-  { id: "s3", label: "Thu, Aug 20", time: "11:00 AM IST" },
-  { id: "s4", label: "Fri, Aug 21", time: "2:00 PM IST" },
-];
+function toFrontierItem(f: CapabilityFrontierRow, buyerName: string, vendorName: string): CapabilityFrontierItem {
+  return {
+    id: f.id,
+    buyerId: f.buyerId,
+    buyerName,
+    vendorId: f.vendorId,
+    vendorName,
+    question: f.question,
+    requirement: f.requirement ?? "",
+    context: f.context ?? "",
+    evidenceChecked: f.evidenceChecked,
+    reasonUnresolved: f.reasonUnresolved ?? "",
+    status: f.status,
+    recommendedExpert: f.recommendedExpert ?? "Specialist",
+    createdAt: f.createdAt,
+  };
+}
+
+const statusConfig: Record<MeetingRequestRow["status"], { label: string; variant: "escalated" | "modelled" | "verified" | "outline" }> = {
+  requested: { label: "Requested", variant: "escalated" },
+  scheduled: { label: "Scheduled", variant: "modelled" },
+  completed: { label: "Completed", variant: "verified" },
+  cancelled: { label: "Cancelled", variant: "outline" },
+};
 
 export default function HandoffPage() {
-  const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
-  const [confirmed, setConfirmed] = useState(false);
+  const buyerId = getStoredBuyerId();
+  const vendorName = getStoredSelectedVendorName() ?? "your vendor";
+  const workflowRunIds = getStoredBuyerWorkflowRunIds();
 
-  const openItems = capabilityFrontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
+  const [items, setItems] = useState<CapabilityFrontierRow[]>([]);
+  const [meetings, setMeetings] = useState<MeetingRequestRow[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const handoffApproval = usePendingApproval("approve_human_handoff", { buyerId, workflowRunIds, enabled: !!buyerId });
+
+  async function refresh() {
+    if (!buyerId) {
+      setLoading(false);
+      return;
+    }
+    try {
+      const [f, m] = await Promise.all([getCapabilityFrontierItems(buyerId), getMeetingRequests(buyerId)]);
+      setItems(f);
+      setMeetings(m);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    const interval = setInterval(refresh, 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buyerId]);
+
+  if (!buyerId) {
+    return (
+      <div>
+        <PageHeader eyebrow="Human Handoff" title="Ready for expert discussion?" description="Start a discovery submission first." />
+        <Card className="max-w-md p-6 text-center">
+          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }))}>
+            Go to Discover
+          </Link>
+        </Card>
+      </div>
+    );
+  }
+
+  const openItems = items.filter((f) => f.status !== "resolved" && f.status !== "closed");
 
   return (
     <div>
       <PageHeader
         eyebrow="Human Handoff"
         title="Ready for expert discussion?"
-        description={`${openItems.length} question${openItems.length === 1 ? "" : "s"} require ${primaryVendor.name} confirmation before closure.`}
+        description={`${openItems.length} question${openItems.length === 1 ? "" : "s"} require ${vendorName} confirmation before closure.`}
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
-          {openItems.map((item) => (
-            <FrontierCard key={item.id} item={item} />
-          ))}
+          {loading ? (
+            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
+          ) : openItems.length === 0 ? (
+            <Card className="p-6 text-center text-sm text-muted">No open questions right now.</Card>
+          ) : (
+            openItems.map((item) => <FrontierCard key={item.id} item={toFrontierItem(item, "You", vendorName)} />)
+          )}
         </div>
 
         <Card className="h-fit lg:sticky lg:top-24">
-          {!confirmed ? (
+          {handoffApproval.approval ? (
             <>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <CalendarCheck2 className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Schedule with Solutions Team
+                  <CalendarCheck2 className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Live discussion?
                 </CardTitle>
-                <CardDescription>Your context package is prepared automatically — no need to re-explain anything.</CardDescription>
+                {handoffApproval.approval.description && <CardDescription>{handoffApproval.approval.description}</CardDescription>}
               </CardHeader>
               <CardContent className="pt-2">
-                <div className="mb-4 space-y-2">
-                  <ContextItem icon={UserCheck} text="Recommended: Solutions Architect" />
-                  <ContextItem icon={Video} text="30-minute video call" />
-                </div>
-                <p className="mb-2 text-xs font-medium text-subtle">Choose a time</p>
-                <div className="grid grid-cols-2 gap-2">
-                  {slots.map((slot) => (
-                    <button
-                      key={slot.id}
-                      onClick={() => setSelectedSlot(slot.id)}
-                      className={cn(
-                        "rounded-lg border p-2.5 text-left text-xs transition-colors",
-                        selectedSlot === slot.id
-                          ? "border-brand-500 bg-brand-50 dark:bg-brand-950/40"
-                          : "border-border bg-surface hover:border-border-strong"
-                      )}
-                    >
-                      <p className="font-medium text-foreground">{slot.label}</p>
-                      <p className="mt-0.5 flex items-center gap-1 text-subtle"><Clock className="h-3 w-3" /> {slot.time}</p>
-                    </button>
-                  ))}
-                </div>
-                <Button className="mt-4 w-full" disabled={!selectedSlot} onClick={() => setConfirmed(true)}>
-                  Confirm meeting
-                </Button>
+                <ApprovalButtons
+                  options={handoffApproval.approval.options}
+                  responding={handoffApproval.responding}
+                  onChoose={(optionId) => handoffApproval.respond({ optionId })}
+                />
+                {handoffApproval.error && <p className="mt-2 text-xs text-escalated">{handoffApproval.error}</p>}
               </CardContent>
             </>
+          ) : meetings.length > 0 ? (
+            <CardContent className="space-y-3 pt-5">
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-subtle">Meeting status</p>
+              {meetings.map((m) => {
+                const cfg = statusConfig[m.status];
+                return (
+                  <motion.div key={m.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-lg border border-border bg-surface-2 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <Badge variant={cfg.variant}>{cfg.label}</Badge>
+                      {m.unresolvedCount > 0 && <span className="text-xs text-escalated">{m.unresolvedCount} unresolved</span>}
+                    </div>
+                    {m.expert && <p className="mt-2 text-sm text-foreground">Recommended: {m.expert}</p>}
+                    {m.proposedDate && <p className="text-xs text-muted">{new Date(m.proposedDate).toLocaleString()}</p>}
+                    {m.status === "scheduled" && (
+                      <p className="mt-2 flex items-center gap-1.5 text-xs text-verified"><CheckCircle2 className="h-3.5 w-3.5" /> Confirmed by {vendorName}</p>
+                    )}
+                  </motion.div>
+                );
+              })}
+            </CardContent>
           ) : (
-            <motion.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }}>
-              <CardContent className="py-8 text-center">
-                <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-verified-bg">
-                  <CheckCircle2 className="h-7 w-7 text-verified" />
-                </div>
-                <p className="mt-4 text-base font-semibold text-foreground">Meeting scheduled</p>
-                <p className="mt-1 text-sm text-muted">
-                  {slots.find((s) => s.id === selectedSlot)?.label} at {slots.find((s) => s.id === selectedSlot)?.time}
-                </p>
-                <Badge variant="verified" className="mt-4">
-                  Context package sent to CloudNova
-                </Badge>
-                <p className="mt-4 text-xs text-subtle">
-                  Your Solutions Architect will arrive prepared with your full discovery history, gap analysis,
-                  and the {openItems.length} unresolved question{openItems.length === 1 ? "" : "s"} above.
-                </p>
-              </CardContent>
-            </motion.div>
+            <CardContent className="space-y-3 pt-5 text-center">
+              <MessageSquareText className="mx-auto h-6 w-6 text-subtle" />
+              <p className="text-sm text-muted">
+                Tell the AI in chat that you&apos;d like a live discussion — this screen updates the moment a specialist call is offered.
+              </p>
+              <Link href="/buyer/chat" className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "w-full")}>
+                Go to chat
+              </Link>
+            </CardContent>
           )}
         </Card>
       </div>
-    </div>
-  );
-}
-
-function ContextItem({ icon: Icon, text }: { icon: React.ElementType; text: string }) {
-  return (
-    <div className="flex items-center gap-2 text-xs text-muted">
-      <Icon className="h-3.5 w-3.5 text-subtle" /> {text}
     </div>
   );
 }

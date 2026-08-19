@@ -1,0 +1,177 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Updated Scenario Projection
+  version: 1.0.0
+  description: >-
+    Saves a what-if scenario against an existing SolutionModel and, when the
+    scenario includes recomputed ROI figures, updates the model's current
+    RoiProjection to match.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-updated-scenario-projection:
+    post:
+      operationId: saveUpdatedScenarioProjection
+      summary: Save a what-if scenario and refresh the current ROI projection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - solutionModelId
+              properties:
+                solutionModelId:
+                  type: string
+                  format: uuid
+                  description: The SolutionModel this scenario belongs to.
+                name:
+                  type: string
+                  description: Defaults to "Adjusted Scenario" if omitted.
+                description:
+                  type: string
+                inputChanges:
+                  type: object
+                  description: Free-form record of what the buyer adjusted (e.g. sliders moved).
+                resultingRoi:
+                  type: object
+                  description: >-
+                    The recomputed ROI figures for this scenario. Any of the
+                    numeric fields supplied here also patch the SolutionModel's
+                    live RoiProjection.
+                  properties:
+                    currentAnnualCost:
+                      type: number
+                    projectedAnnualCost:
+                      type: number
+                    savingsPercent:
+                      type: number
+                    paybackMonths:
+                      type: number
+                    threeYearSavings:
+                      type: number
+                    chart:
+                      type: object
+                      description: Free-form year-by-year chart payload.
+                resultingRecommendations:
+                  type: object
+                  description: Free-form updated recommendations payload for this scenario.
+      responses:
+        "200":
+          description: The scenario was saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - scenarioId
+                  - solutionModelId
+                  - name
+                properties:
+                  scenarioId:
+                    type: string
+                    format: uuid
+                  solutionModelId:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+                  inputChanges:
+                    type: object
+                    description: Free-form record of what the buyer adjusted.
+                  resultingRoi:
+                    type:
+                      - object
+                      - "null"
+                    description: Free-form resulting ROI payload as submitted.
+                  resultingRecommendations:
+                    type:
+                      - object
+                      - "null"
+                    description: Free-form updated recommendations payload as submitted, or null if omitted.
+                  currentRoiProjection:
+                    description: >-
+                      The SolutionModel's live RoiProjection after this
+                      scenario's numeric fields were applied, or null if
+                      resultingRoi supplied no numeric fields.
+                    type:
+                      - object
+                      - "null"
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                      solution_model_id:
+                        type: string
+                        format: uuid
+                      current_annual_cost:
+                        type:
+                          - number
+                          - "null"
+                      projected_annual_cost:
+                        type:
+                          - number
+                          - "null"
+                      savings_percent:
+                        type:
+                          - number
+                          - "null"
+                      payback_months:
+                        type:
+                          - number
+                          - "null"
+                      three_year_savings:
+                        type:
+                          - number
+                          - "null"
+                      chart:
+                        type:
+                          - object
+                          - "null"
+                        description: Free-form year-by-year chart payload.
+        "400":
+          description: The request body was not valid JSON, or solutionModelId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No solution model exists for the supplied solutionModelId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The scenario could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

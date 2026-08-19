@@ -1,0 +1,121 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Interaction Resolution
+  version: 1.0.0
+  description: >-
+    Saves one buyer question and its grounded answer as a user/assistant
+    message pair in the buyer's conversation, tagged verified, modelled, or
+    escalated.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-interaction-resolution:
+    post:
+      operationId: saveInteractionResolution
+      summary: Save a buyer question and its answer to the conversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - questionText
+                - answerText
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                questionText:
+                  type: string
+                answerText:
+                  type: string
+                responseStatus:
+                  type: string
+                  enum: [verified, modelled, escalated]
+                  description: Defaults to modelled if omitted or invalid.
+                conversationId:
+                  type: string
+                  format: uuid
+                  description: >-
+                    An existing conversation to append to. Omit to reuse the
+                    buyer's (and vendor's, if vendorId is supplied) most
+                    recently updated conversation, or start a new one.
+                vendorId:
+                  type: string
+                  format: uuid
+                  description: Used only when conversationId is not supplied.
+                solutionModelId:
+                  type: string
+                  format: uuid
+                  description: Used only when conversationId is not supplied and a new conversation is started.
+                assumptions:
+                  type: array
+                  items:
+                    type: string
+                evidence:
+                  type: object
+                  description: Free-form evidence payload supporting the answer.
+      responses:
+        "200":
+          description: The question and answer were saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversationId
+                  - messageId
+                  - responseStatus
+                  - content
+                properties:
+                  conversationId:
+                    type: string
+                    format: uuid
+                  messageId:
+                    type: string
+                    format: uuid
+                    description: Id of the saved assistant message.
+                  responseStatus:
+                    type: string
+                    enum: [verified, modelled, escalated]
+                  content:
+                    type: string
+                    description: The saved answer text.
+        "400":
+          description: The request body was not valid JSON, or buyerId/questionText/answerText was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The question and answer could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

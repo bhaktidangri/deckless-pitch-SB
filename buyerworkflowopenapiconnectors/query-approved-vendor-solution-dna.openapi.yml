@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Query Approved Vendor Solution DNA
+  version: 1.0.0
+  description: >-
+    Returns one vendor's published (verified or modelled) capabilities and
+    their evidence, for fit-and-gap assessment against a buyer's requirements.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/query-approved-vendor-solution-dna:
+    post:
+      operationId: queryApprovedVendorSolutionDna
+      summary: Fetch one vendor's published capabilities and evidence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - vendorId
+              properties:
+                vendorId:
+                  type: string
+                  format: uuid
+                  description: The vendor whose published capabilities should be returned.
+      responses:
+        "200":
+          description: The vendor's published capabilities and evidence were returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - vendorId
+                  - companyName
+                  - capabilityCount
+                  - capabilities
+                properties:
+                  vendorId:
+                    type: string
+                    format: uuid
+                  companyName:
+                    type: string
+                  capabilityCount:
+                    type: integer
+                    description: Every published capability for this vendor, oldest first.
+                  capabilities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        name:
+                          type: string
+                        description:
+                          type:
+                            - string
+                            - "null"
+                        category:
+                          type: string
+                          enum:
+                            - product
+                            - service
+                            - solution
+                            - feature
+                            - integration
+                            - industry
+                            - consulting
+                            - use_case
+                            - constraint
+                        verificationStatus:
+                          type: string
+                          enum:
+                            - verified
+                            - modelled
+                            - unverified
+                            - pending
+                        sourceLocation:
+                          type:
+                            - string
+                            - "null"
+                        tags:
+                          type: array
+                          items:
+                            type: string
+                        evidence:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                                format: uuid
+                              sourceLabel:
+                                type:
+                                  - string
+                                  - "null"
+                              sourceType:
+                                type:
+                                  - string
+                                  - "null"
+                              sourceText:
+                                type:
+                                  - string
+                                  - "null"
+                              sourceLocation:
+                                type:
+                                  - string
+                                  - "null"
+                              evidenceType:
+                                type:
+                                  - string
+                                  - "null"
+        "400":
+          description: The request body was not valid JSON, or vendorId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No vendor exists for the supplied vendorId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The vendor's published capabilities could not be retrieved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

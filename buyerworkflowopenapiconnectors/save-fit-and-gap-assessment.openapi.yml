@@ -1,0 +1,222 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Fit and Gap Assessment
+  version: 1.0.0
+  description: >-
+    Replaces the pre-solution-model fit-and-gap assessment for one buyer and
+    vendor pair: SolutionMatch records comparing requirements to capabilities,
+    and GapItem records for unmet needs.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-fit-and-gap-assessment:
+    post:
+      operationId: saveFitAndGapAssessment
+      summary: Save a buyer/vendor fit-and-gap assessment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - vendorId
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                vendorId:
+                  type: string
+                  format: uuid
+                matches:
+                  type: array
+                  description: Existing matches for this buyer/vendor pair (with no solution model yet) are replaced.
+                  items:
+                    type: object
+                    properties:
+                      buyerRequirementId:
+                        type: string
+                        format: uuid
+                      capabilityId:
+                        type: string
+                        format: uuid
+                      requirementText:
+                        type: string
+                      capabilityName:
+                        type: string
+                      matchStatus:
+                        type: string
+                        enum: [strong_match, partial_match, unmatched, requires_validation]
+                        description: Defaults to requires_validation if omitted or invalid.
+                      confidence:
+                        type: number
+                      reasoning:
+                        type: string
+                gaps:
+                  type: array
+                  description: Existing gaps for this buyer/vendor pair (with no solution model yet) are replaced.
+                  items:
+                    type: object
+                    properties:
+                      currentState:
+                        type: string
+                      desiredState:
+                        type: string
+                      gap:
+                        type: string
+                      severity:
+                        type: string
+                        enum: [high, medium, low]
+                        description: Defaults to medium if omitted or invalid.
+      responses:
+        "200":
+          description: The fit-and-gap assessment was saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - buyerId
+                  - vendorId
+                  - matchCount
+                  - gapCount
+                  - matches
+                  - gaps
+                properties:
+                  buyerId:
+                    type: string
+                    format: uuid
+                  vendorId:
+                    type: string
+                    format: uuid
+                  matchCount:
+                    type: integer
+                  gapCount:
+                    type: integer
+                  matches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        solution_model_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        buyer_requirement_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        capability_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        requirement_text:
+                          type:
+                            - string
+                            - "null"
+                        capability_name:
+                          type:
+                            - string
+                            - "null"
+                        match_status:
+                          type: string
+                          enum: [strong_match, partial_match, unmatched, requires_validation]
+                        confidence:
+                          type:
+                            - number
+                            - "null"
+                        reasoning:
+                          type:
+                            - string
+                            - "null"
+                        buyer_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        vendor_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                  gaps:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        solution_model_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        current_state:
+                          type:
+                            - string
+                            - "null"
+                        desired_state:
+                          type:
+                            - string
+                            - "null"
+                        gap:
+                          type:
+                            - string
+                            - "null"
+                        severity:
+                          type: string
+                          enum: [high, medium, low]
+                        buyer_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+                        vendor_id:
+                          type:
+                            - string
+                            - "null"
+                          format: uuid
+        "400":
+          description: The request body was not valid JSON, or buyerId/vendorId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The fit-and-gap assessment could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

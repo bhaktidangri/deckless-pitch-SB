@@ -1,0 +1,108 @@
+openapi: 3.1.0
+info:
+  title: Deck-less Pitch - Save Selected Vendor Context
+  version: 1.0.0
+  description: >-
+    Records the buyer's chosen vendor as their single active selection,
+    deactivating any prior selection.
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-selected-vendor-context:
+    post:
+      operationId: saveSelectedVendorContext
+      summary: Save the buyer's active vendor selection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+                - vendorId
+              properties:
+                buyerId:
+                  type: string
+                  format: uuid
+                  description: The buyer making the selection.
+                vendorId:
+                  type: string
+                  format: uuid
+                  description: The vendor being selected.
+      responses:
+        "200":
+          description: The vendor selection was saved and made active.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - selectionId
+                  - buyerId
+                  - vendorId
+                  - companyName
+                  - vendorCompanyName
+                  - isActive
+                properties:
+                  selectionId:
+                    type: string
+                    format: uuid
+                  buyerId:
+                    type: string
+                    format: uuid
+                  vendorId:
+                    type: string
+                    format: uuid
+                  companyName:
+                    type: string
+                    description: The buyer's company name.
+                  vendorCompanyName:
+                    type: string
+                  isActive:
+                    type: boolean
+        "400":
+          description: The request body was not valid JSON, or buyerId/vendorId was not supplied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "404":
+          description: No buyer or no vendor exists for the supplied id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: The request method is not supported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The vendor selection could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
