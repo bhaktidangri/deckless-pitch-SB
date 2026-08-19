@@ -1,0 +1,74 @@
+From d6c4e81bc2f622b1dbe9e44296f62eae4acd2513 Mon Sep 17 00:00:00 2001
+From: satvikrao-atoconn <satvik.rao@atoconn.com>
+Date: Wed, 19 Aug 2026 17:20:50 +0530
+Subject: [PATCH 3/4] vendore side integration in progress 4
+
+---
+ src/app/api/webhooks/yoxa-hitl/route.ts | 37 +++++++++++++++----------
+ 1 file changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/src/app/api/webhooks/yoxa-hitl/route.ts b/src/app/api/webhooks/yoxa-hitl/route.ts
+index cc715ab..5c9c21a 100644
+--- a/src/app/api/webhooks/yoxa-hitl/route.ts
++++ b/src/app/api/webhooks/yoxa-hitl/route.ts
+@@ -9,11 +9,15 @@ import { NextResponse } from "next/server";
+ // publicly reachable (a local dev server needs a tunnel, e.g. ngrok, for
+ // Yoxa to be able to reach it at all).
+ //
+-// Payload shape is inferred from the operator-log rendering shown in
+-// testing (request_id, workflow_run_id, request_title/request_description/
+-// approval_options, possibly nested under request_payload) — the raw
+-// webhook body hasn't been observed directly yet, so field lookups are
+-// deliberately permissive across the naming variants seen so far.
++// Payload shape is inferred from operator-log renderings of the "Request
++// Vendor DNA Approval" tool call (request_title/request_description/
++// options — no capability_id or response_url field on the tool args
++// themselves; capability_id is embedded as text in request_description,
++// see CAPABILITY_ID_PREFIX below). The envelope Yoxa wraps that call in to
++// actually deliver this webhook (request_id, workflow_run_id, response_url)
++// still hasn't been observed directly, so those field-name lookups stay
++// permissive across variants — raw_payload is stored on every save so a
++// real delivery can be inspected if response_url still ends up null.
+ //
+ // Verification is a placeholder: checks X-Yoxa-Deployment-Secret against
+ // our own deployment secret, the only shared-secret mechanism confirmed to
+@@ -33,7 +37,7 @@ export async function POST(req: Request) {
+   const requestId = (body.request_id ?? body.requestId) as string | undefined;
+   const workflowRunId = (body.workflow_run_id ?? body.workflowRunId) as string | undefined;
+   const title = (body.request_title ?? body.title ?? payload.request_title) as string | undefined;
+-  const description = (body.request_description ?? body.description ?? payload.request_description) as
++  const rawDescription = (body.request_description ?? body.description ?? payload.request_description) as
+     | string
+     | undefined;
+   const options = (body.approval_options ?? body.options ?? payload.approval_options) as unknown;
+@@ -50,15 +54,18 @@ export async function POST(req: Request) {
+     payload.responseUrl ??
+     payload.respond_url ??
+     payload.callback_url) as string | undefined;
+-  // capability_id isn't part of the "Request Vendor DNA Approval" tool's
+-  // observed args (request_title/request_description/options only), so this
+-  // is almost always going to end up null — kept as best-effort in case a
+-  // future payload shape includes it. workflow_run_id is the reliable
+-  // correlation key (see findPendingApprovalsForWorkflowRuns) and was
+-  // previously silently dropped here instead of being forwarded at all.
+-  const capabilityId = (body.capability_id ?? body.capabilityId ?? payload.capability_id ?? payload.capabilityId) as
+-    | string
+-    | undefined;
++  // capability_id is never a structured field on this tool's args — Yoxa's
++  // agent embeds it as the first line of request_description instead, e.g.
++  // "Capability ID: bdc21456-a0f1-4fef-8116-2e238b3c29af\n\nExtracted
++  // claim: ..." (confirmed against a live operator log). Structured fields
++  // are still checked first in case a future payload shape adds one.
++  const CAPABILITY_ID_PREFIX = /^Capability ID:\s*([0-9a-fA-F-]{36})\s*\n+/;
++  const embeddedMatch = rawDescription?.match(CAPABILITY_ID_PREFIX);
++  const capabilityId = (body.capability_id ?? body.capabilityId ?? payload.capability_id ?? payload.capabilityId ??
++    embeddedMatch?.[1]) as string | undefined;
++  // Strip the "Capability ID: ..." line before it's shown to the vendor —
++  // it's plumbing, not part of the question being asked.
++  const description = embeddedMatch ? rawDescription!.slice(embeddedMatch[0].length) : rawDescription;
+   const deploymentId = (body.deployment_id ?? body.deploymentId) as string | undefined;
+ 
+   if (!requestId || !workflowRunId) {
+-- 
+2.43.0
+

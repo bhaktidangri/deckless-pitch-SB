@@ -1,0 +1,566 @@
+From 0be9fb37276a8cd4b88cb2d14d3afd0be5504951 Mon Sep 17 00:00:00 2001
+From: satvikrao-atoconn <satvik.rao@atoconn.com>
+Date: Wed, 19 Aug 2026 14:26:35 +0530
+Subject: [PATCH 1/4] Revert "vendore side integration in progress 2"
+
+This reverts commit c34df73b4208a67e9be645fa5139b148e235a841.
+---
+ src/app/api/vendor-source-submission/route.ts |  15 +-
+ src/app/vendor/onboarding/page.tsx            | 138 ++++++++++--------
+ src/app/vendor/solution-dna/page.tsx          |  86 ++---------
+ src/lib/api/yoxa-trigger.ts                   |   7 +-
+ src/lib/vendor-poll.ts                        |  79 ----------
+ src/lib/vendor-session.ts                     |  35 -----
+ 6 files changed, 96 insertions(+), 264 deletions(-)
+ delete mode 100644 src/lib/vendor-poll.ts
+
+diff --git a/src/app/api/vendor-source-submission/route.ts b/src/app/api/vendor-source-submission/route.ts
+index 6ffbcf7..801b55b 100644
+--- a/src/app/api/vendor-source-submission/route.ts
++++ b/src/app/api/vendor-source-submission/route.ts
+@@ -7,15 +7,14 @@ interface SubmissionBody {
+   website?: string;
+   industry?: string;
+   description?: string;
++  directText?: string;
+ }
+ 
+ // Server-side trigger for vendor_source_submission (PRD Section 5.1). Kept
+ // server-only because YOXA_DEPLOYMENT_SECRET must not reach the browser.
+ // Composes the intake form's fields into the trigger_text the Yoxa
+-// deployment actually accepts. The "Ingest Vendor Documents and Direct
+-// Inputs" tool has been removed from the redeployed workflow — Milestone 1
+-// is now crawl-only, so there's no direct-text/document channel to compose
+-// here anymore; a website URL is the sole capability source.
++// deployment actually accepts (its only confirmed input channel — file
++// upload input 500s on Yoxa's side, so isn't sent here; see yoxa-trigger.ts).
+ export async function POST(req: Request) {
+   const body = (await req.json().catch(() => ({}))) as SubmissionBody;
+ 
+@@ -29,12 +28,12 @@ export async function POST(req: Request) {
+   if (body.website) lines.push(`Website: ${body.website}`);
+   if (body.industry) lines.push(`Primary industry: ${body.industry}`);
+   if (body.description) lines.push(`Description: ${body.description}`);
+-
+-  if (!body.website?.trim()) {
+-    return NextResponse.json({ error: "A website URL is required — crawling is the only intake source." }, { status: 400 });
+-  }
++  if (body.directText) lines.push(`\nDirect capability input:\n${body.directText}`);
+ 
+   const triggerText = lines.join("\n").trim();
++  if (!triggerText) {
++    return NextResponse.json({ error: "Provide at least a website, direct text, or company details." }, { status: 400 });
++  }
+ 
+   try {
+     const result = await triggerVendorSourceSubmission(triggerText);
+diff --git a/src/app/vendor/onboarding/page.tsx b/src/app/vendor/onboarding/page.tsx
+index 1faa90c..3f01575 100644
+--- a/src/app/vendor/onboarding/page.tsx
++++ b/src/app/vendor/onboarding/page.tsx
+@@ -2,57 +2,80 @@
+ 
+ import { useEffect, useRef, useState } from "react";
+ import { useRouter } from "next/navigation";
+-import { AlertTriangle, Building2, Clock, Globe, Loader2 } from "lucide-react";
++import { AlertTriangle, Building2, Clock, Globe, Loader2, PenLine } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { Input, Label, Select, Textarea } from "@/components/ui/input";
+ import { Button } from "@/components/ui/button";
+-import {
+-  clearPendingSubmission,
+-  getPendingSubmission,
+-  getStoredVendorId,
+-  setPendingSubmission,
+-  setStoredVendorId,
+-  setStoredVendorName,
+-} from "@/lib/vendor-session";
+-import { countDraftCapabilities } from "@/lib/api/vendor-lookup";
+-import { POLL_TIMEOUT_MS, pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
++import { getStoredVendorId, setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
++import { countDraftCapabilities, findVendorCreatedAfter } from "@/lib/api/vendor-lookup";
+ 
+ const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
+ 
++const POLL_INTERVAL_MS = 4000;
++const POLL_TIMEOUT_MS = 3 * 60 * 1000;
++
+ type Stage = "idle" | "submitting" | "processing" | "timed-out" | "error";
+ 
+-// One composed submission — org details plus a website URL — fires a single
+-// vendor_source_submission trigger event against the live Yoxa.ai deployment
+-// (PRD Section 5.1 / 8). The "Ingest Vendor Documents and Direct Inputs"
+-// tool has been removed from the redeployed workflow: Milestone 1 is now
+-// crawl-only, so website URL is the sole capability source (no direct-text
+-// or document upload path).
++// One composed submission — org details, website URL, and direct-text
++// capability descriptions — fires a single vendor_source_submission trigger
++// event against the live Yoxa.ai deployment (PRD Section 5.1 / 8). Document
++// upload isn't wired: Yoxa's file-input channel 500s server-side, so for now
++// vendors paste key excerpts into the text box instead of attaching files.
+ export default function VendorOnboardingPage() {
+   const router = useRouter();
+   const existingVendorId = getStoredVendorId();
+-  const pollHandleRef = useRef<PollHandle | null>(null);
+-  useEffect(() => () => pollHandleRef.current?.cancel(), []);
++  const cancelled = useRef(false);
++  useEffect(() => () => { cancelled.current = true; }, []);
+ 
+   const [companyName, setCompanyName] = useState("");
+   const [website, setWebsite] = useState("");
+   const [industry, setIndustry] = useState(industryOptions[0]);
+   const [description, setDescription] = useState("");
++  const [directText, setDirectText] = useState("");
+ 
+   const [stage, setStage] = useState<Stage>("idle");
+   const [error, setError] = useState<string | null>(null);
+   const [runId, setRunId] = useState<string | null>(null);
+ 
+-  const hasAnySource = website.trim().length > 0;
++  const hasAnySource = website.trim() || directText.trim();
+   const canSubmit = existingVendorId ? hasAnySource : companyName.trim() && hasAnySource;
+ 
+-  // The original poll deadline has already passed once we're in "timed-out"
+-  // — resuming Milestone 2's auto-poll against a stale deadline would just
+-  // time out again instantly, so give it a fresh budget before navigating.
+-  function goToReviewScreen() {
+-    const pending = getPendingSubmission();
+-    if (pending) setPendingSubmission({ ...pending, deadline: Date.now() + POLL_TIMEOUT_MS });
+-    router.push("/vendor/solution-dna");
++  async function pollForNewVendor(name: string, afterIso: string, deadline: number) {
++    if (cancelled.current) return;
++    try {
++      const vendor = await findVendorCreatedAfter(name, afterIso);
++      if (vendor) {
++        setStoredVendorId(vendor.id);
++        router.push("/vendor/solution-dna");
++        return;
++      }
++    } catch {
++      // transient read error — keep polling until the deadline
++    }
++    if (Date.now() >= deadline) {
++      setStage("timed-out");
++      return;
++    }
++    setTimeout(() => pollForNewVendor(name, afterIso, deadline), POLL_INTERVAL_MS);
++  }
++
++  async function pollForNewCapabilities(vendorId: string, baseline: number, deadline: number) {
++    if (cancelled.current) return;
++    try {
++      const count = await countDraftCapabilities(vendorId);
++      if (count > baseline) {
++        router.push("/vendor/solution-dna");
++        return;
++      }
++    } catch {
++      // transient read error — keep polling until the deadline
++    }
++    if (Date.now() >= deadline) {
++      setStage("timed-out");
++      return;
++    }
++    setTimeout(() => pollForNewCapabilities(vendorId, baseline, deadline), POLL_INTERVAL_MS);
+   }
+ 
+   async function handleSubmit(e: React.FormEvent) {
+@@ -82,6 +105,7 @@ export default function VendorOnboardingPage() {
+           website: website.trim() || undefined,
+           industry: existingVendorId ? undefined : industry,
+           description: description.trim() || undefined,
++          directText: directText.trim() || undefined,
+         }),
+       });
+       const data = await res.json().catch(() => ({}) as Record<string, unknown>);
+@@ -95,35 +119,10 @@ export default function VendorOnboardingPage() {
+       if (!existingVendorId && companyName.trim()) setStoredVendorName(companyName.trim());
+       setStage("processing");
+       const deadline = Date.now() + POLL_TIMEOUT_MS;
+-
+-      // Persisted before polling starts so Milestone 2 can pick up right
+-      // where this leaves off if the vendor navigates away early — this
+-      // page's own poll dies with the component on unmount.
+       if (existingVendorId) {
+-        setPendingSubmission({ kind: "existing-vendor", vendorId: existingVendorId, baseline, deadline });
+-        pollHandleRef.current = pollForNewCapabilities(
+-          existingVendorId,
+-          baseline,
+-          deadline,
+-          () => {
+-            clearPendingSubmission();
+-            router.push("/vendor/solution-dna");
+-          },
+-          () => setStage("timed-out")
+-        );
++        pollForNewCapabilities(existingVendorId, baseline, deadline);
+       } else {
+-        setPendingSubmission({ kind: "new-vendor", companyName: companyName.trim(), afterIso: triggeredAt, deadline });
+-        pollHandleRef.current = pollForNewVendorId(
+-          companyName.trim(),
+-          triggeredAt,
+-          deadline,
+-          (vendorId) => {
+-            setStoredVendorId(vendorId);
+-            clearPendingSubmission();
+-            router.push("/vendor/solution-dna");
+-          },
+-          () => setStage("timed-out")
+-        );
++        pollForNewVendor(companyName.trim(), triggeredAt, deadline);
+       }
+     } catch {
+       setError("Could not reach the submission endpoint. Check your connection and try again.");
+@@ -137,7 +136,7 @@ export default function VendorOnboardingPage() {
+         <PageHeader
+           eyebrow="Milestone 1 — Ingest Vendor Sources and Build DNA Draft"
+           title="Analyzing your submission…"
+-          description="Crawling your site feeds the Vendor Intelligence Agent, which consolidates what it finds into your Solution DNA draft."
++          description="Crawling your site and ingesting text run in parallel; once both finish, the Vendor Intelligence Agent consolidates everything into your Solution DNA draft."
+         />
+         <Card className="max-w-md p-6 text-center">
+           {stage === "processing" ? (
+@@ -152,10 +151,10 @@ export default function VendorOnboardingPage() {
+               <p className="mt-3 text-sm font-medium text-foreground">Still processing after a few minutes.</p>
+               <p className="mt-1 text-sm text-muted">
+                 Your submission is running — check{" "}
+-                <button className="text-brand-600 underline dark:text-brand-400" onClick={goToReviewScreen}>
++                <button className="text-brand-600 underline dark:text-brand-400" onClick={() => router.push("/vendor/solution-dna")}>
+                   the review screen
+                 </button>{" "}
+-                — it keeps checking automatically and loads your draft the moment it&apos;s ready.
++                again shortly, or paste your vendor ID there once you have it.
+               </p>
+               {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
+             </>
+@@ -170,7 +169,7 @@ export default function VendorOnboardingPage() {
+       <PageHeader
+         eyebrow="Milestone 1 — Ingest Vendor Sources and Build DNA Draft"
+         title={existingVendorId ? "Add more sources" : "Register and submit your sources"}
+-        description="Provide your company details plus a website URL — one submission kicks off extraction into your Solution DNA draft."
++        description="Provide your company details plus a website URL and/or direct text — one submission kicks off extraction into your Solution DNA draft."
+       />
+ 
+       <div className="grid gap-6 lg:grid-cols-3">
+@@ -218,16 +217,31 @@ export default function VendorOnboardingPage() {
+               )}
+ 
+               <div>
+-                <Label htmlFor="website">Website URL (crawled for capability extraction)</Label>
++                <Label htmlFor="website">Website URL {existingVendorId ? "" : "(crawled for capability extraction)"}</Label>
+                 <Input
+                   id="website"
+                   value={website}
+                   onChange={(e) => setWebsite(e.target.value)}
+                   placeholder="https://yourcompany.com"
+-                  required
+                 />
+               </div>
+ 
++              <div>
++                <Label htmlFor="direct-text">Direct capability input</Label>
++                <Textarea
++                  id="direct-text"
++                  value={directText}
++                  onChange={(e) => setDirectText(e.target.value)}
++                  rows={5}
++                  placeholder="Type capabilities, pricing rules, or FAQs directly — each statement is treated as its own claim. If you have supporting documents, paste their key excerpts here for now."
++                />
++              </div>
++
++              <div className="flex items-start gap-2 rounded-lg border border-border bg-surface-2/50 px-3 py-2.5 text-xs text-muted">
++                <PenLine className="mt-0.5 h-3.5 w-3.5 shrink-0 text-subtle" />
++                Document upload isn&apos;t wired to live extraction yet — paste key excerpts above instead of attaching files.
++              </div>
++
+               {stage === "error" && error && (
+                 <div className="flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
+                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+@@ -249,8 +263,8 @@ export default function VendorOnboardingPage() {
+             <CardContent className="pt-5">
+               <p className="text-sm font-semibold text-foreground">What happens next?</p>
+               <p className="mt-2 text-sm text-muted">
+-                Crawling your site feeds the Vendor Intelligence Agent, which consolidates what it finds into your
+-                Solution DNA draft — you&apos;re taken to the review screen automatically once it&apos;s done.
++                Crawling your site and ingesting text run in parallel; once both finish, the Vendor Intelligence Agent
++                consolidates everything into your Solution DNA draft and you&apos;re taken to the review screen automatically.
+               </p>
+             </CardContent>
+           </Card>
+diff --git a/src/app/vendor/solution-dna/page.tsx b/src/app/vendor/solution-dna/page.tsx
+index a13d804..4cb86c3 100644
+--- a/src/app/vendor/solution-dna/page.tsx
++++ b/src/app/vendor/solution-dna/page.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import { useEffect, useRef, useState } from "react";
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+ import { AlertTriangle, ArrowRight, CheckCircle2, Dna, Loader2, PartyPopper } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+@@ -16,19 +16,12 @@ import {
+   type PublishApprovedVendorSolutionDnaResponse,
+   type SavedCapability,
+ } from "@/lib/api/vendor-dna";
+-import {
+-  clearPendingSubmission,
+-  getPendingSubmission,
+-  getStoredVendorId,
+-  setStoredVendorId,
+-  setStoredVendorName,
+-} from "@/lib/vendor-session";
++import { getStoredVendorId, setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
+ import {
+   findPendingApprovalForCapability,
+   respondToApprovalRequest,
+   type ApprovalOptionId,
+ } from "@/lib/api/vendor-dna-approvals";
+-import { pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
+ 
+ type Stage = "need-vendor-id" | "loading" | "error" | "reviewing" | "publishing" | "published";
+ 
+@@ -45,61 +38,12 @@ export default function SolutionDnaPage() {
+   const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
+   const [publishResult, setPublishResult] = useState<PublishApprovedVendorSolutionDnaResponse | null>(null);
+ 
+-  // True while this page is auto-polling for a Milestone 1 submission that
+-  // hadn't finished yet when the vendor navigated here (see vendor-session's
+-  // pending-submission handoff and vendor-poll.ts) — lets "need-vendor-id"
+-  // show a live status instead of dead-ending on the manual paste field.
+-  const [autoPolling, setAutoPolling] = useState(false);
+-  const pollHandleRef = useRef<PollHandle | null>(null);
+-
+   useEffect(() => {
+     const stored = getStoredVendorId();
+-    if (stored) {
+-      loadCapabilities(stored);
+-      return;
+-    }
+-
+-    const pending = getPendingSubmission();
+-    if (!pending || Date.now() >= pending.deadline) {
+-      if (pending) clearPendingSubmission();
+-      return;
+-    }
+-
+-    setAutoPolling(true);
+-    if (pending.kind === "new-vendor") {
+-      pollHandleRef.current = pollForNewVendorId(
+-        pending.companyName,
+-        pending.afterIso,
+-        pending.deadline,
+-        (foundVendorId) => {
+-          setStoredVendorId(foundVendorId);
+-          loadCapabilities(foundVendorId);
+-        },
+-        () => {
+-          clearPendingSubmission();
+-          setAutoPolling(false);
+-        }
+-      );
+-    } else {
+-      pollHandleRef.current = pollForNewCapabilities(
+-        pending.vendorId,
+-        pending.baseline,
+-        pending.deadline,
+-        () => loadCapabilities(pending.vendorId),
+-        () => {
+-          clearPendingSubmission();
+-          setAutoPolling(false);
+-        }
+-      );
+-    }
+-
+-    return () => pollHandleRef.current?.cancel();
++    if (stored) loadCapabilities(stored);
+   }, []);
+ 
+   async function loadCapabilities(id: string) {
+-    pollHandleRef.current?.cancel();
+-    setAutoPolling(false);
+-    clearPendingSubmission();
+     setStage("loading");
+     setError(null);
+     try {
+@@ -180,23 +124,13 @@ export default function SolutionDnaPage() {
+         />
+         <Card className="max-w-md">
+           <CardContent className="space-y-4 pt-5">
+-            {autoPolling ? (
+-              <div className="flex items-start gap-2.5 rounded-lg border border-brand-200 bg-brand-50/50 px-3 py-2.5 text-sm text-foreground dark:border-brand-900 dark:bg-brand-950/20">
+-                <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-brand-600 dark:text-brand-400" />
+-                <span>
+-                  Your Milestone 1 submission is still processing — this screen checks automatically and loads your
+-                  draft the moment it&apos;s ready.
+-                </span>
+-              </div>
+-            ) : (
+-              <p className="text-sm text-muted">
+-                No vendor is loaded in this browser yet. If you already registered via{" "}
+-                <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
+-                  the intake form
+-                </Link>
+-                , paste your vendor ID below to resume review.
+-              </p>
+-            )}
++            <p className="text-sm text-muted">
++              No vendor is loaded in this browser yet. If you already registered via{" "}
++              <Link href="/vendor/onboarding" className="text-brand-600 underline dark:text-brand-400">
++                the intake form
++              </Link>
++              , paste your vendor ID below to resume review.
++            </p>
+             <div>
+               <Label htmlFor="vendorId">Vendor ID</Label>
+               <Input
+diff --git a/src/lib/api/yoxa-trigger.ts b/src/lib/api/yoxa-trigger.ts
+index 36bb14c..6ced2ed 100644
+--- a/src/lib/api/yoxa-trigger.ts
++++ b/src/lib/api/yoxa-trigger.ts
+@@ -9,10 +9,9 @@
+ // /trigger requires an Idempotency-Key header, then a JSON body of
+ // { trigger_text: string }, and responds 202 with a workflow_run_id.
+ // File-upload input (multipart, field name "file") consistently 500s
+-// server-side on Yoxa's end — moot now anyway, since the workflow's
+-// "Ingest Vendor Documents and Direct Inputs" tool has been removed from
+-// the redeployed workflow. Milestone 1 is crawl-only; trigger_text now only
+-// carries vendor identity/profile fields, not capability source text.
++// server-side on Yoxa's end — that path is NOT wired here; document upload
++// stays a manual "paste key excerpts as text" workaround until Yoxa's file
++// input is fixed or documented.
+ //
+ // There is no run-status/polling endpoint on this API (every guess 404s,
+ // and GET on /trigger itself is 405). Completion is instead detected by
+diff --git a/src/lib/vendor-poll.ts b/src/lib/vendor-poll.ts
+deleted file mode 100644
+index a57b314..0000000
+--- a/src/lib/vendor-poll.ts
++++ /dev/null
+@@ -1,79 +0,0 @@
+-// Shared Milestone-1-completion polling (see vendor-lookup.ts for why this
+-// polls our own Supabase tables instead of the Yoxa API). Extracted so both
+-// the onboarding page (Milestone 1, polls while the vendor waits) and the
+-// solution-dna page (Milestone 2, resumes polling if the vendor navigated
+-// away before Milestone 1 finished — see vendor-session's pending-submission
+-// handoff) share one implementation instead of drifting apart.
+-
+-import { countDraftCapabilities, findVendorCreatedAfter } from "@/lib/api/vendor-lookup";
+-
+-export const POLL_INTERVAL_MS = 4000;
+-export const POLL_TIMEOUT_MS = 3 * 60 * 1000;
+-
+-export interface PollHandle {
+-  cancel: () => void;
+-}
+-
+-export function pollForNewVendorId(
+-  companyName: string,
+-  afterIso: string,
+-  deadline: number,
+-  onFound: (vendorId: string) => void,
+-  onTimeout: () => void
+-): PollHandle {
+-  let cancelled = false;
+-
+-  async function tick() {
+-    if (cancelled) return;
+-    try {
+-      const vendor = await findVendorCreatedAfter(companyName, afterIso);
+-      if (vendor) {
+-        if (!cancelled) onFound(vendor.id);
+-        return;
+-      }
+-    } catch {
+-      // transient read error — keep polling until the deadline
+-    }
+-    if (cancelled) return;
+-    if (Date.now() >= deadline) {
+-      onTimeout();
+-      return;
+-    }
+-    setTimeout(tick, POLL_INTERVAL_MS);
+-  }
+-
+-  tick();
+-  return { cancel: () => { cancelled = true; } };
+-}
+-
+-export function pollForNewCapabilities(
+-  vendorId: string,
+-  baseline: number,
+-  deadline: number,
+-  onFound: () => void,
+-  onTimeout: () => void
+-): PollHandle {
+-  let cancelled = false;
+-
+-  async function tick() {
+-    if (cancelled) return;
+-    try {
+-      const count = await countDraftCapabilities(vendorId);
+-      if (count > baseline) {
+-        if (!cancelled) onFound();
+-        return;
+-      }
+-    } catch {
+-      // transient read error — keep polling until the deadline
+-    }
+-    if (cancelled) return;
+-    if (Date.now() >= deadline) {
+-      onTimeout();
+-      return;
+-    }
+-    setTimeout(tick, POLL_INTERVAL_MS);
+-  }
+-
+-  tick();
+-  return { cancel: () => { cancelled = true; } };
+-}
+diff --git a/src/lib/vendor-session.ts b/src/lib/vendor-session.ts
+index 89a19d8..9f31fd4 100644
+--- a/src/lib/vendor-session.ts
++++ b/src/lib/vendor-session.ts
+@@ -32,38 +32,3 @@ export function setStoredVendorName(companyName: string) {
+   if (typeof window === "undefined") return;
+   window.localStorage.setItem(NAME_STORAGE_KEY, companyName);
+ }
+-
+-// A submission the agent hasn't finished yet, persisted so Milestone-1
+-// completion can be detected even if the vendor navigates to Milestone 2 (or
+-// reloads) before the onboarding page's own poll finds the result — the
+-// onboarding page's polling loop dies with the component on unmount, so
+-// without this handoff the vendor would land on solution-dna with nothing to
+-// go on but the manual vendor-ID field. `deadline` is an absolute epoch ms
+-// timestamp so whichever page resumes polling honors the original timeout
+-// budget instead of restarting the clock.
+-const PENDING_KEY = "deckless-pitch:pending-submission";
+-
+-export type PendingSubmission =
+-  | { kind: "new-vendor"; companyName: string; afterIso: string; deadline: number }
+-  | { kind: "existing-vendor"; vendorId: string; baseline: number; deadline: number };
+-
+-export function getPendingSubmission(): PendingSubmission | null {
+-  if (typeof window === "undefined") return null;
+-  const raw = window.localStorage.getItem(PENDING_KEY);
+-  if (!raw) return null;
+-  try {
+-    return JSON.parse(raw) as PendingSubmission;
+-  } catch {
+-    return null;
+-  }
+-}
+-
+-export function setPendingSubmission(pending: PendingSubmission) {
+-  if (typeof window === "undefined") return;
+-  window.localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+-}
+-
+-export function clearPendingSubmission() {
+-  if (typeof window === "undefined") return;
+-  window.localStorage.removeItem(PENDING_KEY);
+-}
+-- 
+2.43.0
+
