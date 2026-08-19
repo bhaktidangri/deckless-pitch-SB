@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import {
   LayoutDashboard,
   Search,
@@ -12,7 +11,8 @@ import {
   CalendarClock,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
-import { getStoredCompanyName } from "@/lib/buyer-session";
+import { AgentStatusPill } from "@/components/shared/agent-status-pill";
+import { getStoredBuyerId, getStoredCompanyName } from "@/lib/buyer-session";
 
 const sections: NavSection[] = [
   {
@@ -44,11 +44,20 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
   // Mirrors vendor/layout.tsx: no real auth session exists yet, so this
   // reflects whichever buyer actually submitted a discovery form in this
   // browser (src/lib/buyer-session.ts) instead of a static demo placeholder.
-  const [companyName, setCompanyName] = useState<string | null>(null);
-  useEffect(() => setCompanyName(getStoredCompanyName()), []);
+  // Read directly in the render body (not useState+useEffect) — localStorage
+  // is available synchronously on the client and this avoids a
+  // set-state-in-effect render flash on first paint.
+  const companyName = getStoredCompanyName();
+  const buyerId = getStoredBuyerId();
 
   return (
-    <PortalShell role="buyer" sections={sections} userName={companyName ?? "Not started yet"} userRole="Buyer">
+    <PortalShell
+      role="buyer"
+      sections={sections}
+      userName={companyName ?? "Not started yet"}
+      userRole="Buyer"
+      headerSlot={<AgentStatusPill buyerId={buyerId} />}
+    >
       {children}
     </PortalShell>
   );

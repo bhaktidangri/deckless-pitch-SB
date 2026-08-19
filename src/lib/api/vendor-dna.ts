@@ -122,6 +122,7 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
   try {
     res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
       method: "POST",
+      cache: "no-store",
       headers: {
         "Content-Type": "application/json",
         apikey: SUPABASE_ANON_KEY,

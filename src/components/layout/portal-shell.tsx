@@ -22,6 +22,7 @@ export function PortalShell({
   userName,
   userRole,
   vendorSubLabel,
+  headerSlot,
   children,
 }: {
   role: "vendor" | "buyer" | "admin";
@@ -30,6 +31,8 @@ export function PortalShell({
   userRole: string;
   /** Real registered vendor name, once known — overrides the role switcher's "CloudNova" demo placeholder. */
   vendorSubLabel?: string;
+  /** Optional extra content rendered in the sticky header, left of notifications — e.g. a cross-page status indicator. */
+  headerSlot?: React.ReactNode;
   children: React.ReactNode;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -95,7 +98,8 @@ export function PortalShell({
           <Link href="/" className="text-sm font-semibold text-foreground lg:hidden">
             Deck-less Pitch
           </Link>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center gap-2 sm:gap-3">
+            {headerSlot}
             <NotificationsMenu />
             <ThemeToggle />
           </div>

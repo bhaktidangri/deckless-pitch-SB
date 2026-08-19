@@ -16,6 +16,7 @@ export interface VendorRow {
 async function restGet<T>(path: string): Promise<T> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    cache: "no-store",
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
   if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
@@ -44,6 +45,7 @@ export async function countDraftCapabilities(vendorId: string): Promise<number> 
   const res = await fetch(
     `${SUPABASE_URL}/rest/v1/solution_capabilities?select=id&vendor_id=eq.${vendorId}`,
     {
+      cache: "no-store",
       headers: {
         apikey: SUPABASE_ANON_KEY,
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,

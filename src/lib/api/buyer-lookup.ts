@@ -24,6 +24,11 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 async function restGet<T>(path: string): Promise<T> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    // Every one of these reads backs a polling loop (dashboard stats, HITL
+    // pause checks, vendor/requirement lists) that expects the *current*
+    // row, not whatever the browser's HTTP cache last saw for this exact
+    // URL — force a real network round-trip every time.
+    cache: "no-store",
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
   if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);

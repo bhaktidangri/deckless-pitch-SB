@@ -100,6 +100,9 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
   try {
     res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
       method: "POST",
+      // Buyers re-run this while browsing vendor cards; a stale cached
+      // response would hide a vendor whose Solution DNA just got published.
+      cache: "no-store",
       headers: {
         "Content-Type": "application/json",
         apikey: SUPABASE_ANON_KEY,

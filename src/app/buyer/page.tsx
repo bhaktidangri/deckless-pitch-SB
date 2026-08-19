@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, Loader2, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
+import { ArrowUpRight, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
+import { LoadingState } from "@/components/shared/loading-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { buttonVariants } from "@/components/ui/button";
@@ -89,18 +90,26 @@ export default function BuyerDashboardPage() {
       />
 
       {loading ? (
-        <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
+        <>
+          <LoadingState variant="stats" count={4} />
+          <div className="mt-6 grid gap-6 lg:grid-cols-3">
+            <div className="lg:col-span-2">
+              <LoadingState variant="lines" count={4} />
+            </div>
+            <LoadingState variant="lines" count={3} />
+          </div>
+        </>
       ) : (
         <>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard label="Requirements captured" value={String(requirements.length)} icon={TrendingUp} tone="verified" />
-            <StatCard label="Confirmed" value={String(confirmedCount)} icon={MessageSquareText} tone="brand" />
-            <StatCard label="Vendor selected" value={vendorName ? "1" : "0"} icon={Store} tone="accent" />
-            <StatCard label="Open questions" value={String(openItems.length)} icon={Sparkles} tone="escalated" />
+            <StatCard index={0} label="Requirements captured" value={String(requirements.length)} icon={TrendingUp} tone="verified" />
+            <StatCard index={1} label="Confirmed" value={String(confirmedCount)} icon={MessageSquareText} tone="brand" />
+            <StatCard index={2} label="Vendor selected" value={vendorName ? "1" : "0"} icon={Store} tone="accent" />
+            <StatCard index={3} label="Open questions" value={String(openItems.length)} icon={Sparkles} tone="escalated" />
           </div>
 
-          <div className="mt-6 grid gap-6 lg:grid-cols-3">
-            <Card className="lg:col-span-2">
+          <div className="mt-6 grid gap-6 lg:grid-cols-3 animate-slide-up">
+            <Card className="lg:col-span-2 transition-shadow hover:shadow-md">
               <CardHeader className="flex-row items-center justify-between">
                 <CardTitle>Your vendor</CardTitle>
                 <Link href="/buyer/vendors" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">

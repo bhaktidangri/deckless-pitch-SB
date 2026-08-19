@@ -1,11 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { CheckCircle2, Loader2, Sparkles } from "lucide-react";
+import { CheckCircle2, Search, Sparkles, X } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { buttonVariants } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { LoadingState } from "@/components/shared/loading-state";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
 import {
@@ -18,6 +21,26 @@ import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, setStoredSelectedVendor
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
 
+// Every capability name/tag/category that appears anywhere in a vendor's
+// published Solution DNA — the searchable surface for "find me a vendor
+// that can do X" instead of only being able to search by vendor name.
+function capabilityHaystack(vendor: PublishedVendor | undefined): string {
+  if (!vendor) return "";
+  return vendor.capabilities
+    .flatMap((c) => [c.name, c.category, ...(c.tags ?? [])])
+    .join(" ")
+    .toLowerCase();
+}
+
+function matchingCapabilityName(vendor: PublishedVendor | undefined, query: string): string | undefined {
+  if (!vendor || !query) return undefined;
+  const q = query.toLowerCase();
+  const hit = vendor.capabilities.find(
+    (c) => c.name.toLowerCase().includes(q) || c.category.toLowerCase().includes(q) || c.tags.some((t) => t.toLowerCase().includes(q))
+  );
+  return hit?.name;
+}
+
 // PRD §5 Step 3: "Do not proceed to Build Client Reality Profile or any
 // later step until the buyer has explicitly confirmed a vendorId — this is
 // a hard gate, not a default-to-top-ranked shortcut." So this page always
@@ -29,6 +52,7 @@ export default function BuyerVendorsPage() {
   const [vendorsById, setVendorsById] = useState<Record<string, PublishedVendor>>({});
   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
 
   const selection = usePendingApproval("confirm_vendor_selection", {
     buyerId,
@@ -70,6 +94,26 @@ export default function BuyerVendorsPage() {
     await selection.respond({ optionId });
     setTimeout(refresh, 1500);
   }
+
+  const filteredRecommendations = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return recommendations;
+    return recommendations.filter((r) => {
+      const vendor = vendorsById[r.vendorId];
+      const fields = [
+        vendor?.companyName,
+        vendor?.industry,
+        vendor?.tagline,
+        vendor?.description,
+        ...(vendor?.industries ?? []),
+        r.keyMatch,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return fields.includes(q) || capabilityHaystack(vendor).includes(q);
+    });
+  }, [query, recommendations, vendorsById]);
 
   if (!buyerId) {
     return (
@@ -130,15 +174,60 @@ export default function BuyerVendorsPage() {
         )
       )}
 
+      {!loading && recommendations.length > 0 && (
+        <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="relative max-w-sm flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+            <Input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search by capability, industry, or vendor…"
+              className="pl-9 pr-9"
+              aria-label="Search vendors by capability"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
+                aria-label="Clear search"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+          {query && (
+            <p className="text-xs text-muted">
+              {filteredRecommendations.length} of {recommendations.length} vendor{recommendations.length === 1 ? "" : "s"} match
+            </p>
+          )}
+        </div>
+      )}
+
       {loading ? (
-        <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading recommendations…</p>
+        <LoadingState variant="cards" count={3} />
       ) : recommendations.length === 0 ? (
         <Card className="p-6 text-center text-sm text-muted">No vendor recommendations yet — check back shortly.</Card>
+      ) : filteredRecommendations.length === 0 ? (
+        <Card className="p-6 text-center text-sm text-muted">
+          No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
+        </Card>
       ) : (
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
-          {recommendations.map((r) => (
-            <VendorRecommendationCard key={r.id} recommendation={r} vendor={vendorsById[r.vendorId]} href={`/buyer/vendors/${r.vendorId}`} />
-          ))}
+          {filteredRecommendations.map((r) => {
+            const vendor = vendorsById[r.vendorId];
+            const matched = matchingCapabilityName(vendor, query);
+            return (
+              <div key={r.id} className="flex flex-col gap-2">
+                {matched && (
+                  <Badge variant="brand" size="sm" className="w-fit">
+                    Matches: {matched}
+                  </Badge>
+                )}
+                <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

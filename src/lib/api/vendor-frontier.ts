@@ -11,6 +11,7 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 async function restGet<T>(path: string): Promise<T> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    cache: "no-store",
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
   if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
@@ -21,6 +22,7 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
   const res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
     method: "POST",
+    cache: "no-store",
     headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
     body: JSON.stringify(body),
   });

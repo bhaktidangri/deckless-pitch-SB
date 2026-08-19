@@ -27,6 +27,7 @@ export async function getVendorKnowledgeDocument(vendorId: string): Promise<Vend
     limit: "1",
   });
   const res = await fetch(`${SUPABASE_URL}/rest/v1/vendor_knowledge_documents?${params}`, {
+    cache: "no-store",
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
   if (!res.ok) return null;
