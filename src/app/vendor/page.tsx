@@ -1,3 +1,5 @@
+"use client";
+
 import Link from "next/link";
 import { ArrowUpRight, CircleAlert, Clock, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";

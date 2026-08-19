@@ -1,0 +1,2961 @@
+From 4648d3d9aaa50c3fd1e2c54a8f8fa7ae21fbf19d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 19 Aug 2026 22:35:21 +0000
+Subject: [PATCH] Wire buyer portal to real Supabase data and the Buyer
+ Discovery workflow
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces every buyer page's dummy-data.ts usage with live reads against
+the buyers/buyer_requirements/client_reality_profiles/vendor_recommendations/
+solution_models/roi_projections/solution_matches/gap_items/capability_frontier/
+conversations/messages/meeting_requests/buyer_solution_decks tables (same
+direct-REST pattern already used on the vendor side).
+
+Replaces the scripted fake Discover chat with a real intake form that
+triggers the buyer_requirement_submission Yoxa workflow — this guarantees
+companyName is always present on save-buyer-requirements' first call,
+fixing the 400 ("companyName or buyerId is required") that was cascading
+into 404s on every downstream tool call.
+
+Adds buyer-session/buyer-lookup/buyer-poll (mirroring the vendor-session/
+vendor-lookup/vendor-poll pattern) to hand off buyer.id client-side once
+discovery completes, and wires Requirements' "Add" and Handoff's "Confirm
+meeting" to the real save-buyer-requirements / schedule-vendor-discussion
+tools instead of local-only fake state.
+---
+ .../api/buyer-requirement-submission/route.ts |  57 +++
+ src/app/buyer/chat/page.tsx                   |  96 +++-
+ src/app/buyer/discover/page.tsx               | 455 +++++++++---------
+ src/app/buyer/handoff/page.tsx                | 110 ++++-
+ src/app/buyer/layout.tsx                      |  16 +-
+ src/app/buyer/page.tsx                        | 220 +++++++--
+ src/app/buyer/requirements/page.tsx           | 127 +++--
+ src/app/buyer/scenarios/page.tsx              | 121 ++++-
+ src/app/buyer/solution/page.tsx               | 268 ++++++++---
+ src/app/buyer/vendors/[id]/page.tsx           |  85 +++-
+ src/app/buyer/vendors/page.tsx                |  73 ++-
+ src/lib/api/buyer-lookup.ts                   |  78 +++
+ src/lib/api/buyer.ts                          | 402 ++++++++++++++++
+ src/lib/api/yoxa-trigger.ts                   |  40 +-
+ src/lib/buyer-poll.ts                         | 114 +++++
+ src/lib/buyer-session.ts                      |  82 ++++
+ 16 files changed, 1898 insertions(+), 446 deletions(-)
+ create mode 100644 src/app/api/buyer-requirement-submission/route.ts
+ create mode 100644 src/lib/api/buyer-lookup.ts
+ create mode 100644 src/lib/api/buyer.ts
+ create mode 100644 src/lib/buyer-poll.ts
+ create mode 100644 src/lib/buyer-session.ts
+
+diff --git a/src/app/api/buyer-requirement-submission/route.ts b/src/app/api/buyer-requirement-submission/route.ts
+new file mode 100644
+index 0000000..d12ba71
+--- /dev/null
++++ b/src/app/api/buyer-requirement-submission/route.ts
+@@ -0,0 +1,57 @@
++import { NextResponse } from "next/server";
++import { triggerBuyerRequirementSubmission, YoxaTriggerError } from "@/lib/api/yoxa-trigger";
++
++interface SubmissionBody {
++  companyName?: string;
++  industry?: string;
++  companySize?: number;
++  contactName?: string;
++  contactRole?: string;
++  requirementText?: string;
++}
++
++// Server-side trigger for buyer_requirement_submission. Kept server-only
++// because YOXA_BUYER_DEPLOYMENT_SECRET must not reach the browser.
++//
++// This is the fix for the workflow's very first tool call
++// ("Capture Initial Requirement Summary" -> save-buyer-requirements) 400ing
++// with "companyName or buyerId is required": that tool only ever receives
++// what the conversation has established by the time it fires, and the
++// Buyer Discovery agent doesn't ask for company identity on its own. Rather
++// than rely on the agent to remember, we collect companyName (and the rest
++// of the buyer's identity) in a real form up front and put it directly into
++// trigger_text — the same pattern vendor-source-submission/route.ts already
++// uses to guarantee companyName is never null on Milestone 1's first call.
++export async function POST(req: Request) {
++  const body = (await req.json().catch(() => ({}))) as SubmissionBody;
++
++  if (!body.companyName?.trim()) {
++    return NextResponse.json({ error: "Company name is required." }, { status: 400 });
++  }
++  if (!body.requirementText?.trim()) {
++    return NextResponse.json({ error: "Describe at least one requirement to get started." }, { status: 400 });
++  }
++
++  const lines: string[] = [];
++  lines.push(`Company name: ${body.companyName.trim()}`);
++  if (body.industry) lines.push(`Industry: ${body.industry}`);
++  if (typeof body.companySize === "number" && body.companySize > 0) lines.push(`Company size: ${body.companySize} employees`);
++  if (body.contactName) lines.push(`Contact name: ${body.contactName}`);
++  if (body.contactRole) lines.push(`Contact role: ${body.contactRole}`);
++  lines.push(`Primary requirement: ${body.requirementText.trim()}`);
++  lines.push(
++    "When calling Capture Initial Requirement Summary, pass the company name, industry, company size, contact name, and contact role above exactly as given — do not leave them null."
++  );
++
++  const triggerText = lines.join("\n").trim();
++
++  try {
++    const result = await triggerBuyerRequirementSubmission(triggerText);
++    return NextResponse.json(result, { status: 202 });
++  } catch (e) {
++    if (e instanceof YoxaTriggerError) {
++      return NextResponse.json({ error: e.message, code: e.code }, { status: e.status === 503 ? 503 : 502 });
++    }
++    return NextResponse.json({ error: "Could not submit to the buyer workflow trigger." }, { status: 502 });
++  }
++}
+diff --git a/src/app/buyer/chat/page.tsx b/src/app/buyer/chat/page.tsx
+index 6ed8524..ac5887b 100644
+--- a/src/app/buyer/chat/page.tsx
++++ b/src/app/buyer/chat/page.tsx
+@@ -1,21 +1,99 @@
+-import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
++"use client";
++
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { ArrowUpRight, Bot, Database, FileCheck2, Loader2, Search, ShoppingBag } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { buttonVariants } from "@/components/ui/button";
+ import { ChatPanel } from "@/components/shared/chat-panel";
+-import { conversation, primaryVendor } from "@/lib/dummy-data";
++import { getActiveVendorSelection, getBuyer, getConversationMessages, getRecommendedVendors, getVendorById } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { ConversationMessage, Vendor } from "@/lib/types";
++import { cn } from "@/lib/utils";
+ 
+ export default function BuyerChatPage() {
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [vendor, setVendor] = useState<Vendor | null>(null);
++  const [companyName, setCompanyName] = useState("");
++  const [messages, setMessages] = useState<ConversationMessage[] | null>(null);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      const [buyer, activeVendorId] = await Promise.all([getBuyer(buyerId), getActiveVendorSelection(buyerId)]);
++      if (cancelled) return;
++      if (buyer) setCompanyName(buyer.companyName);
++
++      let v: Vendor | null = null;
++      if (activeVendorId) {
++        const recs = await getRecommendedVendors(buyerId);
++        v = recs.find((r) => r.id === activeVendorId) ?? (await getVendorById(activeVendorId));
++      }
++      if (cancelled) return;
++      setVendor(v);
++
++      const history = await getConversationMessages(buyerId, activeVendorId ?? undefined);
++      if (cancelled) return;
++      setMessages(
++        history.length > 0
++          ? history
++          : [
++              {
++                id: "starter",
++                role: "assistant",
++                content: v
++                  ? `Ask me anything about ${v.name}'s fit for ${buyer?.companyName ?? "your business"} — pricing, compliance, migration timeline, or your ROI numbers.`
++                  : "Ask me anything once your vendor match is ready.",
++                createdAt: new Date().toISOString(),
++              },
++            ]
++      );
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Agentic Chat" title="Ask your vendor's AI" description="Start discovery to unlock grounded chat with your matched vendor." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (messages === null) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
+   return (
+     <div>
+       <PageHeader
+         eyebrow="Agentic Chat"
+-        title="Ask CloudNova's AI"
+-        description="Grounded in CloudNova's Solution DNA and your Client Reality Profile — never a generic chatbot."
++        title={vendor ? `Ask ${vendor.name}'s AI` : "Ask AI"}
++        description={
++          vendor
++            ? `Grounded in ${vendor.name}'s Solution DNA and your Client Reality Profile — never a generic chatbot.`
++            : "Your vendor match is still being generated."
++        }
+       />
+ 
+       <div className="grid gap-6 lg:grid-cols-3">
+         <Card className="h-[640px] lg:col-span-2">
+-          <ChatPanel initialMessages={conversation} />
++          <ChatPanel initialMessages={messages} />
+         </Card>
+ 
+         <div className="space-y-4">
+@@ -26,9 +104,9 @@ export default function BuyerChatPage() {
+               </CardTitle>
+             </CardHeader>
+             <CardContent className="space-y-2.5 pt-2">
+-              <ContextRow icon={Database} label={`${primaryVendor.name} Solution DNA`} detail="6 sources, 10 capabilities" />
+-              <ContextRow icon={ShoppingBag} label="Client Reality Profile" detail="Meridian Retail Group" />
+-              <ContextRow icon={FileCheck2} label="Solution Model v3" detail="Updated today" />
++              <ContextRow icon={Database} label={vendor ? `${vendor.name} Solution DNA` : "Vendor Solution DNA"} detail="Published capabilities" />
++              <ContextRow icon={ShoppingBag} label="Client Reality Profile" detail={companyName || "Your company"} />
++              <ContextRow icon={FileCheck2} label="Solution Model" detail="Latest version" />
+             </CardContent>
+           </Card>
+ 
+@@ -37,7 +115,7 @@ export default function BuyerChatPage() {
+               <p className="text-sm font-semibold text-foreground">How this stays honest</p>
+               <p className="mt-2 text-sm text-muted">
+                 Every answer is checked against verified evidence before it reaches you. If nothing supports a
+-                confident answer, the AI says so — and routes it to a CloudNova specialist instead of guessing.
++                confident answer, the AI says so — and routes it to a specialist instead of guessing.
+               </p>
+             </CardContent>
+           </Card>
+diff --git a/src/app/buyer/discover/page.tsx b/src/app/buyer/discover/page.tsx
+index aa5495d..a2fa978 100644
+--- a/src/app/buyer/discover/page.tsx
++++ b/src/app/buyer/discover/page.tsx
+@@ -1,248 +1,269 @@
+ "use client";
+ 
+ import { useEffect, useRef, useState } from "react";
+-import Link from "next/link";
+-import { AnimatePresence, motion } from "motion/react";
+-import { ArrowRight, CheckCircle2, Sparkles } from "lucide-react";
++import { useRouter } from "next/navigation";
++import { AlertTriangle, Building2, CheckCircle2, Clock, Loader2 } from "lucide-react";
++import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+-import { Avatar } from "@/components/ui/avatar";
+-import { Button, buttonVariants } from "@/components/ui/button";
+-import { cn } from "@/lib/utils";
+-
+-interface Turn {
+-  question: string;
+-  placeholder: string;
+-  defaultAnswer: string;
+-}
++import { Input, Label, Select, Textarea } from "@/components/ui/input";
++import { Button } from "@/components/ui/button";
++import {
++  clearPendingBuyerSubmission,
++  getPendingBuyerSubmission,
++  getStoredBuyerId,
++  setPendingBuyerSubmission,
++  setStoredBuyerContactName,
++  setStoredBuyerId,
++  setStoredBuyerName,
++} from "@/lib/buyer-session";
++import { BUYER_POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
+ 
+-const script: Turn[] = [
+-  {
+-    question: "What's the primary problem or requirement you're facing?",
+-    placeholder: "Describe your business problem...",
+-    defaultAnswer: "We need to reduce our cloud infrastructure cost and our current setup is hard to scale.",
+-  },
+-  {
+-    question: "What systems or infrastructure are you currently using?",
+-    placeholder: "e.g. On-prem servers, specific vendors, database...",
+-    defaultAnswer: "On-prem VMware cluster running a legacy Java monolith, MySQL 5.7.",
+-  },
+-  {
+-    question: "Roughly what's your current annual infrastructure cost?",
+-    placeholder: "e.g. ₹40L per year",
+-    defaultAnswer: "About ₹42 lakhs per year.",
+-  },
+-  {
+-    question: "How many users or how much load does this support today?",
+-    placeholder: "e.g. 500 users",
+-    defaultAnswer: "Around 500 users, growing toward 1,000 next year.",
+-  },
+-  {
+-    question: "What's your expected timeline, and are there any windows we should avoid?",
+-    placeholder: "e.g. 6 months, avoid Q4",
+-    defaultAnswer: "About 6 months — but we can't disrupt our Q4 holiday sale season.",
+-  },
+-  {
+-    question: "Any compliance or regulatory requirements we should know about?",
+-    placeholder: "e.g. PCI-DSS, HIPAA, SOC2...",
+-    defaultAnswer: "Yes — PCI-DSS, since we process retail card payments.",
+-  },
+-];
+-
+-interface CompletedTurn extends Turn {
+-  answer: string;
+-}
++const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
+ 
++type Stage = "idle" | "submitting" | "processing" | "timed-out" | "error";
++
++// Real intake for the Buyer Discovery To Handoff workflow's
++// buyer_requirement_submission trigger. This replaces the old scripted fake
++// chat: company identity is collected here, up front, in a real form —
++// because "Capture Initial Requirement Summary" (save-buyer-requirements)
++// requires companyName (or an existing buyerId) on its very first call, and
++// the discovery agent has no other reliable way to learn it. See
++// /api/buyer-requirement-submission for how these fields become trigger_text.
+ export default function DiscoverPage() {
+-  const [completed, setCompleted] = useState<CompletedTurn[]>([]);
+-  const [input, setInput] = useState(script[0].defaultAnswer);
+-  const [thinking, setThinking] = useState(false);
+-  const [done, setDone] = useState(false);
+-  const scrollRef = useRef<HTMLDivElement>(null);
++  const router = useRouter();
++  const existingBuyerId = getStoredBuyerId();
++  const pollHandleRef = useRef<PollHandle | null>(null);
++  useEffect(() => () => pollHandleRef.current?.cancel(), []);
+ 
+-  const currentIndex = completed.length;
+-  const current = script[currentIndex];
++  const [companyName, setCompanyName] = useState("");
++  const [industry, setIndustry] = useState(industryOptions[0]);
++  const [companySize, setCompanySize] = useState("");
++  const [contactName, setContactName] = useState("");
++  const [contactRole, setContactRole] = useState("");
++  const [requirementText, setRequirementText] = useState("");
+ 
+-  useEffect(() => {
+-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+-  }, [completed, thinking]);
+-
+-  function submit() {
+-    if (!current || !input.trim()) return;
+-    const answer = input.trim();
+-    setThinking(true);
+-    setTimeout(() => {
+-      setCompleted((c) => [...c, { ...current, answer }]);
+-      setThinking(false);
+-      const next = script[currentIndex + 1];
+-      setInput(next ? next.defaultAnswer : "");
+-      if (!next) setDone(true);
+-    }, 850);
++  const [stage, setStage] = useState<Stage>(() => (!existingBuyerId && getPendingBuyerSubmission() ? "processing" : "idle"));
++  const [error, setError] = useState<string | null>(null);
++  const [runId, setRunId] = useState<string | null>(null);
++
++  const canSubmit = companyName.trim().length > 0 && requirementText.trim().length > 0;
++
++  function goToDashboard() {
++    router.push("/buyer");
+   }
+ 
+-  const progress = Math.round((completed.length / script.length) * 100);
++  async function handleSubmit(e: React.FormEvent) {
++    e.preventDefault();
++    if (!canSubmit) return;
++    setStage("submitting");
++    setError(null);
++
++    const triggeredAt = new Date().toISOString();
++
++    try {
++      const res = await fetch("/api/buyer-requirement-submission", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          companyName: companyName.trim(),
++          industry,
++          companySize: companySize ? parseInt(companySize, 10) : undefined,
++          contactName: contactName.trim() || undefined,
++          contactRole: contactRole.trim() || undefined,
++          requirementText: requirementText.trim(),
++        }),
++      });
++      const data = await res.json().catch(() => ({}) as Record<string, unknown>);
++      if (!res.ok) {
++        setError(typeof data?.error === "string" ? data.error : "Submission failed.");
++        setStage("error");
++        return;
++      }
++
++      const workflowRunId = typeof data?.workflowRunId === "string" ? data.workflowRunId : null;
++      setRunId(workflowRunId);
++      setStoredBuyerName(companyName.trim());
++      if (contactName.trim()) setStoredBuyerContactName(contactName.trim());
++      setStage("processing");
++
++      const deadline = Date.now() + BUYER_POLL_TIMEOUT_MS;
++      setPendingBuyerSubmission({ companyName: companyName.trim(), afterIso: triggeredAt, deadline });
++      pollHandleRef.current = pollForNewBuyerId(
++        companyName.trim(),
++        triggeredAt,
++        deadline,
++        (buyerId) => {
++          setStoredBuyerId(buyerId);
++          clearPendingBuyerSubmission();
++          router.push("/buyer");
++        },
++        () => setStage("timed-out")
++      );
++    } catch {
++      setError("Could not reach the submission endpoint. Check your connection and try again.");
++      setStage("error");
++    }
++  }
++
++  // Resume polling if we land here with a pending submission from an
++  // earlier visit (e.g. the buyer reloaded mid-poll) — stage starts at
++  // "processing" via the lazy initializer above, so this effect only needs
++  // to (re)start the poll itself, not set state synchronously.
++  useEffect(() => {
++    if (existingBuyerId) return;
++    const pending = getPendingBuyerSubmission();
++    if (!pending) return;
++    pollHandleRef.current = pollForNewBuyerId(
++      pending.companyName,
++      pending.afterIso,
++      pending.deadline,
++      (buyerId) => {
++        setStoredBuyerId(buyerId);
++        clearPendingBuyerSubmission();
++        router.push("/buyer");
++      },
++      () => setStage("timed-out")
++    );
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  if (stage === "processing" || stage === "timed-out") {
++    return (
++      <div>
++        <PageHeader
++          eyebrow="Understand Buyer Requirement"
++          title="Setting up your discovery…"
++          description="The Buyer Discovery Agent is capturing your requirement and matching it against every published vendor."
++        />
++        <Card className="max-w-md p-6 text-center">
++          {stage === "processing" ? (
++            <>
++              <Loader2 className="mx-auto h-6 w-6 animate-spin text-brand-500" />
++              <p className="mt-3 text-sm text-muted">This usually takes under a minute.</p>
++              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
++            </>
++          ) : (
++            <>
++              <Clock className="mx-auto h-6 w-6 text-modelled" />
++              <p className="mt-3 text-sm font-medium text-foreground">Still setting up after a minute.</p>
++              <p className="mt-1 text-sm text-muted">
++                Your submission is running — check{" "}
++                <button className="text-brand-600 underline dark:text-brand-400" onClick={goToDashboard}>
++                  your dashboard
++                </button>{" "}
++                in a moment. Vendor matching, your Client Reality Profile, and your solution deck all keep building
++                in the background even if you navigate away.
++              </p>
++              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
++            </>
++          )}
++        </Card>
++      </div>
++    );
++  }
+ 
+   return (
+     <div>
+-      <div className="mb-6">
+-        <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-brand-600 dark:text-brand-400">Buyer Discovery Agent</p>
+-        <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Tell us about your business</h1>
+-        <p className="mt-1.5 max-w-2xl text-sm text-muted sm:text-base">
+-          The AI asks only what&apos;s relevant to your problem — no fixed questionnaire. Answers build your Client
+-          Reality Profile in real time.
+-        </p>
+-      </div>
++      <PageHeader
++        eyebrow="Understand Buyer Requirement"
++        title="Tell us about your business"
++        description="A few details about your company, plus your primary requirement — the AI takes it from there: matching vendors, building your Client Reality Profile, and generating a personalized solution."
++      />
+ 
+       <div className="grid gap-6 lg:grid-cols-3">
+-        <Card className="flex h-[600px] flex-col lg:col-span-2">
+-          <div ref={scrollRef} className="flex-1 space-y-5 overflow-y-auto p-5">
+-            {completed.map((turn, i) => (
+-              <div key={i} className="space-y-4">
+-                <QuestionBubble text={turn.question} />
+-                <AnswerBubble text={turn.answer} />
++        <Card className="lg:col-span-2">
++          <CardHeader>
++            <CardTitle className="flex items-center gap-2">
++              <Building2 className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Company &amp; requirement
++            </CardTitle>
++            <CardDescription>
++              {existingBuyerId
++                ? "You're a returning buyer — this starts a fresh discovery run."
++                : "Company name registers you as a new buyer on your first submission."}
++            </CardDescription>
++          </CardHeader>
++          <CardContent>
++            <form onSubmit={handleSubmit} className="space-y-4">
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="name">Company name</Label>
++                  <Input id="name" value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Meridian Retail Group" required />
++                </div>
++                <div>
++                  <Label htmlFor="industry">Industry</Label>
++                  <Select id="industry" value={industry} onChange={(e) => setIndustry(e.target.value)}>
++                    {industryOptions.map((opt) => (
++                      <option key={opt}>{opt}</option>
++                    ))}
++                  </Select>
++                </div>
+               </div>
+-            ))}
+-
+-            {!done && current && (
+-              <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-4">
+-                <QuestionBubble text={current.question} />
+-                {thinking && <ThinkingBubble />}
+-              </motion.div>
+-            )}
+-
+-            {done && (
+-              <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="flex items-start gap-3">
+-                <Avatar name="Discovery AI" color="brand" size="sm" />
+-                <div className="rounded-2xl rounded-tl-sm border border-verified-border bg-verified-bg px-4 py-3 text-sm text-foreground">
+-                  <p className="flex items-center gap-1.5 font-medium text-verified">
+-                    <CheckCircle2 className="h-4 w-4" /> That&apos;s everything I need for now.
+-                  </p>
+-                  <p className="mt-1 text-foreground/80">
+-                    I&apos;ve built your Client Reality Profile and matched it against verified vendor capabilities.
+-                    CloudNova looks like a strong fit based on your requirements.
+-                  </p>
++
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="size">Company size (employees)</Label>
++                  <Input id="size" type="number" min={1} value={companySize} onChange={(e) => setCompanySize(e.target.value)} placeholder="500" />
+                 </div>
+-              </motion.div>
+-            )}
+-          </div>
+-
+-          {!done && (
+-            <div className="border-t border-border p-4">
+-              <form
+-                onSubmit={(e) => {
+-                  e.preventDefault();
+-                  submit();
+-                }}
+-                className="flex items-end gap-2"
+-              >
+-                <textarea
+-                  value={input}
+-                  onChange={(e) => setInput(e.target.value)}
+-                  onKeyDown={(e) => {
+-                    if (e.key === "Enter" && !e.shiftKey) {
+-                      e.preventDefault();
+-                      submit();
+-                    }
+-                  }}
+-                  placeholder={current?.placeholder}
+-                  rows={2}
+-                  className="flex-1 resize-none rounded-xl border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-subtle focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20"
+-                />
+-                <Button type="submit" disabled={!input.trim() || thinking}>
+-                  <ArrowRight className="h-4 w-4" />
+-                </Button>
+-              </form>
+-            </div>
+-          )}
++                <div>
++                  <Label htmlFor="contactName">Your name</Label>
++                  <Input id="contactName" value={contactName} onChange={(e) => setContactName(e.target.value)} placeholder="Priya Sharma" />
++                </div>
++              </div>
+ 
+-          {done && (
+-            <div className="border-t border-border p-4">
+-              <Link href="/buyer/vendors" className={cn(buttonVariants({ variant: "primary" }), "w-full")}>
+-                See vendor recommendations <ArrowRight className="h-4 w-4" />
+-              </Link>
+-            </div>
+-          )}
+-        </Card>
++              <div>
++                <Label htmlFor="contactRole">Your role</Label>
++                <Input id="contactRole" value={contactRole} onChange={(e) => setContactRole(e.target.value)} placeholder="VP of Technology" />
++              </div>
+ 
+-        <div className="space-y-6">
+-          <Card>
+-            <CardHeader>
+-              <CardTitle className="flex items-center gap-2">
+-                <Sparkles className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Progress
+-              </CardTitle>
+-              <CardDescription>{completed.length} of {script.length} questions answered</CardDescription>
+-            </CardHeader>
+-            <CardContent className="pt-2">
+-              <div className="h-2 w-full overflow-hidden rounded-full bg-surface-2">
+-                <motion.div
+-                  className="h-full rounded-full bg-gradient-to-r from-brand-500 to-accent-500"
+-                  animate={{ width: `${progress}%` }}
+-                  transition={{ duration: 0.4 }}
++              <div>
++                <Label htmlFor="requirement">What&apos;s the primary problem or requirement you&apos;re facing?</Label>
++                <Textarea
++                  id="requirement"
++                  value={requirementText}
++                  onChange={(e) => setRequirementText(e.target.value)}
++                  rows={4}
++                  placeholder="We need to reduce our cloud infrastructure cost and our current setup is hard to scale."
++                  required
+                 />
+               </div>
+-            </CardContent>
+-          </Card>
+ 
+-          <Card>
+-            <CardHeader>
+-              <CardTitle>Client Reality Profile</CardTitle>
+-              <CardDescription>Building live as you answer</CardDescription>
+-            </CardHeader>
+-            <CardContent className="pt-2">
+-              <AnimatePresence>
+-                {completed.length === 0 && <p className="text-sm text-subtle">Nothing captured yet.</p>}
+-                <div className="space-y-3">
+-                  {completed.map((turn, i) => (
+-                    <motion.div
+-                      key={i}
+-                      initial={{ opacity: 0, x: 10 }}
+-                      animate={{ opacity: 1, x: 0 }}
+-                      className="rounded-lg bg-surface-2 p-3"
+-                    >
+-                      <p className="text-[11px] font-medium uppercase tracking-wide text-subtle">{turn.question}</p>
+-                      <p className="mt-1 text-sm text-foreground">{turn.answer}</p>
+-                    </motion.div>
+-                  ))}
++              {stage === "error" && error && (
++                <div className="flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
++                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
++                  {error}
+                 </div>
+-              </AnimatePresence>
++              )}
++
++              <div className="flex items-center gap-3 pt-2">
++                <Button type="submit" disabled={!canSubmit || stage === "submitting"} loading={stage === "submitting"}>
++                  {stage === "submitting" ? "Submitting…" : "Start discovery"}
++                </Button>
++              </div>
++            </form>
++          </CardContent>
++        </Card>
++
++        <div className="space-y-6">
++          <Card className="border-brand-200 bg-brand-50/50 dark:border-brand-900 dark:bg-brand-950/20">
++            <CardContent className="pt-5">
++              <p className="text-sm font-semibold text-foreground">What happens next?</p>
++              <p className="mt-2 text-sm text-muted">
++                The Buyer Discovery Agent captures your requirement, the Solution Matching Agent ranks published
++                vendors against it, and a personalized solution deck (with ROI) is generated automatically — you&apos;re
++                taken to your dashboard as soon as your account is set up.
++              </p>
+             </CardContent>
+           </Card>
++          {existingBuyerId && (
++            <Card>
++              <CardContent className="flex items-start gap-2.5 pt-5 text-sm text-muted">
++                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-verified" />
++                Registered buyer: <span className="ml-1 font-mono text-xs text-foreground">{existingBuyerId}</span>
++              </CardContent>
++            </Card>
++          )}
+         </div>
+       </div>
+     </div>
+   );
+ }
+-
+-function QuestionBubble({ text }: { text: string }) {
+-  return (
+-    <div className="flex items-start gap-3">
+-      <Avatar name="Discovery AI" color="brand" size="sm" />
+-      <div className="max-w-[85%] rounded-2xl rounded-tl-sm border border-border bg-surface-2 px-4 py-3 text-sm text-foreground">
+-        {text}
+-      </div>
+-    </div>
+-  );
+-}
+-
+-function AnswerBubble({ text }: { text: string }) {
+-  return (
+-    <div className="flex flex-row-reverse items-start gap-3">
+-      <Avatar name="You" color="accent" size="sm" />
+-      <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-brand-600 px-4 py-3 text-sm text-white">{text}</div>
+-    </div>
+-  );
+-}
+-
+-function ThinkingBubble() {
+-  return (
+-    <div className="flex items-center gap-1.5 pl-11">
+-      {[0, 1, 2].map((i) => (
+-        <motion.span
+-          key={i}
+-          className="h-1.5 w-1.5 rounded-full bg-subtle"
+-          animate={{ opacity: [0.3, 1, 0.3] }}
+-          transition={{ duration: 1, repeat: Infinity, delay: i * 0.15 }}
+-        />
+-      ))}
+-    </div>
+-  );
+-}
+diff --git a/src/app/buyer/handoff/page.tsx b/src/app/buyer/handoff/page.tsx
+index c66ab00..ee6da40 100644
+--- a/src/app/buyer/handoff/page.tsx
++++ b/src/app/buyer/handoff/page.tsx
+@@ -1,39 +1,114 @@
+ "use client";
+ 
+-import { useState } from "react";
+-import { CalendarCheck2, CheckCircle2, Clock, UserCheck, Video } from "lucide-react";
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { AlertTriangle, ArrowUpRight, CalendarCheck2, CheckCircle2, Clock, Loader2, Search, UserCheck, Video } from "lucide-react";
+ import { motion } from "motion/react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+-import { Button } from "@/components/ui/button";
++import { Button, buttonVariants } from "@/components/ui/button";
+ import { Badge } from "@/components/ui/badge";
+ import { FrontierCard } from "@/components/shared/frontier-card";
+-import { capabilityFrontierItems, primaryVendor } from "@/lib/dummy-data";
++import { getActiveVendorSelection, getCapabilityFrontier, getRecommendedVendors, getVendorById, scheduleVendorDiscussion } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { CapabilityFrontierItem, Vendor } from "@/lib/types";
+ import { cn } from "@/lib/utils";
+ 
+ const slots = [
+-  { id: "s1", label: "Wed, Aug 19", time: "10:00 AM IST" },
+-  { id: "s2", label: "Wed, Aug 19", time: "3:30 PM IST" },
+-  { id: "s3", label: "Thu, Aug 20", time: "11:00 AM IST" },
+-  { id: "s4", label: "Fri, Aug 21", time: "2:00 PM IST" },
++  { id: "s1", label: "Wed, Aug 19", time: "10:00 AM IST", iso: "2026-08-19T04:30:00.000Z" },
++  { id: "s2", label: "Wed, Aug 19", time: "3:30 PM IST", iso: "2026-08-19T10:00:00.000Z" },
++  { id: "s3", label: "Thu, Aug 20", time: "11:00 AM IST", iso: "2026-08-20T05:30:00.000Z" },
++  { id: "s4", label: "Fri, Aug 21", time: "2:00 PM IST", iso: "2026-08-21T08:30:00.000Z" },
+ ];
+ 
+ export default function HandoffPage() {
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [vendor, setVendor] = useState<Vendor | null>(null);
++  const [openItems, setOpenItems] = useState<CapabilityFrontierItem[]>([]);
++  const [loading, setLoading] = useState(() => !!buyerId);
++
+   const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
++  const [scheduling, setScheduling] = useState(false);
+   const [confirmed, setConfirmed] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      try {
++        const [activeVendorId, frontier] = await Promise.all([getActiveVendorSelection(buyerId), getCapabilityFrontier(buyerId)]);
++        if (cancelled) return;
++        setOpenItems(frontier.filter((f) => f.status !== "resolved" && f.status !== "closed"));
++        if (activeVendorId) {
++          const recs = await getRecommendedVendors(buyerId);
++          const v = recs.find((r) => r.id === activeVendorId) ?? (await getVendorById(activeVendorId));
++          if (!cancelled) setVendor(v);
++        }
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
+ 
+-  const openItems = capabilityFrontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
++  async function confirmMeeting() {
++    if (!selectedSlot || !buyerId || !vendor) return;
++    setScheduling(true);
++    setError(null);
++    try {
++      const slot = slots.find((s) => s.id === selectedSlot)!;
++      await scheduleVendorDiscussion({
++        buyerId,
++        vendorId: vendor.id,
++        frontierItemIds: openItems.map((i) => i.id),
++        proposedDate: slot.iso,
++        expert: "Solutions Architect",
++      });
++      setConfirmed(true);
++    } catch {
++      setError("Couldn't schedule the meeting right now — try again in a moment.");
++    } finally {
++      setScheduling(false);
++    }
++  }
++
++  if (loading) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Human Handoff" title="Ready for expert discussion?" description="Start discovery first — this page tracks open questions that need vendor confirmation." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
++  }
+ 
+   return (
+     <div>
+       <PageHeader
+         eyebrow="Human Handoff"
+         title="Ready for expert discussion?"
+-        description={`${openItems.length} question${openItems.length === 1 ? "" : "s"} require ${primaryVendor.name} confirmation before closure.`}
++        description={`${openItems.length} question${openItems.length === 1 ? "" : "s"} require ${vendor?.name ?? "vendor"} confirmation before closure.`}
+       />
+ 
+       <div className="grid gap-6 lg:grid-cols-3">
+         <div className="space-y-4 lg:col-span-2">
++          {openItems.length === 0 && <p className="text-sm text-subtle">No open questions right now.</p>}
+           {openItems.map((item) => (
+             <FrontierCard key={item.id} item={item} />
+           ))}
+@@ -71,7 +146,13 @@ export default function HandoffPage() {
+                     </button>
+                   ))}
+                 </div>
+-                <Button className="mt-4 w-full" disabled={!selectedSlot} onClick={() => setConfirmed(true)}>
++                {error && (
++                  <div className="mt-3 flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
++                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
++                    {error}
++                  </div>
++                )}
++                <Button className="mt-4 w-full" disabled={!selectedSlot || !vendor || scheduling} loading={scheduling} onClick={confirmMeeting}>
+                   Confirm meeting
+                 </Button>
+               </CardContent>
+@@ -82,16 +163,17 @@ export default function HandoffPage() {
+                 <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-verified-bg">
+                   <CheckCircle2 className="h-7 w-7 text-verified" />
+                 </div>
+-                <p className="mt-4 text-base font-semibold text-foreground">Meeting scheduled</p>
++                <p className="mt-4 text-base font-semibold text-foreground">Meeting requested</p>
+                 <p className="mt-1 text-sm text-muted">
+                   {slots.find((s) => s.id === selectedSlot)?.label} at {slots.find((s) => s.id === selectedSlot)?.time}
+                 </p>
+                 <Badge variant="verified" className="mt-4">
+-                  Context package sent to CloudNova
++                  Context package sent to {vendor?.name}
+                 </Badge>
+                 <p className="mt-4 text-xs text-subtle">
+                   Your Solutions Architect will arrive prepared with your full discovery history, gap analysis,
+-                  and the {openItems.length} unresolved question{openItems.length === 1 ? "" : "s"} above.
++                  and the {openItems.length} unresolved question{openItems.length === 1 ? "" : "s"} above. They&apos;ll
++                  confirm the final time on their end.
+                 </p>
+               </CardContent>
+             </motion.div>
+diff --git a/src/app/buyer/layout.tsx b/src/app/buyer/layout.tsx
+index f8387ee..c422075 100644
+--- a/src/app/buyer/layout.tsx
++++ b/src/app/buyer/layout.tsx
+@@ -1,5 +1,6 @@
+ "use client";
+ 
++import { useState } from "react";
+ import {
+   LayoutDashboard,
+   Search,
+@@ -11,6 +12,7 @@ import {
+   CalendarClock,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
++import { getStoredBuyerContactName, getStoredBuyerName } from "@/lib/buyer-session";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -39,8 +41,20 @@ const sections: NavSection[] = [
+ ];
+ 
+ export default function BuyerLayout({ children }: { children: React.ReactNode }) {
++  // Reflects the real registered buyer once discovery has run, falling back
++  // to the demo placeholder before that (e.g. first visit, no buyer yet).
++  // Lazy initializers (not an effect) so this is read once on mount without
++  // an extra setState-triggered re-render.
++  const [userName] = useState(() => getStoredBuyerContactName() ?? "Priya Sharma");
++  const [companyName] = useState(() => getStoredBuyerName());
++
+   return (
+-    <PortalShell role="buyer" sections={sections} userName="Priya Sharma" userRole="VP of Technology">
++    <PortalShell
++      role="buyer"
++      sections={sections}
++      userName={userName}
++      userRole={companyName ?? "VP of Technology"}
++    >
+       {children}
+     </PortalShell>
+   );
+diff --git a/src/app/buyer/page.tsx b/src/app/buyer/page.tsx
+index c5624b1..e0c6b5c 100644
+--- a/src/app/buyer/page.tsx
++++ b/src/app/buyer/page.tsx
+@@ -1,5 +1,8 @@
++"use client";
++
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
++import { ArrowUpRight, Loader2, MessageSquareText, Search, Sparkles, Store, TrendingUp } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+@@ -8,24 +11,116 @@ import { buttonVariants } from "@/components/ui/button";
+ import { Badge } from "@/components/ui/badge";
+ import { EvidenceBadge } from "@/components/shared/status-badge";
+ import {
+-  capabilityFrontierItems,
+-  dashboardStats,
+-  primaryVendor,
+-  requirements,
+-  roiProjection,
+-} from "@/lib/dummy-data";
++  getActiveVendorSelection,
++  getBuyerRequirements,
++  getCapabilityFrontier,
++  getRecommendedVendors,
++  getSolutionModel,
++  getVendorById,
++} from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { CapabilityFrontierItem, Requirement, SolutionModel, Vendor } from "@/lib/types";
+ import { cn, formatCurrencyINR } from "@/lib/utils";
+ 
++interface DashboardData {
++  companyName: string;
++  primaryVendor: Vendor | null;
++  requirements: Requirement[];
++  solutionModel: SolutionModel | null;
++  openFrontierItems: CapabilityFrontierItem[];
++  vendorsExplored: number;
++  questionsResolved: number;
++}
++
+ export default function BuyerDashboardPage() {
+-  const stats = dashboardStats.buyer;
+-  const openItems = capabilityFrontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [data, setData] = useState<DashboardData | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      try {
++        const [requirements, activeVendorId, recommendedVendors, frontier] = await Promise.all([
++          getBuyerRequirements(buyerId),
++          getActiveVendorSelection(buyerId),
++          getRecommendedVendors(buyerId),
++          getCapabilityFrontier(buyerId),
++        ]);
++        if (cancelled) return;
++
++        let primaryVendor: Vendor | null = null;
++        if (activeVendorId) {
++          primaryVendor = recommendedVendors.find((v) => v.id === activeVendorId) ?? (await getVendorById(activeVendorId));
++        } else {
++          primaryVendor = recommendedVendors[0] ?? null;
++        }
++
++        const solutionModel = primaryVendor ? await getSolutionModel(buyerId, primaryVendor.id) : null;
++        if (cancelled) return;
++
++        const openFrontierItems = frontier.filter((f) => f.status !== "resolved" && f.status !== "closed");
++
++        setData({
++          companyName: primaryVendor ? primaryVendor.name : "",
++          primaryVendor,
++          requirements,
++          solutionModel,
++          openFrontierItems,
++          vendorsExplored: recommendedVendors.length,
++          questionsResolved: frontier.length - openFrontierItems.length,
++        });
++      } catch {
++        if (!cancelled) setError("Couldn't load your dashboard right now — try refreshing in a moment.");
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
++
++  if (buyerId === null) {
++    return <NoBuyerYet />;
++  }
++
++  if (error) {
++    return (
++      <div>
++        <PageHeader eyebrow="Dashboard" title="Welcome back" description={error} />
++      </div>
++    );
++  }
++
++  if (!data) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
++  const { primaryVendor, requirements, solutionModel, openFrontierItems, vendorsExplored, questionsResolved } = data;
++  const matches = solutionModel?.matches ?? [];
++  const solutionReadiness = matches.length
++    ? Math.round(
++        ((matches.filter((m) => m.matchStatus === "strong_match").length +
++          matches.filter((m) => m.matchStatus === "partial_match").length * 0.5) /
++          matches.length) *
++          100
++      )
++    : 0;
+ 
+   return (
+     <div>
+       <PageHeader
+-        eyebrow="Meridian Retail Group"
+-        title="Welcome back, Priya"
+-        description="Here's where your CloudNova solution stands, and what still needs an answer."
++        eyebrow="Your dashboard"
++        title="Welcome back"
++        description={
++          primaryVendor
++            ? `Here's where your ${primaryVendor.name} solution stands, and what still needs an answer.`
++            : "Your requirement is in — vendor matching is running now."
++        }
+         actions={
+           <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
+             Open solution workspace <ArrowUpRight className="h-4 w-4" />
+@@ -34,10 +129,10 @@ export default function BuyerDashboardPage() {
+       />
+ 
+       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+-        <StatCard label="Solution readiness" value={`${stats.solutionReadiness}%`} icon={TrendingUp} tone="verified" />
+-        <StatCard label="Questions resolved" value={String(stats.questionsResolved)} icon={MessageSquareText} tone="brand" />
+-        <StatCard label="Vendors explored" value={String(stats.vendorsExplored)} icon={Store} tone="accent" />
+-        <StatCard label="Open questions" value={String(stats.openQuestions)} icon={Sparkles} tone="escalated" />
++        <StatCard label="Solution readiness" value={`${solutionReadiness}%`} icon={TrendingUp} tone="verified" />
++        <StatCard label="Questions resolved" value={String(questionsResolved)} icon={MessageSquareText} tone="brand" />
++        <StatCard label="Vendors explored" value={String(vendorsExplored)} icon={Store} tone="accent" />
++        <StatCard label="Open questions" value={String(openFrontierItems.length)} icon={Sparkles} tone="escalated" />
+       </div>
+ 
+       <div className="mt-6 grid gap-6 lg:grid-cols-3">
+@@ -49,36 +144,51 @@ export default function BuyerDashboardPage() {
+             </Link>
+           </CardHeader>
+           <CardContent className="pt-2">
+-            <div className="flex items-center gap-4">
+-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-accent-500 text-lg font-bold text-white">
+-                {primaryVendor.name.slice(0, 2).toUpperCase()}
+-              </div>
+-              <div className="flex-1">
+-                <p className="text-base font-semibold text-foreground">{primaryVendor.name}</p>
+-                <p className="text-sm text-muted">{primaryVendor.tagline}</p>
+-              </div>
+-              <div className="text-right">
+-                <p className="text-2xl font-bold text-brand-600 dark:text-brand-400">{primaryVendor.fitScore}%</p>
+-                <p className="text-[11px] uppercase tracking-wide text-subtle">fit score</p>
+-              </div>
+-            </div>
++            {primaryVendor ? (
++              <>
++                <div className="flex items-center gap-4">
++                  <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-accent-500 text-lg font-bold text-white">
++                    {primaryVendor.name.slice(0, 2).toUpperCase()}
++                  </div>
++                  <div className="flex-1">
++                    <p className="text-base font-semibold text-foreground">{primaryVendor.name}</p>
++                    <p className="text-sm text-muted">{primaryVendor.tagline}</p>
++                  </div>
++                  {primaryVendor.fitScore != null && (
++                    <div className="text-right">
++                      <p className="text-2xl font-bold text-brand-600 dark:text-brand-400">{primaryVendor.fitScore}%</p>
++                      <p className="text-[11px] uppercase tracking-wide text-subtle">fit score</p>
++                    </div>
++                  )}
++                </div>
+ 
+-            <div className="mt-5 rounded-xl bg-surface-2 p-4">
+-              <div className="flex items-center justify-between text-sm">
+-                <span className="text-muted">Projected annual savings</span>
+-                <span className="font-semibold text-verified">{roiProjection.savingsPercent}%</span>
+-              </div>
+-              <Progress value={roiProjection.savingsPercent} className="mt-2" size="sm" />
+-              <p className="mt-2 text-xs text-subtle">
+-                From {formatCurrencyINR(roiProjection.currentAnnualCost)} to {formatCurrencyINR(roiProjection.projectedAnnualCost)}/year
+-              </p>
+-            </div>
++                {solutionModel && (
++                  <div className="mt-5 rounded-xl bg-surface-2 p-4">
++                    <div className="flex items-center justify-between text-sm">
++                      <span className="text-muted">Projected annual savings</span>
++                      <span className="font-semibold text-verified">{solutionModel.roi.savingsPercent}%</span>
++                    </div>
++                    <Progress value={solutionModel.roi.savingsPercent} className="mt-2" size="sm" />
++                    <p className="mt-2 text-xs text-subtle">
++                      From {formatCurrencyINR(solutionModel.roi.currentAnnualCost)} to{" "}
++                      {formatCurrencyINR(solutionModel.roi.projectedAnnualCost)}/year
++                    </p>
++                  </div>
++                )}
+ 
+-            <div className="mt-4 flex flex-wrap gap-2">
+-              {requirements.slice(0, 3).map((r) => (
+-                <Badge key={r.id} variant="outline" size="sm">{r.text}</Badge>
+-              ))}
+-            </div>
++                <div className="mt-4 flex flex-wrap gap-2">
++                  {requirements.slice(0, 3).map((r) => (
++                    <Badge key={r.id} variant="outline" size="sm">
++                      {r.text}
++                    </Badge>
++                  ))}
++                </div>
++              </>
++            ) : (
++              <p className="py-8 text-center text-sm text-muted">
++                Vendor matching is still running for your requirement — check back shortly.
++              </p>
++            )}
+           </CardContent>
+         </Card>
+ 
+@@ -87,7 +197,8 @@ export default function BuyerDashboardPage() {
+             <CardTitle>Awaiting confirmation</CardTitle>
+           </CardHeader>
+           <CardContent className="space-y-3 pt-2">
+-            {openItems.map((item) => (
++            {openFrontierItems.length === 0 && <p className="text-sm text-subtle">Nothing open right now.</p>}
++            {openFrontierItems.slice(0, 4).map((item) => (
+               <div key={item.id} className="rounded-xl border border-border bg-surface-2 p-3.5">
+                 <p className="text-sm font-medium text-foreground">{item.question}</p>
+                 <div className="mt-2 flex items-center justify-between">
+@@ -107,3 +218,22 @@ export default function BuyerDashboardPage() {
+     </div>
+   );
+ }
++
++function NoBuyerYet() {
++  return (
++    <div>
++      <PageHeader
++        eyebrow="Your dashboard"
++        title="Let's get started"
++        description="You haven't run discovery yet — tell us about your business and we'll match you against every published vendor."
++      />
++      <Card className="max-w-md p-6 text-center">
++        <Search className="mx-auto h-6 w-6 text-brand-500" />
++        <p className="mt-3 text-sm text-muted">Nothing to show yet — start discovery to build your dashboard.</p>
++        <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++          Start discovery <ArrowUpRight className="h-4 w-4" />
++        </Link>
++      </Card>
++    </div>
++  );
++}
+diff --git a/src/app/buyer/requirements/page.tsx b/src/app/buyer/requirements/page.tsx
+index 9c72600..bfccaf0 100644
+--- a/src/app/buyer/requirements/page.tsx
++++ b/src/app/buyer/requirements/page.tsx
+@@ -1,27 +1,83 @@
+ "use client";
+ 
+-import { useState } from "react";
+-import { Plus } from "lucide-react";
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { ArrowUpRight, Loader2, Plus, Search } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { Input } from "@/components/ui/input";
+-import { Button } from "@/components/ui/button";
++import { Button, buttonVariants } from "@/components/ui/button";
+ import { RequirementCard } from "@/components/shared/requirement-card";
+-import { clientRealityProfile, requirements as initialRequirements } from "@/lib/dummy-data";
+-import type { Requirement } from "@/lib/types";
+-import { formatCurrencyINR, formatNumber } from "@/lib/utils";
++import { addBuyerRequirement, getBuyerRequirements, getClientRealityProfile } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { ClientRealityProfile, Requirement } from "@/lib/types";
++import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
+ 
+ export default function RequirementsPage() {
+-  const [requirements, setRequirements] = useState<Requirement[]>(initialRequirements);
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [requirements, setRequirements] = useState<Requirement[]>([]);
++  const [profile, setProfile] = useState<ClientRealityProfile | null>(null);
++  const [loading, setLoading] = useState(() => !!buyerId);
+   const [newReq, setNewReq] = useState("");
++  const [adding, setAdding] = useState(false);
+ 
+-  function addRequirement() {
+-    if (!newReq.trim()) return;
+-    setRequirements((r) => [
+-      { id: `req-local-${Date.now()}`, text: newReq.trim(), priority: "medium", status: "captured", source: "buyer_input" },
+-      ...r,
+-    ]);
+-    setNewReq("");
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      try {
++        const [reqs, prof] = await Promise.all([getBuyerRequirements(buyerId), getClientRealityProfile(buyerId)]);
++        if (!cancelled) {
++          setRequirements(reqs);
++          setProfile(prof);
++        }
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
++
++  async function addRequirement() {
++    if (!newReq.trim() || !buyerId) return;
++    setAdding(true);
++    try {
++      const saved = await addBuyerRequirement(buyerId, newReq.trim());
++      setRequirements((r) => [
++        { id: saved.id || `req-local-${r.length}`, text: saved.text, priority: "medium", status: "captured", source: "buyer_input" },
++        ...r,
++      ]);
++      setNewReq("");
++    } catch {
++      // leave the input as-is so the buyer can retry
++    } finally {
++      setAdding(false);
++    }
++  }
++
++  if (loading) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Discovery" title="Requirements" description="Start discovery to begin capturing requirements." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
+   }
+ 
+   return (
+@@ -36,14 +92,20 @@ export default function RequirementsPage() {
+         <div className="space-y-4 lg:col-span-2">
+           <Card>
+             <CardContent className="flex gap-2 py-4">
+-              <Input placeholder="Add a requirement manually..." value={newReq} onChange={(e) => setNewReq(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addRequirement()} />
+-              <Button onClick={addRequirement}>
++              <Input
++                placeholder="Add a requirement manually..."
++                value={newReq}
++                onChange={(e) => setNewReq(e.target.value)}
++                onKeyDown={(e) => e.key === "Enter" && addRequirement()}
++              />
++              <Button onClick={addRequirement} disabled={!newReq.trim() || adding} loading={adding}>
+                 <Plus className="h-4 w-4" /> Add
+               </Button>
+             </CardContent>
+           </Card>
+ 
+           <div className="space-y-2.5">
++            {requirements.length === 0 && <p className="text-sm text-subtle">No requirements captured yet.</p>}
+             {requirements.map((r) => (
+               <RequirementCard key={r.id} requirement={r} />
+             ))}
+@@ -57,19 +119,26 @@ export default function RequirementsPage() {
+               <CardDescription>Auto-built from discovery</CardDescription>
+             </CardHeader>
+             <CardContent className="space-y-4 pt-2">
+-              <Row label="Current cost" value={formatCurrencyINR(clientRealityProfile.currentCostAnnual)} />
+-              <Row label="Users" value={formatNumber(clientRealityProfile.users)} />
+-              <Row label="Timeline" value={`${clientRealityProfile.timelineMonths} months`} />
+-              <div>
+-                <p className="mb-1.5 text-xs font-medium text-subtle">Current technology</p>
+-                <div className="flex flex-wrap gap-1.5">
+-                  {clientRealityProfile.currentTechnology.map((t) => (
+-                    <span key={t} className="rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs text-muted">
+-                      {t}
+-                    </span>
+-                  ))}
+-                </div>
+-              </div>
++              {profile ? (
++                <>
++                  <Row label="Current cost" value={formatCurrencyINR(profile.currentCostAnnual)} />
++                  <Row label="Users" value={formatNumber(profile.users)} />
++                  <Row label="Timeline" value={`${profile.timelineMonths} months`} />
++                  <div>
++                    <p className="mb-1.5 text-xs font-medium text-subtle">Current technology</p>
++                    <div className="flex flex-wrap gap-1.5">
++                      {profile.currentTechnology.length === 0 && <span className="text-xs text-subtle">None captured yet.</span>}
++                      {profile.currentTechnology.map((t) => (
++                        <span key={t} className="rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs text-muted">
++                          {t}
++                        </span>
++                      ))}
++                    </div>
++                  </div>
++                </>
++              ) : (
++                <p className="text-sm text-subtle">Still building your Client Reality Profile — check back soon.</p>
++              )}
+             </CardContent>
+           </Card>
+         </div>
+diff --git a/src/app/buyer/scenarios/page.tsx b/src/app/buyer/scenarios/page.tsx
+index 6cca71d..d3de321 100644
+--- a/src/app/buyer/scenarios/page.tsx
++++ b/src/app/buyer/scenarios/page.tsx
+@@ -1,31 +1,66 @@
+ "use client";
+ 
+-import { useMemo, useState } from "react";
+-import { AlertTriangle, RotateCcw, Sparkles } from "lucide-react";
++import { useEffect, useMemo, useState } from "react";
++import Link from "next/link";
++import { AlertTriangle, ArrowUpRight, Loader2, RotateCcw, Search, Sparkles } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+-import { Button } from "@/components/ui/button";
++import { Button, buttonVariants } from "@/components/ui/button";
+ import { Badge } from "@/components/ui/badge";
+ import { ScenarioSlider } from "@/components/shared/scenario-slider";
+ import { RoiWidget } from "@/components/shared/roi-widget";
+-import { clientRealityProfile } from "@/lib/dummy-data";
+-import { formatCurrencyINR, formatNumber } from "@/lib/utils";
++import { getActiveVendorSelection, getClientRealityProfile, getSolutionModel } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
+ 
+-const BASE_USERS = clientRealityProfile.users;
+-const BASE_CURRENT = 4200000;
+-const BASE_PROJECTED = 2730000;
+-const BASE_TIMELINE = clientRealityProfile.timelineMonths;
++interface ScenarioBase {
++  users: number;
++  timelineMonths: number;
++  currentAnnualCost: number;
++  projectedAnnualCost: number;
++}
+ 
+ export default function ScenariosPage() {
+-  const [users, setUsers] = useState(BASE_USERS);
+-  const [timeline, setTimeline] = useState(BASE_TIMELINE);
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [base, setBase] = useState<ScenarioBase | null | undefined>(undefined);
++  const [users, setUsers] = useState(500);
++  const [timeline, setTimeline] = useState(6);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      const [profile, activeVendorId] = await Promise.all([getClientRealityProfile(buyerId), getActiveVendorSelection(buyerId)]);
++      if (cancelled) return;
++      const solutionModel = activeVendorId ? await getSolutionModel(buyerId, activeVendorId) : null;
++      if (cancelled) return;
++
++      if (!profile || !solutionModel) {
++        setBase(null);
++        return;
++      }
++      const b: ScenarioBase = {
++        users: profile.users || 500,
++        timelineMonths: profile.timelineMonths || 6,
++        currentAnnualCost: solutionModel.roi.currentAnnualCost || 4200000,
++        projectedAnnualCost: solutionModel.roi.projectedAnnualCost || 2730000,
++      };
++      setBase(b);
++      setUsers(b.users);
++      setTimeline(b.timelineMonths);
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
+ 
+   const result = useMemo(() => {
+-    const userRatio = users / BASE_USERS;
+-    const currentAtScale = Math.round(BASE_CURRENT * userRatio);
+-    const projectedAtScale = Math.round(BASE_PROJECTED * Math.pow(userRatio, 0.78));
+-    const savingsPercent = Math.round((1 - projectedAtScale / currentAtScale) * 100);
+-    const timelineFactor = BASE_TIMELINE / timeline;
++    if (!base) return null;
++    const userRatio = users / base.users;
++    const currentAtScale = Math.round(base.currentAnnualCost * userRatio);
++    const projectedAtScale = Math.round(base.projectedAnnualCost * Math.pow(userRatio, 0.78));
++    const savingsPercent = currentAtScale > 0 ? Math.round((1 - projectedAtScale / currentAtScale) * 100) : 0;
++    const timelineFactor = base.timelineMonths / timeline;
+     const paybackMonths = Math.max(3, Math.round(8 * timelineFactor));
+     const threeYearSavings = (currentAtScale - projectedAtScale) * 3;
+     const isRisky = timeline < 4;
+@@ -44,11 +79,47 @@ export default function ScenariosPage() {
+         { year: "Year 3", current: currentAtScale, projected: Math.round(projectedAtScale * 0.96) },
+       ],
+     };
+-  }, [users, timeline]);
++  }, [base, users, timeline]);
+ 
+   function reset() {
+-    setUsers(BASE_USERS);
+-    setTimeline(BASE_TIMELINE);
++    if (!base) return;
++    setUsers(base.users);
++    setTimeline(base.timelineMonths);
++  }
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Scenario Engine" title="What if...?" description="Start discovery to model scenarios against your solution." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (base === undefined) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
++  if (base === null || !result) {
++    return (
++      <div>
++        <PageHeader eyebrow="Scenario Engine" title="What if...?" description="Your solution model is still being generated — scenarios need it as a baseline." />
++        <Card className="max-w-md p-6 text-center">
++          <Loader2 className="mx-auto h-6 w-6 animate-spin text-brand-500" />
++          <p className="mt-3 text-sm text-muted">Check back once your Solution Workspace is ready.</p>
++        </Card>
++      </div>
++    );
+   }
+ 
+   return (
+@@ -98,7 +169,7 @@ export default function ScenariosPage() {
+                 <div>
+                   <p className="text-xs font-medium text-escalated">Feasibility risk</p>
+                   <p className="mt-0.5 text-xs text-foreground/80">
+-                    A timeline under 4 months compresses CloudNova&apos;s phased migration methodology and
++                    A timeline under 4 months compresses the vendor&apos;s phased migration methodology and
+                     increases cutover risk. This has not been validated against vendor capacity.
+                   </p>
+                 </div>
+@@ -108,7 +179,7 @@ export default function ScenariosPage() {
+             <div className="rounded-xl bg-surface-2 p-3.5">
+               <p className="text-xs font-medium text-subtle">Baseline (unchanged)</p>
+               <p className="mt-1 text-sm text-foreground">
+-                {formatNumber(BASE_USERS)} users &middot; {BASE_TIMELINE}-month timeline &middot; {formatCurrencyINR(BASE_CURRENT)}/year
++                {formatNumber(base.users)} users &middot; {base.timelineMonths}-month timeline &middot; {formatCurrencyINR(base.currentAnnualCost)}/year
+               </p>
+             </div>
+           </CardContent>
+@@ -119,13 +190,13 @@ export default function ScenariosPage() {
+             <Badge variant="modelled">
+               <Sparkles className="h-3 w-3" /> Modelled projection — assumptions applied
+             </Badge>
+-            {users !== BASE_USERS && <Badge variant="outline">Users changed: {formatNumber(BASE_USERS)} → {formatNumber(users)}</Badge>}
+-            {timeline !== BASE_TIMELINE && <Badge variant="outline">Timeline changed: {BASE_TIMELINE}mo → {timeline}mo</Badge>}
++            {users !== base.users && <Badge variant="outline">Users changed: {formatNumber(base.users)} → {formatNumber(users)}</Badge>}
++            {timeline !== base.timelineMonths && <Badge variant="outline">Timeline changed: {base.timelineMonths}mo → {timeline}mo</Badge>}
+           </div>
+           <RoiWidget roi={result} />
+           <p className="text-xs text-subtle">
+-            Estimate based on your current usage profile and CloudNova&apos;s published 25-40% optimization range.
+-            Scaling assumes sub-linear infrastructure growth typical of Kubernetes elasticity.
++            Estimate based on your current usage profile and the vendor&apos;s modelled optimization range. Scaling
++            assumes sub-linear infrastructure growth.
+           </p>
+         </div>
+       </div>
+diff --git a/src/app/buyer/solution/page.tsx b/src/app/buyer/solution/page.tsx
+index b993de0..57d38f5 100644
+--- a/src/app/buyer/solution/page.tsx
++++ b/src/app/buyer/solution/page.tsx
+@@ -1,12 +1,22 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { AlertTriangle, CalendarClock, MessageSquareText, RefreshCcw, SlidersHorizontal, Sparkles } from "lucide-react";
++import {
++  AlertTriangle,
++  ArrowUpRight,
++  CalendarClock,
++  Download,
++  Loader2,
++  MessageSquareText,
++  Search,
++  SlidersHorizontal,
++  Sparkles,
++} from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+-import { Button, buttonVariants } from "@/components/ui/button";
++import { buttonVariants } from "@/components/ui/button";
+ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+ import { GapCard } from "@/components/shared/gap-card";
+ import { MatchRow } from "@/components/shared/match-row";
+@@ -14,39 +24,152 @@ import { RoiWidget } from "@/components/shared/roi-widget";
+ import { PresentationDeck, type Slide } from "@/components/shared/presentation-deck";
+ import { FrontierCard } from "@/components/shared/frontier-card";
+ import {
+-  capabilities,
+-  capabilityFrontierItems,
+-  clientRealityProfile,
+-  gapItems,
+-  primaryVendor,
+-  solutionMatches,
+-  solutionModel,
+-  requirements,
+-} from "@/lib/dummy-data";
++  getActiveVendorSelection,
++  getBuyerRequirements,
++  getBuyerSolutionDeck,
++  getCapabilityFrontier,
++  getClientRealityProfile,
++  getRecommendedVendors,
++  getSolutionModel,
++  getVendorById,
++  getVendorCapabilities,
++  type BuyerSolutionDeck,
++} from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { Capability, CapabilityFrontierItem, ClientRealityProfile, Requirement, SolutionModel, Vendor } from "@/lib/types";
+ import { cn, formatCurrencyINR, formatNumber, formatRelativeTime } from "@/lib/utils";
+ 
++interface WorkspaceData {
++  vendor: Vendor;
++  solutionModel: SolutionModel;
++  profile: ClientRealityProfile;
++  frontier: CapabilityFrontierItem[];
++  requirements: Requirement[];
++  capabilities: Capability[];
++  deck: BuyerSolutionDeck | null;
++}
++
+ export default function SolutionWorkspacePage() {
+-  const [stale, setStale] = useState(false);
+-  const [recalculating, setRecalculating] = useState(false);
+-  const [updatedAt, setUpdatedAt] = useState(solutionModel.updatedAt);
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [data, setData] = useState<WorkspaceData | null | undefined>(undefined);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++
++    async function load() {
++      const activeVendorId = await getActiveVendorSelection(buyerId!);
++      if (cancelled) return;
++
++      let vendor: Vendor | null = null;
++      if (activeVendorId) {
++        const recs = await getRecommendedVendors(buyerId!);
++        vendor = recs.find((v) => v.id === activeVendorId) ?? (await getVendorById(activeVendorId));
++      }
++      if (cancelled) return;
++      if (!vendor) {
++        setData(null);
++        return;
++      }
++
++      const [solutionModel, profile, frontier, requirements, capabilities, deck] = await Promise.all([
++        getSolutionModel(buyerId!, vendor.id),
++        getClientRealityProfile(buyerId!),
++        getCapabilityFrontier(buyerId!),
++        getBuyerRequirements(buyerId!),
++        getVendorCapabilities(vendor.id),
++        getBuyerSolutionDeck(buyerId!),
++      ]);
++      if (cancelled) return;
++
++      if (!solutionModel) {
++        setData(null);
++        return;
++      }
++
++      setData({
++        vendor,
++        solutionModel,
++        profile: profile ?? {
++          buyerId: buyerId!,
++          currentTechnology: [],
++          currentCostAnnual: 0,
++          users: 0,
++          processes: [],
++          painPoints: [],
++          goals: [],
++          constraints: [],
++          timelineMonths: 0,
++        },
++        frontier,
++        requirements,
++        capabilities: capabilities as unknown as Capability[],
++        deck,
++      });
++    }
++
++    load();
++    // Solution model generation happens later in the pipeline than the
++    // buyer row itself, so keep re-checking until it shows up.
++    const interval = setInterval(() => {
++      if (!cancelled) load();
++    }, 8000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, [buyerId]);
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Your solution" title="Solution workspace" description="Start discovery to generate your personalized solution." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (data === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Your solution" title="Building your solution…" description="The Solution Model Agent is still generating your personalized recommendation." />
++        <Card className="max-w-md p-6 text-center">
++          <Loader2 className="mx-auto h-6 w-6 animate-spin text-brand-500" />
++          <p className="mt-3 text-sm text-muted">This page checks automatically and will update the moment it&apos;s ready.</p>
++        </Card>
++      </div>
++    );
++  }
+ 
+-  function recalculate() {
+-    setRecalculating(true);
+-    setTimeout(() => {
+-      setRecalculating(false);
+-      setStale(false);
+-      setUpdatedAt(new Date().toISOString());
+-    }, 1400);
++  if (data === undefined) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
+   }
+ 
++  const { vendor, solutionModel, profile, frontier, requirements, capabilities, deck } = data;
++
+   return (
+     <div>
+       <PageHeader
+-        eyebrow={`Personalized for ${primaryVendor.name}`}
+-        title="Your Cloud Transformation"
+-        description="Not a generic deck — this is how CloudNova's verified solution applies specifically to Meridian Retail Group."
++        eyebrow={`Personalized for ${vendor.name}`}
++        title="Your Solution"
++        description={`How ${vendor.name}'s verified solution applies specifically to your business.`}
+         actions={
+           <div className="flex items-center gap-2">
++            {deck?.pptxUrl && (
++              <a href={deck.pptxUrl} target="_blank" rel="noreferrer" className={cn(buttonVariants({ variant: "secondary" }))}>
++                <Download className="h-4 w-4" /> Download deck
++              </a>
++            )}
+             <Link href="/buyer/scenarios" className={cn(buttonVariants({ variant: "secondary" }))}>
+               <SlidersHorizontal className="h-4 w-4" /> Run what-if
+             </Link>
+@@ -57,30 +180,12 @@ export default function SolutionWorkspacePage() {
+         }
+       />
+ 
+-      {stale ? (
+-        <Card className="mb-6 border-modelled-border bg-modelled-bg">
+-          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
+-            <div className="flex items-start gap-2.5">
+-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-modelled" />
+-              <p className="text-sm text-foreground">
+-                CloudNova updated their Solution DNA. This model may be stale — recalculate to reflect the latest capabilities.
+-              </p>
+-            </div>
+-            <Button size="sm" onClick={recalculate} loading={recalculating}>
+-              <RefreshCcw className="h-3.5 w-3.5" /> Recalculate
+-            </Button>
+-          </CardContent>
+-        </Card>
+-      ) : (
+-        <button onClick={() => setStale(true)} className="mb-6 text-xs text-subtle underline decoration-dotted underline-offset-4 hover:text-muted">
+-          Simulate: CloudNova updates their Solution DNA
+-        </button>
+-      )}
+-
+       <div className="mb-6 flex flex-wrap items-center gap-3">
+         <Badge variant="brand">Version {solutionModel.version}</Badge>
+-        <Badge variant="verified">Active</Badge>
+-        <span className="text-xs text-subtle">Last updated {formatRelativeTime(updatedAt)}</span>
++        <Badge variant={solutionModel.status === "active" ? "verified" : "outline"} className="capitalize">
++          {solutionModel.status}
++        </Badge>
++        <span className="text-xs text-subtle">Last updated {formatRelativeTime(solutionModel.updatedAt)}</span>
+       </div>
+ 
+       <Tabs defaultValue="workspace">
+@@ -90,17 +195,17 @@ export default function SolutionWorkspacePage() {
+         </TabsList>
+ 
+         <TabsContent value="workspace">
+-          <WorkspaceView />
++          <WorkspaceView vendor={vendor} solutionModel={solutionModel} profile={profile} />
+         </TabsContent>
+         <TabsContent value="presentation">
+-          <PresentationDeck slides={buildSlides()} />
++          <PresentationDeck slides={buildSlides({ vendor, solutionModel, profile, frontier, requirements, capabilities })} />
+         </TabsContent>
+       </Tabs>
+     </div>
+   );
+ }
+ 
+-function WorkspaceView() {
++function WorkspaceView({ vendor, solutionModel, profile }: { vendor: Vendor; solutionModel: SolutionModel; profile: ClientRealityProfile }) {
+   return (
+     <div className="space-y-6">
+       <Card>
+@@ -110,14 +215,16 @@ function WorkspaceView() {
+           </CardTitle>
+         </CardHeader>
+         <CardContent className="pt-2">
+-          <p className="text-sm leading-relaxed text-muted">{solutionModel.executiveSummary}</p>
++          <p className="text-sm leading-relaxed text-muted">
++            {solutionModel.executiveSummary || `${vendor.name} is being modelled against your requirements.`}
++          </p>
+         </CardContent>
+       </Card>
+ 
+       <div className="grid gap-4 sm:grid-cols-3">
+-        <SummaryStat label="Current annual cost" value={formatCurrencyINR(clientRealityProfile.currentCostAnnual)} />
+-        <SummaryStat label="Users today" value={formatNumber(clientRealityProfile.users)} />
+-        <SummaryStat label="Target timeline" value={`${clientRealityProfile.timelineMonths} months`} />
++        <SummaryStat label="Current annual cost" value={formatCurrencyINR(profile.currentCostAnnual)} />
++        <SummaryStat label="Users today" value={formatNumber(profile.users)} />
++        <SummaryStat label="Target timeline" value={`${profile.timelineMonths} months`} />
+       </div>
+ 
+       <Card>
+@@ -125,7 +232,8 @@ function WorkspaceView() {
+           <CardTitle>Business gaps</CardTitle>
+         </CardHeader>
+         <CardContent className="space-y-3 pt-2">
+-          {gapItems.map((g) => (
++          {solutionModel.gaps.length === 0 && <p className="text-sm text-subtle">No gaps identified.</p>}
++          {solutionModel.gaps.map((g) => (
+             <GapCard key={g.id} gap={g} />
+           ))}
+         </CardContent>
+@@ -133,10 +241,11 @@ function WorkspaceView() {
+ 
+       <Card>
+         <CardHeader>
+-          <CardTitle>How CloudNova addresses each requirement</CardTitle>
++          <CardTitle>How {vendor.name} addresses each requirement</CardTitle>
+         </CardHeader>
+         <CardContent className="space-y-3 pt-2">
+-          {solutionMatches.map((m) => (
++          {solutionModel.matches.length === 0 && <p className="text-sm text-subtle">Matching in progress.</p>}
++          {solutionModel.matches.map((m) => (
+             <MatchRow key={m.id} match={m} />
+           ))}
+         </CardContent>
+@@ -148,7 +257,7 @@ function WorkspaceView() {
+         <CardContent className="flex flex-col items-start justify-between gap-4 py-6 sm:flex-row sm:items-center">
+           <div>
+             <p className="text-sm font-semibold text-foreground">Ready to explore further?</p>
+-            <p className="mt-1 text-sm text-muted">Adjust assumptions in Scenarios, or ask CloudNova&apos;s AI directly.</p>
++            <p className="mt-1 text-sm text-muted">Adjust assumptions in Scenarios, or ask {vendor.name}&apos;s AI directly.</p>
+           </div>
+           <div className="flex shrink-0 gap-2">
+             <Link href="/buyer/handoff" className={cn(buttonVariants({ variant: "secondary" }))}>
+@@ -173,24 +282,38 @@ function SummaryStat({ label, value }: { label: string; value: string }) {
+   );
+ }
+ 
+-function buildSlides(): Slide[] {
+-  const matchedCapabilities = capabilities.filter((c) => solutionMatches.some((m) => m.capabilityId === c.id));
+-  const openFrontier = capabilityFrontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
++function buildSlides({
++  vendor,
++  solutionModel,
++  profile,
++  frontier,
++  requirements,
++  capabilities,
++}: {
++  vendor: Vendor;
++  solutionModel: SolutionModel;
++  profile: ClientRealityProfile;
++  frontier: CapabilityFrontierItem[];
++  requirements: Requirement[];
++  capabilities: Capability[];
++}): Slide[] {
++  const matchedCapabilities = capabilities.filter((c) => solutionModel.matches.some((m) => m.capabilityId === c.id));
++  const openFrontier = frontier.filter((f) => f.status !== "resolved" && f.status !== "closed");
+ 
+   return [
+     {
+       label: "Executive Summary",
+       title: "Executive Summary",
+-      content: <p className="text-base leading-relaxed text-muted">{solutionModel.executiveSummary}</p>,
++      content: <p className="text-base leading-relaxed text-muted">{solutionModel.executiveSummary || "Summary in progress."}</p>,
+     },
+     {
+       label: "Current Situation",
+       title: "Your Current Situation",
+       content: (
+         <div className="grid gap-3 sm:grid-cols-3">
+-          <SummaryStat label="Annual infrastructure cost" value={formatCurrencyINR(clientRealityProfile.currentCostAnnual)} />
+-          <SummaryStat label="Users" value={formatNumber(clientRealityProfile.users)} />
+-          <SummaryStat label="Avg. utilization" value="28%" />
++          <SummaryStat label="Annual infrastructure cost" value={formatCurrencyINR(profile.currentCostAnnual)} />
++          <SummaryStat label="Users" value={formatNumber(profile.users)} />
++          <SummaryStat label="Timeline" value={`${profile.timelineMonths} months`} />
+         </div>
+       ),
+     },
+@@ -199,7 +322,8 @@ function buildSlides(): Slide[] {
+       title: "Problems Identified",
+       content: (
+         <ul className="space-y-2.5">
+-          {clientRealityProfile.painPoints.map((p) => (
++          {profile.painPoints.length === 0 && <li className="text-sm text-muted">No pain points captured yet.</li>}
++          {profile.painPoints.map((p) => (
+             <li key={p} className="flex items-start gap-2.5 text-sm text-foreground">
+               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-escalated" /> {p}
+             </li>
+@@ -212,7 +336,7 @@ function buildSlides(): Slide[] {
+       title: "Business Gaps",
+       content: (
+         <div className="space-y-3">
+-          {gapItems.slice(0, 3).map((g) => (
++          {solutionModel.gaps.slice(0, 3).map((g) => (
+             <GapCard key={g.id} gap={g} />
+           ))}
+         </div>
+@@ -234,10 +358,10 @@ function buildSlides(): Slide[] {
+     },
+     {
+       label: "Addressing Gaps",
+-      title: "How CloudNova Addresses Each Gap",
++      title: `How ${vendor.name} Addresses Each Gap`,
+       content: (
+         <div className="space-y-3">
+-          {solutionMatches.slice(0, 4).map((m) => (
++          {solutionModel.matches.slice(0, 4).map((m) => (
+             <MatchRow key={m.id} match={m} />
+           ))}
+         </div>
+@@ -253,8 +377,8 @@ function buildSlides(): Slide[] {
+       title: "Implementation Considerations",
+       content: (
+         <ul className="space-y-2.5">
+-          <li className="text-sm text-foreground">Timeline: {clientRealityProfile.timelineMonths}-month phased migration</li>
+-          {clientRealityProfile.constraints.map((c) => (
++          <li className="text-sm text-foreground">Timeline: {profile.timelineMonths}-month phased migration</li>
++          {profile.constraints.map((c) => (
+             <li key={c} className="flex items-start gap-2.5 text-sm text-foreground">
+               <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-modelled" /> {c}
+             </li>
+@@ -285,7 +409,7 @@ function buildSlides(): Slide[] {
+           </p>
+           <div className="mt-5 flex flex-wrap gap-3">
+             <Link href="/buyer/handoff" className={cn(buttonVariants({ variant: "primary" }))}>
+-              <CalendarClock className="h-4 w-4" /> Schedule with CloudNova Solutions Team
++              <CalendarClock className="h-4 w-4" /> Schedule with {vendor.name}&apos;s Solutions Team
+             </Link>
+             <Link href="/buyer/chat" className={cn(buttonVariants({ variant: "secondary" }))}>
+               Ask a follow-up question
+diff --git a/src/app/buyer/vendors/[id]/page.tsx b/src/app/buyer/vendors/[id]/page.tsx
+index 980b9fc..65d9e2a 100644
+--- a/src/app/buyer/vendors/[id]/page.tsx
++++ b/src/app/buyer/vendors/[id]/page.tsx
+@@ -1,21 +1,68 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { useParams } from "next/navigation";
+ import Link from "next/link";
+-import { notFound } from "next/navigation";
+-import { ArrowLeft, Building2, CheckCircle2, Globe, MapPin, Sparkles, Users2 } from "lucide-react";
++import { ArrowLeft, Building2, CheckCircle2, Globe, Loader2, MapPin, Sparkles, Users2 } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { buttonVariants } from "@/components/ui/button";
+ import { CapabilityCard } from "@/components/shared/capability-card";
+-import { capabilities, vendors } from "@/lib/dummy-data";
++import { getActiveVendorSelection, getRecommendedVendors, getVendorBySlugOrId, getVendorCapabilities } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { Capability, Vendor } from "@/lib/types";
+ import { cn } from "@/lib/utils";
+ 
+-export default async function VendorProfilePage(props: PageProps<"/buyer/vendors/[id]">) {
+-  const { id } = await props.params;
+-  const vendor = vendors.find((v) => v.slug === id || v.id === id);
+-  if (!vendor) notFound();
++export default function VendorProfilePage() {
++  const params = useParams<{ id: string }>();
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [vendor, setVendor] = useState<Vendor | null | undefined>(undefined);
++  const [capabilities, setCapabilities] = useState<Capability[]>([]);
++  const [isPrimary, setIsPrimary] = useState(false);
++
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      const v = await getVendorBySlugOrId(params.id);
++      if (cancelled) return;
++      setVendor(v);
++      if (!v) return;
++
++      const caps = await getVendorCapabilities(v.id);
++      if (!cancelled) setCapabilities(caps as unknown as Capability[]);
++
++      if (buyerId) {
++        const [activeVendorId, recs] = await Promise.all([getActiveVendorSelection(buyerId), getRecommendedVendors(buyerId)]);
++        if (cancelled) return;
++        setIsPrimary(activeVendorId === v.id);
++        const withFit = recs.find((r) => r.id === v.id);
++        if (withFit) setVendor(withFit);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [params.id, buyerId]);
++
++  if (vendor === undefined) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
+ 
+-  const vendorCapabilities = capabilities.filter((c) => c.vendorId === vendor.id);
+-  const isPrimary = vendor.id === "v-cloudnova";
++  if (vendor === null) {
++    return (
++      <div>
++        <Link href="/buyer/vendors" className="mb-4 inline-flex items-center gap-1.5 text-sm font-medium text-muted hover:text-foreground">
++          <ArrowLeft className="h-3.5 w-3.5" /> Back to vendors
++        </Link>
++        <PageHeader eyebrow="Vendor Discovery" title="Vendor not found" description="This vendor doesn't exist or hasn't published a profile yet." />
++      </div>
++    );
++  }
+ 
+   return (
+     <div>
+@@ -39,10 +86,12 @@ export default async function VendorProfilePage(props: PageProps<"/buyer/vendors
+           </div>
+         </div>
+         <div className="flex flex-col items-start gap-3 sm:items-end">
+-          <div className="text-right">
+-            <p className="text-3xl font-bold text-brand-600 dark:text-brand-400">{vendor.fitScore}%</p>
+-            <p className="text-[11px] uppercase tracking-wide text-subtle">requirement fit</p>
+-          </div>
++          {vendor.fitScore != null && (
++            <div className="text-right">
++              <p className="text-3xl font-bold text-brand-600 dark:text-brand-400">{vendor.fitScore}%</p>
++              <p className="text-[11px] uppercase tracking-wide text-subtle">requirement fit</p>
++            </div>
++          )}
+           {isPrimary ? (
+             <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
+               <Sparkles className="h-4 w-4" /> View my personalized solution
+@@ -71,13 +120,13 @@ export default async function VendorProfilePage(props: PageProps<"/buyer/vendors
+             </CardContent>
+           </Card>
+ 
+-          {vendorCapabilities.length > 0 ? (
++          {capabilities.length > 0 ? (
+             <Card>
+               <CardHeader>
+                 <CardTitle>Verified capabilities</CardTitle>
+               </CardHeader>
+               <CardContent className="space-y-3 pt-2">
+-                {vendorCapabilities.map((c) => (
++                {capabilities.map((c) => (
+                   <CapabilityCard key={c.id} capability={c} />
+                 ))}
+               </CardContent>
+@@ -86,8 +135,8 @@ export default async function VendorProfilePage(props: PageProps<"/buyer/vendors
+             <Card>
+               <CardContent className="py-10 text-center">
+                 <p className="text-sm text-muted">
+-                  Solution DNA for {vendor.name} hasn&apos;t been fully explored in this demo yet. Start a
+-                  discovery conversation to build your personalized comparison.
++                  Solution DNA for {vendor.name} hasn&apos;t been fully explored yet. Start a discovery conversation
++                  to build your personalized comparison.
+                 </p>
+               </CardContent>
+             </Card>
+@@ -103,7 +152,7 @@ export default async function VendorProfilePage(props: PageProps<"/buyer/vendors
+             </CardHeader>
+             <CardContent className="space-y-3 pt-2">
+               <FitReason text={vendor.keyMatch ?? "Aligned with your industry"} />
+-              <FitReason text={`Founded ${vendor.foundedYear}, ${vendor.employeeRange} employees`} />
++              <FitReason text={`Founded ${vendor.foundedYear || "—"}, ${vendor.employeeRange || "unknown"} employees`} />
+               <FitReason text={`Active across ${vendor.industries.length} of your relevant industries`} />
+             </CardContent>
+           </Card>
+diff --git a/src/app/buyer/vendors/page.tsx b/src/app/buyer/vendors/page.tsx
+index 194b5ac..6a5cb54 100644
+--- a/src/app/buyer/vendors/page.tsx
++++ b/src/app/buyer/vendors/page.tsx
+@@ -1,15 +1,64 @@
+ "use client";
+ 
+-import { useState } from "react";
+-import { Search, Sparkles } from "lucide-react";
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { ArrowUpRight, Loader2, Search, Sparkles } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Input } from "@/components/ui/input";
+ import { Badge } from "@/components/ui/badge";
++import { buttonVariants } from "@/components/ui/button";
++import { Card } from "@/components/ui/card";
+ import { VendorMatchCard } from "@/components/shared/vendor-match-card";
+-import { vendors } from "@/lib/dummy-data";
++import { getRecommendedVendors } from "@/lib/api/buyer";
++import { getStoredBuyerId } from "@/lib/buyer-session";
++import type { Vendor } from "@/lib/types";
++import { cn } from "@/lib/utils";
+ 
+ export default function BuyerVendorsPage() {
++  const [buyerId] = useState(() => getStoredBuyerId());
++  const [vendors, setVendors] = useState<Vendor[]>([]);
++  const [loading, setLoading] = useState(() => !!buyerId);
+   const [query, setQuery] = useState("");
++
++  useEffect(() => {
++    if (!buyerId) return;
++    let cancelled = false;
++    (async () => {
++      try {
++        const recs = await getRecommendedVendors(buyerId);
++        if (!cancelled) setVendors(recs);
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
++
++  if (loading) {
++    return (
++      <div className="flex h-64 items-center justify-center">
++        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
++      </div>
++    );
++  }
++
++  if (buyerId === null) {
++    return (
++      <div>
++        <PageHeader eyebrow="Vendor Discovery" title="Recommended vendors" description="Start discovery to see your ranked vendor matches." />
++        <Card className="max-w-md p-6 text-center">
++          <Search className="mx-auto h-6 w-6 text-brand-500" />
++          <p className="mt-3 text-sm text-muted">You haven&apos;t started discovery yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Start discovery <ArrowUpRight className="h-4 w-4" />
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
+   const sorted = [...vendors].sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
+   const filtered = sorted.filter(
+     (v) => v.name.toLowerCase().includes(query.toLowerCase()) || v.industry.toLowerCase().includes(query.toLowerCase())
+@@ -20,7 +69,7 @@ export default function BuyerVendorsPage() {
+       <PageHeader
+         eyebrow="Vendor Discovery"
+         title="Recommended vendors"
+-        description="Ranked by AI fit score against your captured requirements: reduce cost, migrate legacy architecture, and scale without downtime."
++        description="Ranked by AI fit score against your captured requirements."
+       />
+ 
+       <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+@@ -33,11 +82,17 @@ export default function BuyerVendorsPage() {
+         </Badge>
+       </div>
+ 
+-      <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+-        {filtered.map((v) => (
+-          <VendorMatchCard key={v.id} vendor={v} href={`/buyer/vendors/${v.slug}`} />
+-        ))}
+-      </div>
++      {filtered.length === 0 ? (
++        <p className="text-sm text-subtle">
++          {vendors.length === 0 ? "Vendor matching is still running — check back shortly." : "No vendors match your search."}
++        </p>
++      ) : (
++        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
++          {filtered.map((v) => (
++            <VendorMatchCard key={v.id} vendor={v} href={`/buyer/vendors/${v.slug}`} />
++          ))}
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+new file mode 100644
+index 0000000..e1e6651
+--- /dev/null
++++ b/src/lib/api/buyer-lookup.ts
+@@ -0,0 +1,78 @@
++// Buyer-completion polling helpers — same reasoning as vendor-lookup.ts:
++// the Yoxa public trigger API has no run-status/polling endpoint, so we
++// detect "the buyer row now exists" by polling our own Supabase `buyers`
++// table directly via PostgREST (public, RLS-permitted read with the
++// publishable key).
++
++const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
++const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++
++export interface BuyerRow {
++  id: string;
++  companyName: string;
++  createdAt: string;
++}
++
++async function restGet<T>(path: string): Promise<T> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
++  });
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
++  return res.json() as Promise<T>;
++}
++
++// Finds the buyer row a fresh discovery submission created, by matching the
++// company name the buyer typed and requiring created_at to be after the
++// trigger fired — same name+time correlation vendor-lookup.ts uses, since
++// the trigger response carries no buyerId of its own.
++export async function findBuyerCreatedAfter(companyName: string, afterIso: string): Promise<BuyerRow | null> {
++  const params = new URLSearchParams({
++    select: "id,company_name,created_at",
++    company_name: `eq.${companyName}`,
++    created_at: `gt.${afterIso}`,
++    order: "created_at.asc",
++    limit: "1",
++  });
++  const rows = await restGet<{ id: string; company_name: string; created_at: string }[]>(`buyers?${params}`);
++  const row = rows[0];
++  return row ? { id: row.id, companyName: row.company_name, createdAt: row.created_at } : null;
++}
++
++export async function countBuyerRequirements(buyerId: string): Promise<number> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(
++    `${SUPABASE_URL}/rest/v1/buyer_requirements?select=id&buyer_id=eq.${buyerId}`,
++    {
++      headers: {
++        apikey: SUPABASE_ANON_KEY,
++        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
++        Prefer: "count=exact",
++        Range: "0-0",
++      },
++    }
++  );
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
++  const range = res.headers.get("content-range");
++  const total = range?.split("/")[1];
++  return total ? parseInt(total, 10) : 0;
++}
++
++export async function hasSolutionDeck(buyerId: string): Promise<boolean> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(
++    `${SUPABASE_URL}/rest/v1/buyer_solution_decks?select=id&buyer_id=eq.${buyerId}&status=eq.ready`,
++    {
++      headers: {
++        apikey: SUPABASE_ANON_KEY,
++        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
++        Prefer: "count=exact",
++        Range: "0-0",
++      },
++    }
++  );
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
++  const range = res.headers.get("content-range");
++  const total = range?.split("/")[1];
++  return !!total && parseInt(total, 10) > 0;
++}
+diff --git a/src/lib/api/buyer.ts b/src/lib/api/buyer.ts
+new file mode 100644
+index 0000000..061a3bc
+--- /dev/null
++++ b/src/lib/api/buyer.ts
+@@ -0,0 +1,402 @@
++// Buyer-side read client — direct PostgREST reads against Supabase tables
++// with the publishable anon key, same low-risk pattern as vendor-lookup.ts
++// and vendor-knowledge.ts (public RLS SELECT policies, qual: true). Every
++// buyer portal page reads through this instead of dummy-data.ts.
++//
++// Writes still go through the Yoxa workflow's own tools (save-buyer-
++// requirements, save-client-reality-profile, etc.) — this client only
++// mirrors what those tools have already persisted back into a shape the
++// existing UI components (which were built against dummy-data.ts) expect.
++
++import type {
++  Buyer,
++  CapabilityFrontierItem,
++  ClientRealityProfile,
++  ConversationMessage,
++  GapItem,
++  MeetingRequest,
++  RoiProjection,
++  SolutionMatch,
++  SolutionModel,
++  Vendor,
++} from "@/lib/types";
++
++const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
++const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++
++async function restGet<T>(path: string): Promise<T> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
++  });
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
++  return res.json() as Promise<T>;
++}
++
++async function callFunction<T>(slug: string, body: unknown): Promise<T> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
++    body: JSON.stringify(body),
++  });
++  const data = await res.json().catch(() => ({}) as Record<string, unknown>);
++  if (!res.ok) {
++    const message = typeof (data as Record<string, unknown>)?.error === "string" ? (data as Record<string, unknown>).error : `${slug} failed (${res.status}).`;
++    throw new Error(message as string);
++  }
++  return data as T;
++}
++
++// Appends one manually-typed requirement to an existing buyer via the same
++// save-buyer-requirements tool the workflow itself uses — so a requirement
++// added from the Requirements page is real, not a local-only fake row.
++export async function addBuyerRequirement(buyerId: string, text: string): Promise<{ id: string; text: string }> {
++  const result = await callFunction<{ savedRequirementIds: string[]; requirements: { id: string; requirement_text: string }[] }>(
++    "save-buyer-requirements",
++    { buyerId, requirements: [{ text, priority: "medium", source: "buyer_input" }] }
++  );
++  const saved = result.requirements[0];
++  return { id: saved?.id ?? "", text: saved?.requirement_text ?? text };
++}
++
++// ---------------------------------------------------------------------------
++// Buyer identity
++// ---------------------------------------------------------------------------
++
++export async function getBuyer(buyerId: string): Promise<Buyer | null> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `buyers?id=eq.${buyerId}&select=id,company_name,industry,company_size,contact_name,contact_role,created_at&limit=1`
++  );
++  const b = rows[0];
++  if (!b) return null;
++  return {
++    id: b.id as string,
++    companyName: (b.company_name as string) ?? "",
++    industry: (b.industry as string) ?? "",
++    companySize: (b.company_size as number) ?? 0,
++    createdAt: b.created_at as string,
++    contactName: (b.contact_name as string) ?? "",
++    contactRole: (b.contact_role as string) ?? "",
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Requirements + Client Reality Profile
++// ---------------------------------------------------------------------------
++
++export async function getBuyerRequirements(buyerId: string) {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `buyer_requirements?buyer_id=eq.${buyerId}&select=id,requirement_text,priority,status,source&order=created_at.desc`
++  );
++  return rows.map((r) => ({
++    id: r.id as string,
++    text: r.requirement_text as string,
++    priority: r.priority as "high" | "medium" | "low",
++    status: r.status as "captured" | "clarifying" | "confirmed",
++    source: r.source as "buyer_input" | "ai_inferred",
++  }));
++}
++
++export async function getClientRealityProfile(buyerId: string): Promise<ClientRealityProfile | null> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `client_reality_profiles?buyer_id=eq.${buyerId}&select=*&limit=1`
++  );
++  const p = rows[0];
++  if (!p) return null;
++  return {
++    buyerId,
++    currentTechnology: (p.current_technology as string[]) ?? [],
++    currentCostAnnual: Number(p.current_cost_annual ?? 0),
++    users: (p.users as number) ?? 0,
++    processes: (p.processes as string[]) ?? [],
++    painPoints: (p.pain_points as string[]) ?? [],
++    goals: (p.goals as string[]) ?? [],
++    constraints: (p.constraints as string[]) ?? [],
++    timelineMonths: (p.timeline_months as number) ?? 0,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Vendors
++// ---------------------------------------------------------------------------
++
++function mapVendorRow(v: Record<string, unknown>, fitScore?: number | null, keyMatch?: string | null): Vendor {
++  return {
++    id: v.id as string,
++    name: (v.company_name as string) ?? "",
++    slug: (v.slug as string) ?? (v.id as string),
++    website: (v.website as string) ?? "",
++    industry: (v.industry as string) ?? "",
++    description: (v.description as string) ?? "",
++    tagline: (v.tagline as string) ?? "",
++    verificationStatus: (v.verification_status as Vendor["verificationStatus"]) ?? "pending",
++    employeeRange: (v.employee_range as string) ?? "",
++    hq: (v.hq as string) ?? "",
++    foundedYear: (v.founded_year as number) ?? 0,
++    color: (v.color as string) ?? "brand",
++    fitScore: fitScore != null ? Math.round(Number(fitScore)) : undefined,
++    keyMatch: keyMatch ?? undefined,
++    industries: (v.industries as string[]) ?? [],
++  };
++}
++
++// All vendors the Solution Matching Agent ranked for this buyer (Recommend
++// Vendors -> Query All Published Vendor Solution DNA -> Save Vendor
++// Recommendation Ranking), sorted by fit score.
++export async function getRecommendedVendors(buyerId: string): Promise<Vendor[]> {
++  const recs = await restGet<Record<string, unknown>[]>(
++    `vendor_recommendations?buyer_id=eq.${buyerId}&select=vendor_id,fit_score,key_match&order=fit_score.desc`
++  );
++  if (recs.length === 0) return [];
++  const vendorIds = [...new Set(recs.map((r) => r.vendor_id as string))];
++  const vendors = await restGet<Record<string, unknown>[]>(
++    `vendors?id=in.(${vendorIds.join(",")})&select=id,company_name,slug,website,industry,description,tagline,employee_range,hq,founded_year,color,industries,verification_status`
++  );
++  const byId = new Map(vendors.map((v) => [v.id as string, v]));
++  return recs
++    .map((r) => {
++      const v = byId.get(r.vendor_id as string);
++      return v ? mapVendorRow(v, r.fit_score as number | null, r.key_match as string | null) : null;
++    })
++    .filter((v): v is Vendor => v !== null);
++}
++
++export async function getVendorById(vendorId: string): Promise<Vendor | null> {
++  const rows = await restGet<Record<string, unknown>[]>(`vendors?id=eq.${vendorId}&select=*`);
++  const v = rows[0];
++  return v ? mapVendorRow(v) : null;
++}
++
++export async function getVendorBySlugOrId(idOrSlug: string): Promise<Vendor | null> {
++  const bySlug = await restGet<Record<string, unknown>[]>(`vendors?slug=eq.${idOrSlug}&select=*&limit=1`);
++  if (bySlug[0]) return mapVendorRow(bySlug[0]);
++  const byId = await restGet<Record<string, unknown>[]>(`vendors?id=eq.${idOrSlug}&select=*&limit=1`);
++  return byId[0] ? mapVendorRow(byId[0]) : null;
++}
++
++// The buyer's currently active vendor selection (Confirm Vendor Selection ->
++// Save Selected Vendor Context).
++export async function getActiveVendorSelection(buyerId: string): Promise<string | null> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `buyer_vendor_selections?buyer_id=eq.${buyerId}&is_active=eq.true&select=vendor_id&order=selected_at.desc&limit=1`
++  );
++  return rows[0] ? (rows[0].vendor_id as string) : null;
++}
++
++// Published capabilities for a vendor's profile page, with evidence —
++// mirrors the shape dummy-data.ts's `capabilities` array uses.
++export async function getVendorCapabilities(vendorId: string) {
++  const caps = await restGet<Record<string, unknown>[]>(
++    `solution_capabilities?vendor_id=eq.${vendorId}&select=id,name,description,category,verification_status,tags&order=created_at.asc`
++  );
++  if (caps.length === 0) return [];
++  const capIds = caps.map((c) => c.id as string);
++  const evidence = await restGet<Record<string, unknown>[]>(
++    `solution_evidence?capability_id=in.(${capIds.join(",")})&select=capability_id,source_label,source_type,source_text`
++  );
++  const evidenceByCapId = new Map<string, Record<string, unknown>[]>();
++  for (const e of evidence) {
++    const key = e.capability_id as string;
++    if (!evidenceByCapId.has(key)) evidenceByCapId.set(key, []);
++    evidenceByCapId.get(key)!.push(e);
++  }
++  return caps.map((c) => ({
++    id: c.id as string,
++    vendorId,
++    name: (c.name as string) ?? "",
++    description: (c.description as string) ?? "",
++    category: c.category as string,
++    verificationStatus: c.verification_status as string,
++    evidence: (evidenceByCapId.get(c.id as string) ?? []).map((e) => ({
++      sourceLabel: (e.source_label as string) ?? "Source",
++      sourceType: (e.source_type as string) ?? "other",
++      snippet: (e.source_text as string) ?? "",
++    })),
++    tags: (c.tags as string[]) ?? [],
++  }));
++}
++
++// ---------------------------------------------------------------------------
++// Solution model (matches, gaps, ROI)
++// ---------------------------------------------------------------------------
++
++export async function getSolutionModel(buyerId: string, vendorId: string): Promise<SolutionModel | null> {
++  const models = await restGet<Record<string, unknown>[]>(
++    `solution_models?buyer_id=eq.${buyerId}&vendor_id=eq.${vendorId}&select=*&order=version.desc&limit=1`
++  );
++  const m = models[0];
++  if (!m) return null;
++
++  const [roiRows, matchRows, gapRows] = await Promise.all([
++    restGet<Record<string, unknown>[]>(`roi_projections?solution_model_id=eq.${m.id}&select=*&limit=1`),
++    restGet<Record<string, unknown>[]>(`solution_matches?solution_model_id=eq.${m.id}&select=*`),
++    restGet<Record<string, unknown>[]>(`gap_items?solution_model_id=eq.${m.id}&select=*`),
++  ]);
++
++  const roiRow = roiRows[0];
++  const roi: RoiProjection = roiRow
++    ? {
++        currentAnnualCost: Number(roiRow.current_annual_cost ?? 0),
++        projectedAnnualCost: Number(roiRow.projected_annual_cost ?? 0),
++        savingsPercent: Number(roiRow.savings_percent ?? 0),
++        paybackMonths: Number(roiRow.payback_months ?? 0),
++        threeYearSavings: Number(roiRow.three_year_savings ?? 0),
++        chart: Array.isArray(roiRow.chart) ? (roiRow.chart as RoiProjection["chart"]) : [],
++      }
++    : { currentAnnualCost: 0, projectedAnnualCost: 0, savingsPercent: 0, paybackMonths: 0, threeYearSavings: 0, chart: [] };
++
++  const matches: SolutionMatch[] = matchRows.map((mm) => ({
++    id: mm.id as string,
++    requirementText: (mm.requirement_text as string) ?? "",
++    capabilityId: (mm.capability_id as string) ?? "",
++    capabilityName: (mm.capability_name as string) ?? "",
++    matchStatus: mm.match_status as SolutionMatch["matchStatus"],
++    confidence: Number(mm.confidence ?? 0),
++    reasoning: (mm.reasoning as string) ?? "",
++  }));
++
++  const gaps: GapItem[] = gapRows.map((g) => ({
++    id: g.id as string,
++    current: (g.current_state as string) ?? "",
++    desired: (g.desired_state as string) ?? "",
++    gap: (g.gap as string) ?? "",
++    severity: g.severity as GapItem["severity"],
++  }));
++
++  return {
++    id: m.id as string,
++    buyerId,
++    vendorId,
++    version: (m.version as number) ?? 1,
++    status: m.status as SolutionModel["status"],
++    executiveSummary: (m.executive_summary as string) ?? "",
++    matches,
++    gaps,
++    roi,
++    updatedAt: m.updated_at as string,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Capability frontier / handoff
++// ---------------------------------------------------------------------------
++
++export async function getCapabilityFrontier(buyerId: string): Promise<CapabilityFrontierItem[]> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `capability_frontier?buyer_id=eq.${buyerId}&select=*&order=created_at.desc`
++  );
++  if (rows.length === 0) return [];
++  const vendorIds = [...new Set(rows.map((r) => r.vendor_id as string).filter(Boolean))];
++  const vendors = vendorIds.length
++    ? await restGet<Record<string, unknown>[]>(`vendors?id=in.(${vendorIds.join(",")})&select=id,company_name`)
++    : [];
++  const vendorNameById = new Map(vendors.map((v) => [v.id as string, v.company_name as string]));
++  const buyer = await getBuyer(buyerId);
++
++  return rows.map((r) => ({
++    id: r.id as string,
++    buyerId,
++    buyerName: buyer?.companyName ?? "",
++    vendorId: (r.vendor_id as string) ?? "",
++    vendorName: vendorNameById.get(r.vendor_id as string) ?? "",
++    question: (r.question as string) ?? "",
++    requirement: (r.requirement as string) ?? "",
++    context: (r.context as string) ?? "",
++    evidenceChecked: (r.evidence_checked as string[]) ?? [],
++    reasonUnresolved: (r.reason_unresolved as string) ?? "",
++    status: r.status as CapabilityFrontierItem["status"],
++    recommendedExpert: (r.recommended_expert as string) ?? "",
++    createdAt: r.created_at as string,
++    vendorResponse: (r.vendor_response as string) ?? undefined,
++  }));
++}
++
++export async function getMeetingRequests(buyerId: string): Promise<MeetingRequest[]> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `meeting_requests?buyer_id=eq.${buyerId}&select=*&order=created_at.desc`
++  );
++  if (rows.length === 0) return [];
++  const vendorIds = [...new Set(rows.map((r) => r.vendor_id as string).filter(Boolean))];
++  const vendors = vendorIds.length
++    ? await restGet<Record<string, unknown>[]>(`vendors?id=in.(${vendorIds.join(",")})&select=id,company_name`)
++    : [];
++  const vendorNameById = new Map(vendors.map((v) => [v.id as string, v.company_name as string]));
++  const buyer = await getBuyer(buyerId);
++
++  return rows.map((r) => ({
++    id: r.id as string,
++    buyerName: buyer?.companyName ?? "",
++    vendorName: vendorNameById.get(r.vendor_id as string) ?? "",
++    status: r.status as MeetingRequest["status"],
++    unresolvedCount: (r.unresolved_count as number) ?? 0,
++    proposedDate: (r.proposed_date as string) ?? undefined,
++    expert: (r.expert as string) ?? "",
++  }));
++}
++
++// ---------------------------------------------------------------------------
++// Chat / conversation history
++// ---------------------------------------------------------------------------
++
++export async function getConversationMessages(buyerId: string, vendorId?: string): Promise<ConversationMessage[]> {
++  const convParams = new URLSearchParams({
++    buyer_id: `eq.${buyerId}`,
++    select: "id",
++    order: "created_at.desc",
++    limit: "1",
++  });
++  if (vendorId) convParams.set("vendor_id", `eq.${vendorId}`);
++  const conversations = await restGet<Record<string, unknown>[]>(`conversations?${convParams}`);
++  const conversationId = conversations[0]?.id as string | undefined;
++  if (!conversationId) return [];
++
++  const rows = await restGet<Record<string, unknown>[]>(
++    `messages?conversation_id=eq.${conversationId}&select=*&order=created_at.asc`
++  );
++  return rows
++    .filter((r) => r.role === "user" || r.role === "assistant")
++    .map((r) => ({
++      id: r.id as string,
++      role: r.role as ConversationMessage["role"],
++      content: (r.content as string) ?? "",
++      responseStatus: (r.response_status as ConversationMessage["responseStatus"]) ?? undefined,
++      evidence: (r.evidence as ConversationMessage["evidence"]) ?? undefined,
++      assumptions: (r.assumptions as string[]) ?? undefined,
++      createdAt: r.created_at as string,
++    }));
++}
++
++// ---------------------------------------------------------------------------
++// Solution deck (Generate Solution Pitch Deck -> Save Buyer Solution Deck)
++// ---------------------------------------------------------------------------
++
++// Buyer requests a meeting with the vendor's Solutions Team over the still-
++// open Capability Frontier items — the real "Handoff" tool
++// (schedule-vendor-discussion). The vendor side later calls
++// confirm-vendor-discussion-meeting to move it to "scheduled"; from the
++// buyer's chair this always lands as "requested".
++export async function scheduleVendorDiscussion(params: {
++  buyerId: string;
++  vendorId: string;
++  frontierItemIds: string[];
++  proposedDate?: string;
++  expert?: string;
++}): Promise<{ meetingRequestId: string; status: string; proposedDate: string | null; expert: string | null }> {
++  return callFunction("schedule-vendor-discussion", params);
++}
++
++export interface BuyerSolutionDeck {
++  title: string;
++  pptxUrl: string;
++  status: "ready" | "failed";
++}
++
++export async function getBuyerSolutionDeck(buyerId: string): Promise<BuyerSolutionDeck | null> {
++  const rows = await restGet<Record<string, unknown>[]>(
++    `buyer_solution_decks?buyer_id=eq.${buyerId}&select=title,pptx_url,status&order=created_at.desc&limit=1`
++  );
++  const d = rows[0];
++  if (!d || !d.pptx_url) return null;
++  return { title: (d.title as string) ?? "Your solution deck", pptxUrl: d.pptx_url as string, status: d.status as "ready" | "failed" };
++}
+diff --git a/src/lib/api/yoxa-trigger.ts b/src/lib/api/yoxa-trigger.ts
+index 36bb14c..f0b123f 100644
+--- a/src/lib/api/yoxa-trigger.ts
++++ b/src/lib/api/yoxa-trigger.ts
+@@ -39,14 +39,14 @@ export class YoxaTriggerError extends Error {
+   }
+ }
+ 
+-export async function triggerVendorSourceSubmission(triggerText: string): Promise<TriggerVendorSourceSubmissionResult> {
+-  const deploymentId = process.env.YOXA_WORKFLOW_DEPLOYMENT_ID;
+-  const secret = process.env.YOXA_DEPLOYMENT_SECRET;
++async function triggerDeployment(
++  deploymentId: string | undefined,
++  secret: string | undefined,
++  missingConfigMessage: string,
++  triggerText: string
++): Promise<TriggerVendorSourceSubmissionResult> {
+   if (!deploymentId || !secret) {
+-    throw new YoxaTriggerError(
+-      "The vendor workflow trigger isn't configured (YOXA_WORKFLOW_DEPLOYMENT_ID / YOXA_DEPLOYMENT_SECRET missing).",
+-      503
+-    );
++    throw new YoxaTriggerError(missingConfigMessage, 503);
+   }
+ 
+   let res: Response;
+@@ -78,3 +78,29 @@ export async function triggerVendorSourceSubmission(triggerText: string): Promis
+     status: data.status as string,
+   };
+ }
++
++export async function triggerVendorSourceSubmission(triggerText: string): Promise<TriggerVendorSourceSubmissionResult> {
++  return triggerDeployment(
++    process.env.YOXA_WORKFLOW_DEPLOYMENT_ID,
++    process.env.YOXA_DEPLOYMENT_SECRET,
++    "The vendor workflow trigger isn't configured (YOXA_WORKFLOW_DEPLOYMENT_ID / YOXA_DEPLOYMENT_SECRET missing).",
++    triggerText
++  );
++}
++
++// Trigger for the "Buyer Discovery To Handoff" workflow's
++// buyer_requirement_submission event — a separate Yoxa deployment from the
++// vendor workflow above, so it needs its own deployment id + secret pair.
++// The deployment id (aaeae08d-603b-40b9-801a-70fc027ac3ad) is public — it's
++// just the URL path segment — but the secret is generated from the
++// deployment's own "Integrate" -> "Setup client access" panel and must be
++// set as YOXA_BUYER_DEPLOYMENT_SECRET in the deployment environment before
++// this will work (same as YOXA_DEPLOYMENT_SECRET was for the vendor side).
++export async function triggerBuyerRequirementSubmission(triggerText: string): Promise<TriggerVendorSourceSubmissionResult> {
++  return triggerDeployment(
++    process.env.YOXA_BUYER_WORKFLOW_DEPLOYMENT_ID ?? "aaeae08d-603b-40b9-801a-70fc027ac3ad",
++    process.env.YOXA_BUYER_DEPLOYMENT_SECRET,
++    "The buyer workflow trigger isn't configured yet (YOXA_BUYER_DEPLOYMENT_SECRET missing) — generate a deployment secret on the Buyer Discovery To Handoff workflow's Integrate tab and set it in the deployment environment.",
++    triggerText
++  );
++}
+diff --git a/src/lib/buyer-poll.ts b/src/lib/buyer-poll.ts
+new file mode 100644
+index 0000000..74bc184
+--- /dev/null
++++ b/src/lib/buyer-poll.ts
+@@ -0,0 +1,114 @@
++// Shared buyer-workflow-completion polling, mirroring vendor-poll.ts. The
++// Buyer Discovery To Handoff workflow runs its full pipeline (Understand ->
++// Recommend -> Confirm -> Build Profile -> Assess -> Generate Deck ->
++// Scenarios -> Handoff) inside one trigger call, so there are two signals
++// worth waiting for: the buyer row existing (fast — created on the very
++// first tool call) and the solution deck being ready (slow — the last step
++// in the pipeline). The Discover page only waits on the first signal so the
++// buyer isn't stuck on a spinner for minutes; the Solution Workspace page
++// waits on the second.
++
++import { countBuyerRequirements, findBuyerCreatedAfter, hasSolutionDeck } from "@/lib/api/buyer-lookup";
++
++export const POLL_INTERVAL_MS = 4000;
++export const BUYER_POLL_TIMEOUT_MS = 90 * 1000;
++export const DECK_POLL_TIMEOUT_MS = 6 * 60 * 1000;
++
++export interface PollHandle {
++  cancel: () => void;
++}
++
++export function pollForNewBuyerId(
++  companyName: string,
++  afterIso: string,
++  deadline: number,
++  onFound: (buyerId: string) => void,
++  onTimeout: () => void
++): PollHandle {
++  let cancelled = false;
++
++  async function tick() {
++    if (cancelled) return;
++    try {
++      const buyer = await findBuyerCreatedAfter(companyName, afterIso);
++      if (buyer) {
++        if (!cancelled) onFound(buyer.id);
++        return;
++      }
++    } catch {
++      // transient read error — keep polling until the deadline
++    }
++    if (cancelled) return;
++    if (Date.now() >= deadline) {
++      onTimeout();
++      return;
++    }
++    setTimeout(tick, POLL_INTERVAL_MS);
++  }
++
++  tick();
++  return { cancel: () => { cancelled = true; } };
++}
++
++export function pollForNewBuyerRequirements(
++  buyerId: string,
++  baseline: number,
++  deadline: number,
++  onFound: () => void,
++  onTimeout: () => void
++): PollHandle {
++  let cancelled = false;
++
++  async function tick() {
++    if (cancelled) return;
++    try {
++      const count = await countBuyerRequirements(buyerId);
++      if (count > baseline) {
++        if (!cancelled) onFound();
++        return;
++      }
++    } catch {
++      // transient read error — keep polling until the deadline
++    }
++    if (cancelled) return;
++    if (Date.now() >= deadline) {
++      onTimeout();
++      return;
++    }
++    setTimeout(tick, POLL_INTERVAL_MS);
++  }
++
++  tick();
++  return { cancel: () => { cancelled = true; } };
++}
++
++export function pollForSolutionDeck(
++  buyerId: string,
++  deadline: number,
++  onFound: () => void,
++  onTimeout: () => void
++): PollHandle {
++  let cancelled = false;
++
++  async function tick() {
++    if (cancelled) return;
++    try {
++      const ready = await hasSolutionDeck(buyerId);
++      if (ready) {
++        if (!cancelled) onFound();
++        return;
++      }
++    } catch {
++      // transient read error — keep polling until the deadline
++    }
++    if (cancelled) return;
++    if (Date.now() >= deadline) {
++      onTimeout();
++      return;
++    }
++    setTimeout(tick, POLL_INTERVAL_MS);
++  }
++
++  tick();
++  return { cancel: () => { cancelled = true; } };
++}
+diff --git a/src/lib/buyer-session.ts b/src/lib/buyer-session.ts
+new file mode 100644
+index 0000000..df87b3d
+--- /dev/null
++++ b/src/lib/buyer-session.ts
+@@ -0,0 +1,82 @@
++// Client-side hand-off of buyer.id between the Discover intake form and the
++// rest of the buyer portal, mirroring vendor-session.ts. The "Understand
++// Buyer Requirement" milestone's "Capture Initial Requirement Summary" tool
++// (save-buyer-requirements) finds-or-creates the buyer row by companyName,
++// so once that first trigger call lands we look the row up and remember its
++// id here for every later page/read.
++const STORAGE_KEY = "deckless-pitch:buyer-id";
++const NAME_STORAGE_KEY = "deckless-pitch:buyer-name";
++
++export function getStoredBuyerId(): string | null {
++  if (typeof window === "undefined") return null;
++  return window.localStorage.getItem(STORAGE_KEY);
++}
++
++export function setStoredBuyerId(buyerId: string) {
++  if (typeof window === "undefined") return;
++  window.localStorage.setItem(STORAGE_KEY, buyerId);
++}
++
++export function clearStoredBuyerId() {
++  if (typeof window === "undefined") return;
++  window.localStorage.removeItem(STORAGE_KEY);
++  window.localStorage.removeItem(NAME_STORAGE_KEY);
++}
++
++// Company name (and contact) of the registered buyer, so the portal shell
++// can reflect who's actually signed in instead of the hardcoded "Priya
++// Sharma / Meridian Retail Group" demo placeholder.
++export function getStoredBuyerName(): string | null {
++  if (typeof window === "undefined") return null;
++  return window.localStorage.getItem(NAME_STORAGE_KEY);
++}
++
++export function setStoredBuyerName(companyName: string) {
++  if (typeof window === "undefined") return;
++  window.localStorage.setItem(NAME_STORAGE_KEY, companyName);
++}
++
++const CONTACT_NAME_KEY = "deckless-pitch:buyer-contact-name";
++
++export function getStoredBuyerContactName(): string | null {
++  if (typeof window === "undefined") return null;
++  return window.localStorage.getItem(CONTACT_NAME_KEY);
++}
++
++export function setStoredBuyerContactName(contactName: string) {
++  if (typeof window === "undefined") return;
++  window.localStorage.setItem(CONTACT_NAME_KEY, contactName);
++}
++
++// A submission the workflow hasn't finished yet, persisted so the buyer
++// id can still be found even if the buyer navigates away (or reloads)
++// before the discover page's own poll finds the result — the poll dies
++// with the component on unmount, same reasoning as vendor-session.ts.
++const PENDING_KEY = "deckless-pitch:buyer-pending-submission";
++
++export interface PendingBuyerSubmission {
++  companyName: string;
++  afterIso: string;
++  deadline: number;
++}
++
++export function getPendingBuyerSubmission(): PendingBuyerSubmission | null {
++  if (typeof window === "undefined") return null;
++  const raw = window.localStorage.getItem(PENDING_KEY);
++  if (!raw) return null;
++  try {
++    return JSON.parse(raw) as PendingBuyerSubmission;
++  } catch {
++    return null;
++  }
++}
++
++export function setPendingBuyerSubmission(pending: PendingBuyerSubmission) {
++  if (typeof window === "undefined") return;
++  window.localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
++}
++
++export function clearPendingBuyerSubmission() {
++  if (typeof window === "undefined") return;
++  window.localStorage.removeItem(PENDING_KEY);
++}
+-- 
+2.43.0
+

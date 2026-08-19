@@ -1,0 +1,771 @@
+From 4284370dcf4c80b950fb4bac1889eeafb84aac4f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 19 Aug 2026 22:55:43 +0000
+Subject: [PATCH] Fix stale REST/edge-function caching, unify cross-page agent
+ status, add capability search, and polish buyer portal visuals
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add cache: "no-store" to every plain fetch() in the PostgREST/edge-function
+  read helpers (buyer-lookup, buyer-vendor-dna, vendor-lookup, vendor-frontier,
+  vendor-knowledge, vendor-dna) — these back tight polling loops, and the
+  browser's default HTTP cache could silently serve a stale identical-URL
+  response instead of the agent's latest write.
+- Add useAgentStatus() + <AgentStatusPill>, wired into PortalShell's header
+  via a new headerSlot prop and rendered from buyer/layout.tsx — one
+  persistent "needs your input" / "all caught up" indicator visible across
+  every buyer page, deep-linking straight to whichever page has the pending
+  HITL pause instead of leaving the buyer to hunt for it. Also fixes the
+  pre-existing set-state-in-effect lint violation in buyer/layout.tsx by
+  reading session values directly in the render body.
+- Add capability/industry search to /buyer/vendors, searching each
+  recommended vendor's published Solution DNA (capability name, category,
+  tags) in addition to name/industry/tagline, with a "Matches: <capability>"
+  badge on hits.
+- Redesign PageHeader (gradient eyebrow badge, entrance animation) and
+  StatCard (staggered entrance, hover lift, icon glow ring) — shared
+  primitives so the lift applies everywhere they're used.
+- Add a shared <LoadingState> skeleton (stats/cards/lines variants) and swap
+  it in on the buyer dashboard and vendors page in place of plain
+  "Loading…" text.
+---
+ src/app/buyer/layout.tsx                    |  19 +++-
+ src/app/buyer/page.tsx                      |  25 +++--
+ src/app/buyer/vendors/page.tsx              | 101 ++++++++++++++++++--
+ src/components/layout/page-header.tsx       |  16 +++-
+ src/components/layout/portal-shell.tsx      |   6 +-
+ src/components/shared/agent-status-pill.tsx |  65 +++++++++++++
+ src/components/shared/loading-state.tsx     |  57 +++++++++++
+ src/components/shared/stat-card.tsx         |  31 ++++--
+ src/components/ui/skeleton.tsx              |   3 +-
+ src/lib/api/buyer-lookup.ts                 |   5 +
+ src/lib/api/buyer-vendor-dna.ts             |   3 +
+ src/lib/api/vendor-dna.ts                   |   1 +
+ src/lib/api/vendor-frontier.ts              |   2 +
+ src/lib/api/vendor-knowledge.ts             |   1 +
+ src/lib/api/vendor-lookup.ts                |   2 +
+ src/lib/hooks/use-agent-status.ts           |  90 +++++++++++++++++
+ 16 files changed, 394 insertions(+), 33 deletions(-)
+ create mode 100644 src/components/shared/agent-status-pill.tsx
+ create mode 100644 src/components/shared/loading-state.tsx
+ create mode 100644 src/lib/hooks/use-agent-status.ts
+
+diff --git a/src/app/buyer/layout.tsx b/src/app/buyer/layout.tsx
+index e1f5176..67f10b7 100644
+--- a/src/app/buyer/layout.tsx
++++ b/src/app/buyer/layout.tsx
+@@ -1,6 +1,5 @@
+ "use client";
+ 
+-import { useEffect, useState } from "react";
+ import {
+   LayoutDashboard,
+   Search,
+@@ -12,7 +11,8 @@ import {
+   CalendarClock,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+-import { getStoredCompanyName } from "@/lib/buyer-session";
++import { AgentStatusPill } from "@/components/shared/agent-status-pill";
++import { getStoredBuyerId, getStoredCompanyName } from "@/lib/buyer-session";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -44,11 +44,20 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
+   // Mirrors vendor/layout.tsx: no real auth session exists yet, so this
+   // reflects whichever buyer actually submitted a discovery form in this
+   // browser (src/lib/buyer-session.ts) instead of a static demo placeholder.
+-  const [companyName, setCompanyName] = useState<string | null>(null);
+-  useEffect(() => setCompanyName(getStoredCompanyName()), []);
++  // Read directly in the render body (not useState+useEffect) — localStorage
++  // is available synchronously on the client and this avoids a
++  // set-state-in-effect render flash on first paint.
++  const companyName = getStoredCompanyName();
++  const buyerId = getStoredBuyerId();
+ 
+   return (
+-    <PortalShell role="buyer" sections={sections} userName={companyName ?? "Not started yet"} userRole="Buyer">
++    <PortalShell
++      role="buyer"
++      sections={sections}
++      userName={companyName ?? "Not started yet"}
++      userRole="Buyer"
++      headerSlot={<AgentStatusPill buyerId={buyerId} />}
++    >
+       {children}
+     </PortalShell>
+   );
+diff --git a/src/app/buyer/page.tsx b/src/app/buyer/page.tsx
+index a09b3ce..1da60ae 100644
+--- a/src/app/buyer/page.tsx
++++ b/src/app/buyer/page.tsx
+@@ -2,9 +2,10 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, Loader2, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
++import { ArrowUpRight, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
++import { LoadingState } from "@/components/shared/loading-state";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Progress } from "@/components/ui/progress";
+ import { buttonVariants } from "@/components/ui/button";
+@@ -89,18 +90,26 @@ export default function BuyerDashboardPage() {
+       />
+ 
+       {loading ? (
+-        <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
++        <>
++          <LoadingState variant="stats" count={4} />
++          <div className="mt-6 grid gap-6 lg:grid-cols-3">
++            <div className="lg:col-span-2">
++              <LoadingState variant="lines" count={4} />
++            </div>
++            <LoadingState variant="lines" count={3} />
++          </div>
++        </>
+       ) : (
+         <>
+           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+-            <StatCard label="Requirements captured" value={String(requirements.length)} icon={TrendingUp} tone="verified" />
+-            <StatCard label="Confirmed" value={String(confirmedCount)} icon={MessageSquareText} tone="brand" />
+-            <StatCard label="Vendor selected" value={vendorName ? "1" : "0"} icon={Store} tone="accent" />
+-            <StatCard label="Open questions" value={String(openItems.length)} icon={Sparkles} tone="escalated" />
++            <StatCard index={0} label="Requirements captured" value={String(requirements.length)} icon={TrendingUp} tone="verified" />
++            <StatCard index={1} label="Confirmed" value={String(confirmedCount)} icon={MessageSquareText} tone="brand" />
++            <StatCard index={2} label="Vendor selected" value={vendorName ? "1" : "0"} icon={Store} tone="accent" />
++            <StatCard index={3} label="Open questions" value={String(openItems.length)} icon={Sparkles} tone="escalated" />
+           </div>
+ 
+-          <div className="mt-6 grid gap-6 lg:grid-cols-3">
+-            <Card className="lg:col-span-2">
++          <div className="mt-6 grid gap-6 lg:grid-cols-3 animate-slide-up">
++            <Card className="lg:col-span-2 transition-shadow hover:shadow-md">
+               <CardHeader className="flex-row items-center justify-between">
+                 <CardTitle>Your vendor</CardTitle>
+                 <Link href="/buyer/vendors" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
+diff --git a/src/app/buyer/vendors/page.tsx b/src/app/buyer/vendors/page.tsx
+index 8736d5e..02024d4 100644
+--- a/src/app/buyer/vendors/page.tsx
++++ b/src/app/buyer/vendors/page.tsx
+@@ -1,11 +1,14 @@
+ "use client";
+ 
+-import { useEffect, useState } from "react";
++import { useEffect, useMemo, useState } from "react";
+ import Link from "next/link";
+-import { CheckCircle2, Loader2, Sparkles } from "lucide-react";
++import { CheckCircle2, Search, Sparkles, X } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { buttonVariants } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { Badge } from "@/components/ui/badge";
++import { LoadingState } from "@/components/shared/loading-state";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
+ import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
+ import {
+@@ -18,6 +21,26 @@ import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, setStoredSelectedVendor
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn } from "@/lib/utils";
+ 
++// Every capability name/tag/category that appears anywhere in a vendor's
++// published Solution DNA — the searchable surface for "find me a vendor
++// that can do X" instead of only being able to search by vendor name.
++function capabilityHaystack(vendor: PublishedVendor | undefined): string {
++  if (!vendor) return "";
++  return vendor.capabilities
++    .flatMap((c) => [c.name, c.category, ...(c.tags ?? [])])
++    .join(" ")
++    .toLowerCase();
++}
++
++function matchingCapabilityName(vendor: PublishedVendor | undefined, query: string): string | undefined {
++  if (!vendor || !query) return undefined;
++  const q = query.toLowerCase();
++  const hit = vendor.capabilities.find(
++    (c) => c.name.toLowerCase().includes(q) || c.category.toLowerCase().includes(q) || c.tags.some((t) => t.toLowerCase().includes(q))
++  );
++  return hit?.name;
++}
++
+ // PRD §5 Step 3: "Do not proceed to Build Client Reality Profile or any
+ // later step until the buyer has explicitly confirmed a vendorId — this is
+ // a hard gate, not a default-to-top-ranked shortcut." So this page always
+@@ -29,6 +52,7 @@ export default function BuyerVendorsPage() {
+   const [vendorsById, setVendorsById] = useState<Record<string, PublishedVendor>>({});
+   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
+   const [loading, setLoading] = useState(true);
++  const [query, setQuery] = useState("");
+ 
+   const selection = usePendingApproval("confirm_vendor_selection", {
+     buyerId,
+@@ -71,6 +95,26 @@ export default function BuyerVendorsPage() {
+     setTimeout(refresh, 1500);
+   }
+ 
++  const filteredRecommendations = useMemo(() => {
++    const q = query.trim().toLowerCase();
++    if (!q) return recommendations;
++    return recommendations.filter((r) => {
++      const vendor = vendorsById[r.vendorId];
++      const fields = [
++        vendor?.companyName,
++        vendor?.industry,
++        vendor?.tagline,
++        vendor?.description,
++        ...(vendor?.industries ?? []),
++        r.keyMatch,
++      ]
++        .filter(Boolean)
++        .join(" ")
++        .toLowerCase();
++      return fields.includes(q) || capabilityHaystack(vendor).includes(q);
++    });
++  }, [query, recommendations, vendorsById]);
++
+   if (!buyerId) {
+     return (
+       <div>
+@@ -130,15 +174,60 @@ export default function BuyerVendorsPage() {
+         )
+       )}
+ 
++      {!loading && recommendations.length > 0 && (
++        <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
++          <div className="relative max-w-sm flex-1">
++            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
++            <Input
++              value={query}
++              onChange={(e) => setQuery(e.target.value)}
++              placeholder="Search by capability, industry, or vendor…"
++              className="pl-9 pr-9"
++              aria-label="Search vendors by capability"
++            />
++            {query && (
++              <button
++                type="button"
++                onClick={() => setQuery("")}
++                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
++                aria-label="Clear search"
++              >
++                <X className="h-4 w-4" />
++              </button>
++            )}
++          </div>
++          {query && (
++            <p className="text-xs text-muted">
++              {filteredRecommendations.length} of {recommendations.length} vendor{recommendations.length === 1 ? "" : "s"} match
++            </p>
++          )}
++        </div>
++      )}
++
+       {loading ? (
+-        <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading recommendations…</p>
++        <LoadingState variant="cards" count={3} />
+       ) : recommendations.length === 0 ? (
+         <Card className="p-6 text-center text-sm text-muted">No vendor recommendations yet — check back shortly.</Card>
++      ) : filteredRecommendations.length === 0 ? (
++        <Card className="p-6 text-center text-sm text-muted">
++          No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
++        </Card>
+       ) : (
+         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+-          {recommendations.map((r) => (
+-            <VendorRecommendationCard key={r.id} recommendation={r} vendor={vendorsById[r.vendorId]} href={`/buyer/vendors/${r.vendorId}`} />
+-          ))}
++          {filteredRecommendations.map((r) => {
++            const vendor = vendorsById[r.vendorId];
++            const matched = matchingCapabilityName(vendor, query);
++            return (
++              <div key={r.id} className="flex flex-col gap-2">
++                {matched && (
++                  <Badge variant="brand" size="sm" className="w-fit">
++                    Matches: {matched}
++                  </Badge>
++                )}
++                <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
++              </div>
++            );
++          })}
+         </div>
+       )}
+     </div>
+diff --git a/src/components/layout/page-header.tsx b/src/components/layout/page-header.tsx
+index 6fa338a..d8425ed 100644
+--- a/src/components/layout/page-header.tsx
++++ b/src/components/layout/page-header.tsx
+@@ -1,3 +1,6 @@
++"use client";
++
++import { motion } from "motion/react";
+ import { cn } from "@/lib/utils";
+ 
+ export function PageHeader({
+@@ -14,17 +17,22 @@ export function PageHeader({
+   className?: string;
+ }) {
+   return (
+-    <div className={cn("mb-6 flex flex-col gap-4 sm:mb-8 sm:flex-row sm:items-end sm:justify-between", className)}>
++    <motion.div
++      initial={{ opacity: 0, y: -8 }}
++      animate={{ opacity: 1, y: 0 }}
++      transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
++      className={cn("mb-6 flex flex-col gap-4 sm:mb-8 sm:flex-row sm:items-end sm:justify-between", className)}
++    >
+       <div>
+         {eyebrow && (
+-          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-brand-600 dark:text-brand-400">
++          <span className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-gradient-to-r from-brand-50 to-accent-400/10 px-2.5 py-1 text-xs font-semibold uppercase tracking-wider text-brand-600 dark:border-brand-800 dark:from-brand-950/50 dark:to-accent-500/10 dark:text-brand-300">
+             {eyebrow}
+-          </p>
++          </span>
+         )}
+         <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">{title}</h1>
+         {description && <p className="mt-1.5 max-w-2xl text-sm text-muted sm:text-base">{description}</p>}
+       </div>
+       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+-    </div>
++    </motion.div>
+   );
+ }
+diff --git a/src/components/layout/portal-shell.tsx b/src/components/layout/portal-shell.tsx
+index 08fe9de..6cdd370 100644
+--- a/src/components/layout/portal-shell.tsx
++++ b/src/components/layout/portal-shell.tsx
+@@ -22,6 +22,7 @@ export function PortalShell({
+   userName,
+   userRole,
+   vendorSubLabel,
++  headerSlot,
+   children,
+ }: {
+   role: "vendor" | "buyer" | "admin";
+@@ -30,6 +31,8 @@ export function PortalShell({
+   userRole: string;
+   /** Real registered vendor name, once known — overrides the role switcher's "CloudNova" demo placeholder. */
+   vendorSubLabel?: string;
++  /** Optional extra content rendered in the sticky header, left of notifications — e.g. a cross-page status indicator. */
++  headerSlot?: React.ReactNode;
+   children: React.ReactNode;
+ }) {
+   const [mobileOpen, setMobileOpen] = useState(false);
+@@ -95,7 +98,8 @@ export function PortalShell({
+           <Link href="/" className="text-sm font-semibold text-foreground lg:hidden">
+             Deck-less Pitch
+           </Link>
+-          <div className="ml-auto flex items-center gap-2">
++          <div className="ml-auto flex items-center gap-2 sm:gap-3">
++            {headerSlot}
+             <NotificationsMenu />
+             <ThemeToggle />
+           </div>
+diff --git a/src/components/shared/agent-status-pill.tsx b/src/components/shared/agent-status-pill.tsx
+new file mode 100644
+index 0000000..967c4bd
+--- /dev/null
++++ b/src/components/shared/agent-status-pill.tsx
+@@ -0,0 +1,65 @@
++"use client";
++
++// The one persistent "where are we" indicator for the buyer journey — lives
++// in the portal header (via PortalShell's headerSlot) so it's visible on
++// every buyer page, not just the one you happen to be on. Replaces the old
++// pattern of each page silently polling in isolation with no shared signal.
++import Link from "next/link";
++import { motion, AnimatePresence } from "motion/react";
++import { Bot, CheckCircle2, Sparkles } from "lucide-react";
++import { cn } from "@/lib/utils";
++import { useAgentStatus } from "@/lib/hooks/use-agent-status";
++
++export function AgentStatusPill({ buyerId }: { buyerId: string | null | undefined }) {
++  const { status, label, href } = useAgentStatus(buyerId);
++
++  if (status === "idle" && !buyerId) return null;
++
++  const toneClass =
++    status === "needs_input"
++      ? "border-modelled-border bg-modelled-bg text-modelled"
++      : status === "working"
++        ? "border-verified-border bg-verified-bg text-verified"
++        : "border-border bg-surface-2 text-muted";
++
++  const Icon = status === "needs_input" ? Sparkles : status === "working" ? CheckCircle2 : Bot;
++
++  const content = (
++    <motion.div
++      layout
++      initial={{ opacity: 0, y: -4 }}
++      animate={{ opacity: 1, y: 0 }}
++      className={cn(
++        "flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors",
++        toneClass,
++        href && "cursor-pointer hover:brightness-95"
++      )}
++    >
++      <AnimatePresence mode="wait">
++        {status === "needs_input" ? (
++          <motion.span
++            key="pulse"
++            className="relative flex h-2 w-2"
++            initial={{ scale: 0 }}
++            animate={{ scale: 1 }}
++          >
++            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-modelled opacity-75" />
++            <span className="relative inline-flex h-2 w-2 rounded-full bg-modelled" />
++          </motion.span>
++        ) : (
++          <Icon className="h-3.5 w-3.5" />
++        )}
++      </AnimatePresence>
++      <span className="hidden sm:inline">{label}</span>
++    </motion.div>
++  );
++
++  if (href) {
++    return (
++      <Link href={href} aria-label={label}>
++        {content}
++      </Link>
++    );
++  }
++  return content;
++}
+diff --git a/src/components/shared/loading-state.tsx b/src/components/shared/loading-state.tsx
+new file mode 100644
+index 0000000..41aa39d
+--- /dev/null
++++ b/src/components/shared/loading-state.tsx
+@@ -0,0 +1,57 @@
++// Shared "the agent/data is still loading" placeholder — replaces the
++// scattered plain "Loading…" text + spinner that used to appear
++// differently on every buyer page. `variant="stats"` mimics a StatCard
++// grid, `variant="cards"` mimics a card grid (e.g. vendor recommendations),
++// `variant="lines"` is a generic content skeleton.
++import { Skeleton } from "@/components/ui/skeleton";
++import { Card } from "@/components/ui/card";
++
++export function LoadingState({
++  variant = "lines",
++  count = 4,
++}: {
++  variant?: "stats" | "cards" | "lines";
++  count?: number;
++}) {
++  if (variant === "stats") {
++    return (
++      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
++        {Array.from({ length: count }).map((_, i) => (
++          <Card key={i} className="p-5">
++            <Skeleton className="h-9 w-9 rounded-xl" />
++            <Skeleton className="mt-4 h-6 w-16" />
++            <Skeleton className="mt-2 h-3 w-24" />
++          </Card>
++        ))}
++      </div>
++    );
++  }
++
++  if (variant === "cards") {
++    return (
++      <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
++        {Array.from({ length: count }).map((_, i) => (
++          <Card key={i} className="p-5">
++            <div className="flex items-center gap-3">
++              <Skeleton className="h-11 w-11 rounded-xl" />
++              <div className="flex-1 space-y-2">
++                <Skeleton className="h-4 w-2/3" />
++                <Skeleton className="h-3 w-1/3" />
++              </div>
++            </div>
++            <Skeleton className="mt-4 h-3 w-full" />
++            <Skeleton className="mt-2 h-3 w-4/5" />
++          </Card>
++        ))}
++      </div>
++    );
++  }
++
++  return (
++    <div className="space-y-2.5">
++      {Array.from({ length: count }).map((_, i) => (
++        <Skeleton key={i} className="h-4" style={{ width: `${85 - i * 12}%` }} />
++      ))}
++    </div>
++  );
++}
+diff --git a/src/components/shared/stat-card.tsx b/src/components/shared/stat-card.tsx
+index 67600af..1f903cd 100644
+--- a/src/components/shared/stat-card.tsx
++++ b/src/components/shared/stat-card.tsx
+@@ -1,4 +1,7 @@
++"use client";
++
+ import type { LucideIcon } from "lucide-react";
++import { motion } from "motion/react";
+ import { cn } from "@/lib/utils";
+ 
+ export function StatCard({
+@@ -8,6 +11,7 @@ export function StatCard({
+   trend,
+   tone = "brand",
+   className,
++  index = 0,
+ }: {
+   label: string;
+   value: string;
+@@ -15,24 +19,35 @@ export function StatCard({
+   trend?: string;
+   tone?: "brand" | "verified" | "modelled" | "escalated" | "accent";
+   className?: string;
++  /** Position in a grid of stat cards — staggers the entrance animation so a row doesn't pop in all at once. */
++  index?: number;
+ }) {
+   const toneClass: Record<string, string> = {
+-    brand: "bg-brand-50 text-brand-600 dark:bg-brand-950/40 dark:text-brand-300",
+-    verified: "bg-verified-bg text-verified",
+-    modelled: "bg-modelled-bg text-modelled",
+-    escalated: "bg-escalated-bg text-escalated",
+-    accent: "bg-accent-400/15 text-accent-600 dark:text-accent-400",
++    brand: "bg-brand-50 text-brand-600 ring-brand-100 dark:bg-brand-950/40 dark:text-brand-300 dark:ring-brand-900",
++    verified: "bg-verified-bg text-verified ring-verified-border",
++    modelled: "bg-modelled-bg text-modelled ring-modelled-border",
++    escalated: "bg-escalated-bg text-escalated ring-escalated-border",
++    accent: "bg-accent-400/15 text-accent-600 ring-accent-400/20 dark:text-accent-400",
+   };
+   return (
+-    <div className={cn("rounded-2xl border border-border bg-surface p-5 transition-shadow hover:shadow-md", className)}>
++    <motion.div
++      initial={{ opacity: 0, y: 10 }}
++      animate={{ opacity: 1, y: 0 }}
++      transition={{ duration: 0.35, delay: index * 0.05, ease: [0.16, 1, 0.3, 1] }}
++      whileHover={{ y: -2 }}
++      className={cn(
++        "group rounded-2xl border border-border bg-surface p-5 shadow-sm shadow-black/[0.02] transition-shadow hover:shadow-md hover:shadow-black/[0.04] dark:shadow-black/20",
++        className
++      )}
++    >
+       <div className="flex items-center justify-between">
+-        <div className={cn("flex h-9 w-9 items-center justify-center rounded-xl", toneClass[tone])}>
++        <div className={cn("flex h-9 w-9 items-center justify-center rounded-xl ring-1 transition-transform duration-200 group-hover:scale-110", toneClass[tone])}>
+           <Icon className="h-4 w-4" />
+         </div>
+         {trend && <span className="text-xs font-medium text-verified">{trend}</span>}
+       </div>
+       <p className="mt-3 text-2xl font-bold tracking-tight text-foreground">{value}</p>
+       <p className="mt-0.5 text-xs text-muted">{label}</p>
+-    </div>
++    </motion.div>
+   );
+ }
+diff --git a/src/components/ui/skeleton.tsx b/src/components/ui/skeleton.tsx
+index bfe29ab..80933a0 100644
+--- a/src/components/ui/skeleton.tsx
++++ b/src/components/ui/skeleton.tsx
+@@ -1,8 +1,9 @@
+ import { cn } from "@/lib/utils";
+ 
+-export function Skeleton({ className }: { className?: string }) {
++export function Skeleton({ className, style }: { className?: string; style?: React.CSSProperties }) {
+   return (
+     <div
++      style={style}
+       className={cn(
+         "animate-shimmer rounded-md bg-[linear-gradient(110deg,var(--surface-2)_8%,var(--surface-hover)_18%,var(--surface-2)_33%)] bg-[length:200%_100%]",
+         className
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index d3968bd..40bfa9f 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -24,6 +24,11 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+ async function restGet<T>(path: string): Promise<T> {
+   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
+   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    // Every one of these reads backs a polling loop (dashboard stats, HITL
++    // pause checks, vendor/requirement lists) that expects the *current*
++    // row, not whatever the browser's HTTP cache last saw for this exact
++    // URL — force a real network round-trip every time.
++    cache: "no-store",
+     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+   });
+   if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
+diff --git a/src/lib/api/buyer-vendor-dna.ts b/src/lib/api/buyer-vendor-dna.ts
+index a271a9d..021862d 100644
+--- a/src/lib/api/buyer-vendor-dna.ts
++++ b/src/lib/api/buyer-vendor-dna.ts
+@@ -100,6 +100,9 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
+   try {
+     res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
+       method: "POST",
++      // Buyers re-run this while browsing vendor cards; a stale cached
++      // response would hide a vendor whose Solution DNA just got published.
++      cache: "no-store",
+       headers: {
+         "Content-Type": "application/json",
+         apikey: SUPABASE_ANON_KEY,
+diff --git a/src/lib/api/vendor-dna.ts b/src/lib/api/vendor-dna.ts
+index a7eb11c..3719152 100644
+--- a/src/lib/api/vendor-dna.ts
++++ b/src/lib/api/vendor-dna.ts
+@@ -122,6 +122,7 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
+   try {
+     res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
+       method: "POST",
++      cache: "no-store",
+       headers: {
+         "Content-Type": "application/json",
+         apikey: SUPABASE_ANON_KEY,
+diff --git a/src/lib/api/vendor-frontier.ts b/src/lib/api/vendor-frontier.ts
+index 69a3a77..0e21e8e 100644
+--- a/src/lib/api/vendor-frontier.ts
++++ b/src/lib/api/vendor-frontier.ts
+@@ -11,6 +11,7 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+ async function restGet<T>(path: string): Promise<T> {
+   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
+   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    cache: "no-store",
+     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+   });
+   if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
+@@ -21,6 +22,7 @@ async function callFunction<T>(slug: string, body: unknown): Promise<T> {
+   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
+   const res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
+     method: "POST",
++    cache: "no-store",
+     headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+     body: JSON.stringify(body),
+   });
+diff --git a/src/lib/api/vendor-knowledge.ts b/src/lib/api/vendor-knowledge.ts
+index f1ea51b..dea0826 100644
+--- a/src/lib/api/vendor-knowledge.ts
++++ b/src/lib/api/vendor-knowledge.ts
+@@ -27,6 +27,7 @@ export async function getVendorKnowledgeDocument(vendorId: string): Promise<Vend
+     limit: "1",
+   });
+   const res = await fetch(`${SUPABASE_URL}/rest/v1/vendor_knowledge_documents?${params}`, {
++    cache: "no-store",
+     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+   });
+   if (!res.ok) return null;
+diff --git a/src/lib/api/vendor-lookup.ts b/src/lib/api/vendor-lookup.ts
+index 136e5fa..a95742e 100644
+--- a/src/lib/api/vendor-lookup.ts
++++ b/src/lib/api/vendor-lookup.ts
+@@ -16,6 +16,7 @@ export interface VendorRow {
+ async function restGet<T>(path: string): Promise<T> {
+   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
+   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    cache: "no-store",
+     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+   });
+   if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
+@@ -44,6 +45,7 @@ export async function countDraftCapabilities(vendorId: string): Promise<number>
+   const res = await fetch(
+     `${SUPABASE_URL}/rest/v1/solution_capabilities?select=id&vendor_id=eq.${vendorId}`,
+     {
++      cache: "no-store",
+       headers: {
+         apikey: SUPABASE_ANON_KEY,
+         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+diff --git a/src/lib/hooks/use-agent-status.ts b/src/lib/hooks/use-agent-status.ts
+new file mode 100644
+index 0000000..b936709
+--- /dev/null
++++ b/src/lib/hooks/use-agent-status.ts
+@@ -0,0 +1,90 @@
++"use client";
++
++// Single cross-page "where does the agent stand right now" signal for the
++// buyer portal. Every buyer page used to run its own independent poll and
++// show its own "Loading…" / HITL card with no way to know, from any *other*
++// page, that the agent was waiting on you — this hook is the one flow all
++// of them now share (surfaced via <AgentStatusPill> in the portal header).
++//
++// It reuses the exact same read the per-page usePendingApproval() hooks
++// already make (getPendingApproval), just without a nodeKey filter, so it
++// finds a pause anywhere in the buyer's journey, not just on the page
++// you're currently looking at.
++import { useCallback, useEffect, useRef, useState } from "react";
++import { getPendingApproval, type BuyerApprovalNodeKey, type BuyerApprovalRequestRow } from "@/lib/api/buyer-lookup";
++import { POLL_INTERVAL_MS } from "@/lib/buyer-poll";
++
++export type AgentStatus = "idle" | "working" | "needs_input";
++
++// Where the buyer should go to answer a pause at each node — lets the
++// status pill deep-link straight to the right page instead of making them
++// hunt for which one has the waiting card.
++export const APPROVAL_NODE_ROUTE: Record<BuyerApprovalNodeKey, string> = {
++  confirm_vendor_selection: "/buyer/vendors",
++  adaptive_discovery_questioning: "/buyer/discover",
++  adjust_scenario_assumptions: "/buyer/scenarios",
++  answer_scenario_questions: "/buyer/scenarios",
++  query_workspace_evidence: "/buyer/chat",
++  approve_human_handoff: "/buyer/handoff",
++  unknown: "/buyer",
++};
++
++const APPROVAL_NODE_LABEL: Record<BuyerApprovalNodeKey, string> = {
++  confirm_vendor_selection: "Confirm your vendor",
++  adaptive_discovery_questioning: "Answer discovery questions",
++  adjust_scenario_assumptions: "Review scenario assumptions",
++  answer_scenario_questions: "Answer a scenario question",
++  query_workspace_evidence: "Reply in Ask AI",
++  approve_human_handoff: "Confirm expert handoff",
++  unknown: "Respond to the agent",
++};
++
++export interface AgentStatusResult {
++  status: AgentStatus;
++  approval: BuyerApprovalRequestRow | null;
++  label: string;
++  href: string | null;
++}
++
++export function useAgentStatus(buyerId: string | null | undefined): AgentStatusResult {
++  const [approval, setApproval] = useState<BuyerApprovalRequestRow | null>(null);
++  const [checkedOnce, setCheckedOnce] = useState(false);
++  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
++
++  const refresh = useCallback(async () => {
++    if (!buyerId) return;
++    try {
++      const found = await getPendingApproval({ buyerId });
++      setApproval((prev) => (prev?.requestId === found?.requestId ? prev : found));
++    } catch {
++      // transient read error — next tick tries again
++    } finally {
++      setCheckedOnce(true);
++    }
++  }, [buyerId]);
++
++  useEffect(() => {
++    if (!buyerId) return;
++    refresh();
++    intervalRef.current = setInterval(refresh, POLL_INTERVAL_MS);
++    return () => {
++      if (intervalRef.current) clearInterval(intervalRef.current);
++    };
++  }, [buyerId, refresh]);
++
++  if (!buyerId) return { status: "idle", approval: null, label: "Start a discovery request", href: "/buyer/discover" };
++  if (approval) {
++    return {
++      status: "needs_input",
++      approval,
++      label: APPROVAL_NODE_LABEL[approval.nodeKey] ?? "Respond to the agent",
++      href: APPROVAL_NODE_ROUTE[approval.nodeKey] ?? "/buyer",
++    };
++  }
++  return {
++    status: checkedOnce ? "working" : "idle",
++    approval: null,
++    label: checkedOnce ? "All caught up" : "Checking…",
++    href: null,
++  };
++}
+-- 
+2.43.0
+
