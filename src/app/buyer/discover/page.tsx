@@ -20,7 +20,7 @@ import {
   setStoredBuyerId,
   setStoredCompanyName,
 } from "@/lib/buyer-session";
-import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
+import { getBuyerRequirements, getClientRealityProfile, linkBuyerWorkflowRun, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
 import { POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
@@ -131,6 +131,7 @@ export default function DiscoverPage() {
       if (existingBuyerId) {
         setBuyerId(existingBuyerId);
         setStage("ready");
+        if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, existingBuyerId);
         return;
       }
 
@@ -146,6 +147,7 @@ export default function DiscoverPage() {
           setBuyerId(id);
           clearPendingBuyerSubmission();
           setStage("ready");
+          if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, id);
         },
         () => setStage("timed-out")
       );
@@ -170,6 +172,10 @@ export default function DiscoverPage() {
         setBuyerId(id);
         clearPendingBuyerSubmission();
         setStage("ready");
+        // Page reload lost the runId local state (see handleSubmit) — the
+        // most recent stored run id is the one this submission created.
+        const [mostRecentRunId] = getStoredBuyerWorkflowRunIds();
+        if (mostRecentRunId) linkBuyerWorkflowRun(mostRecentRunId, id);
       },
       () => setStage("timed-out")
     );

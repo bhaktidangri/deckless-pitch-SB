@@ -6,7 +6,7 @@
 // pattern of each page silently polling in isolation with no shared signal.
 import Link from "next/link";
 import { motion, AnimatePresence } from "motion/react";
-import { Bot, CheckCircle2, Sparkles } from "lucide-react";
+import { Bot, CheckCircle2, PartyPopper, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAgentStatus } from "@/lib/hooks/use-agent-status";
 
@@ -18,11 +18,13 @@ export function AgentStatusPill({ buyerId }: { buyerId: string | null | undefine
   const toneClass =
     status === "needs_input"
       ? "border-modelled-border bg-modelled-bg text-modelled"
-      : status === "working"
-        ? "border-verified-border bg-verified-bg text-verified"
-        : "border-border bg-surface-2 text-muted";
+      : status === "completed"
+        ? "border-brand-300 bg-brand-50 text-brand-700 dark:border-brand-800 dark:bg-brand-950/40 dark:text-brand-300"
+        : status === "working"
+          ? "border-verified-border bg-verified-bg text-verified"
+          : "border-border bg-surface-2 text-muted";
 
-  const Icon = status === "needs_input" ? Sparkles : status === "working" ? CheckCircle2 : Bot;
+  const Icon = status === "needs_input" ? Sparkles : status === "completed" ? PartyPopper : status === "working" ? CheckCircle2 : Bot;
 
   const content = (
     <motion.div

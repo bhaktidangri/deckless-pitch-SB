@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
+import { ArrowUpRight, MessageSquareText, PartyPopper, Sparkles, Store, TrendingUp } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
 import { LoadingState } from "@/components/shared/loading-state";
@@ -20,6 +20,7 @@ import {
   type CapabilityFrontierRow,
   type RoiProjectionRow,
 } from "@/lib/api/buyer-lookup";
+import { useAgentStatus } from "@/lib/hooks/use-agent-status";
 import { getStoredBuyerId, getStoredCompanyName, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
 import { cn, formatCurrencyINR } from "@/lib/utils";
 
@@ -33,6 +34,7 @@ export default function BuyerDashboardPage() {
   const [frontierItems, setFrontierItems] = useState<CapabilityFrontierRow[]>([]);
   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
   const [loading, setLoading] = useState(true);
+  const agentStatus = useAgentStatus(buyerId);
 
   useEffect(() => {
     if (!buyerId) {
@@ -88,6 +90,23 @@ export default function BuyerDashboardPage() {
           </Link>
         }
       />
+
+      {agentStatus.status === "completed" && (
+        <Card className="mb-6 border-brand-300 bg-gradient-to-br from-brand-50 to-accent-50 dark:border-brand-800 dark:from-brand-950/30 dark:to-accent-950/20 animate-slide-up">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
+            <div className="flex items-center gap-3">
+              <PartyPopper className="h-5 w-5 shrink-0 text-brand-600 dark:text-brand-400" />
+              <div>
+                <p className="text-sm font-semibold text-foreground">Your agent has finished — your solution is ready</p>
+                <p className="text-xs text-muted">Open the solution workspace to review it and download your pitch deck.</p>
+              </div>
+            </div>
+            <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary", size: "sm" }))}>
+              View solution <ArrowUpRight className="h-3.5 w-3.5" />
+            </Link>
+          </CardContent>
+        </Card>
+      )}
 
       {loading ? (
         <>

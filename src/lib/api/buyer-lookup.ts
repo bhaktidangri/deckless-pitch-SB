@@ -493,6 +493,72 @@ export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolut
   return { id: row.id, buyerId: row.buyer_id, title: row.title, pptxUrl: row.pptx_url, status: row.status, createdAt: row.created_at };
 }
 
+// ---- buyer_workflow_runs (run-completion tracking) -------------------------
+// See supabase-buyer/migrations/0004_buyer_workflow_runs.sql — the durable,
+// server-side record of "does this run exist and has it finished", used by
+// useAgentStatus to show a distinct "your solution is ready" state instead
+// of forever showing "working", and by the scheduled Yoxa-sync task to know
+// which runs still need checking.
+
+export interface BuyerWorkflowRunRow {
+  id: string;
+  workflowRunId: string;
+  buyerId: string | null;
+  status: "running" | "completed" | "failed";
+  deckSyncedAt: string | null;
+  completedAt: string | null;
+  startedAt: string;
+}
+
+export async function getLatestBuyerWorkflowRun(buyerId: string): Promise<BuyerWorkflowRunRow | null> {
+  const params = new URLSearchParams({
+    select: "id,workflow_run_id,buyer_id,status,deck_synced_at,completed_at,started_at",
+    buyer_id: `eq.${buyerId}`,
+    order: "started_at.desc",
+    limit: "1",
+  });
+  const rows = await restGet<
+    {
+      id: string;
+      workflow_run_id: string;
+      buyer_id: string | null;
+      status: "running" | "completed" | "failed";
+      deck_synced_at: string | null;
+      completed_at: string | null;
+      started_at: string;
+    }[]
+  >(`buyer_workflow_runs?${params}`);
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    workflowRunId: row.workflow_run_id,
+    buyerId: row.buyer_id,
+    status: row.status,
+    deckSyncedAt: row.deck_synced_at,
+    completedAt: row.completed_at,
+    startedAt: row.started_at,
+  };
+}
+
+// Client-side backfill of buyer_id onto a run row created before buyerId was
+// known (see the buyer-requirement-submission route's own initial insert).
+// Best-effort, fire-and-forget by design at both call sites in
+// src/app/buyer/discover/page.tsx — a missed backfill just means the sync
+// task's next pass (or the next submission on this run) tries again.
+export async function linkBuyerWorkflowRun(workflowRunId: string, buyerId: string): Promise<void> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
+  try {
+    await fetch(`${SUPABASE_URL}/functions/v1/save-buyer-workflow-run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+      body: JSON.stringify({ workflowRunId, buyerId }),
+    });
+  } catch {
+    // best-effort — see callers
+  }
+}
+
 // ---- buyer_workflow_approval_requests (HITL bridge) ------------------------
 
 export type BuyerApprovalNodeKey =

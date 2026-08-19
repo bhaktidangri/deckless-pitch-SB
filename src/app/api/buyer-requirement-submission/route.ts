@@ -57,6 +57,24 @@ export async function POST(req: Request) {
 
   try {
     const result = await triggerBuyerRequirementSubmission(triggerText);
+
+    // Record the run immediately so it's discoverable server-side (by the
+    // Yoxa-sync scheduled task, or anything else) even before the client
+    // learns its own buyerId — see 0004_buyer_workflow_runs.sql. Best-effort:
+    // a failure here shouldn't fail the submission itself.
+    const functionsUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    if (functionsUrl && anonKey && result.workflowRunId) {
+      fetch(`${functionsUrl}/functions/v1/save-buyer-workflow-run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", apikey: anonKey, Authorization: `Bearer ${anonKey}` },
+        body: JSON.stringify({ workflowRunId: result.workflowRunId, buyerId: body.buyerId }),
+      }).catch(() => {
+        // transient — the discover page's own backfill call, or the sync
+        // task's next pass, gets another chance to create/update this row
+      });
+    }
+
     return NextResponse.json(result, { status: 202 });
   } catch (e) {
     if (e instanceof YoxaBuyerTriggerError) {
