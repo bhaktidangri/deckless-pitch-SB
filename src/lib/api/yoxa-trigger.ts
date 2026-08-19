@@ -9,10 +9,9 @@
 // /trigger requires an Idempotency-Key header, then a JSON body of
 // { trigger_text: string }, and responds 202 with a workflow_run_id.
 // File-upload input (multipart, field name "file") consistently 500s
-// server-side on Yoxa's end — moot now anyway, since the workflow's
-// "Ingest Vendor Documents and Direct Inputs" tool has been removed from
-// the redeployed workflow. Milestone 1 is crawl-only; trigger_text now only
-// carries vendor identity/profile fields, not capability source text.
+// server-side on Yoxa's end — that path is NOT wired here; document upload
+// stays a manual "paste key excerpts as text" workaround until Yoxa's file
+// input is fixed or documented.
 //
 // There is no run-status/polling endpoint on this API (every guess 404s,
 // and GET on /trigger itself is 405). Completion is instead detected by
