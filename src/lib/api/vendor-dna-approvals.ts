@@ -50,6 +50,40 @@ export async function findPendingApprovalForCapability(capabilityId: string): Pr
   };
 }
 
+// Primary lookup path: workflow_run_id is present on every approval-request
+// row (unlike capability_id, which Yoxa's "Request Vendor DNA Approval" tool
+// doesn't send — see api/webhooks/yoxa-hitl/route.ts). Scoped to the run ids
+// this browser actually triggered (vendor-session's addStoredWorkflowRunId),
+// so solution-dna can surface real pending HITL questions instead of relying
+// on the capability-card piggyback ever lining up.
+export async function findPendingApprovalsForWorkflowRuns(runIds: string[]): Promise<PendingApprovalRequest[]> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || runIds.length === 0) return [];
+  const params = new URLSearchParams({
+    select: "request_id,capability_id,title,description,options",
+    workflow_run_id: `in.(${runIds.join(",")})`,
+    status: "eq.pending",
+    order: "created_at.desc",
+  });
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/vendor_dna_approval_requests?${params}`, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+  });
+  if (!res.ok) return [];
+  const rows = (await res.json()) as {
+    request_id: string;
+    capability_id: string | null;
+    title: string | null;
+    description: string | null;
+    options: PendingApprovalRequest["options"];
+  }[];
+  return rows.map((row) => ({
+    requestId: row.request_id,
+    capabilityId: row.capability_id,
+    title: row.title,
+    description: row.description,
+    options: row.options ?? [],
+  }));
+}
+
 // approve_as_is/revise -> option_1/2 (approved), reject -> option_3, leave
 // pending -> option_4, per the fixed 4-choice contract in PRD 5.3.3.
 export type ApprovalOptionId = "option_1" | "option_2" | "option_3" | "option_4";

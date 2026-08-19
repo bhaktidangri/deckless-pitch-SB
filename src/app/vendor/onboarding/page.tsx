@@ -2,80 +2,58 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, Building2, Clock, Globe, Loader2, PenLine } from "lucide-react";
+import { AlertTriangle, Building2, Clock, Globe, Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { getStoredVendorId, setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
-import { countDraftCapabilities, findVendorCreatedAfter } from "@/lib/api/vendor-lookup";
+import {
+  addStoredWorkflowRunId,
+  clearPendingSubmission,
+  getPendingSubmission,
+  getStoredVendorId,
+  setPendingSubmission,
+  setStoredVendorId,
+  setStoredVendorName,
+} from "@/lib/vendor-session";
+import { countDraftCapabilities } from "@/lib/api/vendor-lookup";
+import { POLL_TIMEOUT_MS, pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
 
 const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
 
-const POLL_INTERVAL_MS = 4000;
-const POLL_TIMEOUT_MS = 3 * 60 * 1000;
-
 type Stage = "idle" | "submitting" | "processing" | "timed-out" | "error";
 
-// One composed submission — org details, website URL, and direct-text
-// capability descriptions — fires a single vendor_source_submission trigger
-// event against the live Yoxa.ai deployment (PRD Section 5.1 / 8). Document
-// upload isn't wired: Yoxa's file-input channel 500s server-side, so for now
-// vendors paste key excerpts into the text box instead of attaching files.
+// One composed submission — org details plus a website URL — fires a single
+// vendor_source_submission trigger event against the live Yoxa.ai deployment
+// (PRD Section 5.1 / 8). The "Ingest Vendor Documents and Direct Inputs"
+// tool has been removed from the redeployed workflow: Milestone 1 is now
+// crawl-only, so website URL is the sole capability source (no direct-text
+// or document upload path).
 export default function VendorOnboardingPage() {
   const router = useRouter();
   const existingVendorId = getStoredVendorId();
-  const cancelled = useRef(false);
-  useEffect(() => () => { cancelled.current = true; }, []);
+  const pollHandleRef = useRef<PollHandle | null>(null);
+  useEffect(() => () => pollHandleRef.current?.cancel(), []);
 
   const [companyName, setCompanyName] = useState("");
   const [website, setWebsite] = useState("");
   const [industry, setIndustry] = useState(industryOptions[0]);
   const [description, setDescription] = useState("");
-  const [directText, setDirectText] = useState("");
 
   const [stage, setStage] = useState<Stage>("idle");
   const [error, setError] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
 
-  const hasAnySource = website.trim() || directText.trim();
+  const hasAnySource = website.trim().length > 0;
   const canSubmit = existingVendorId ? hasAnySource : companyName.trim() && hasAnySource;
 
-  async function pollForNewVendor(name: string, afterIso: string, deadline: number) {
-    if (cancelled.current) return;
-    try {
-      const vendor = await findVendorCreatedAfter(name, afterIso);
-      if (vendor) {
-        setStoredVendorId(vendor.id);
-        router.push("/vendor/solution-dna");
-        return;
-      }
-    } catch {
-      // transient read error — keep polling until the deadline
-    }
-    if (Date.now() >= deadline) {
-      setStage("timed-out");
-      return;
-    }
-    setTimeout(() => pollForNewVendor(name, afterIso, deadline), POLL_INTERVAL_MS);
-  }
-
-  async function pollForNewCapabilities(vendorId: string, baseline: number, deadline: number) {
-    if (cancelled.current) return;
-    try {
-      const count = await countDraftCapabilities(vendorId);
-      if (count > baseline) {
-        router.push("/vendor/solution-dna");
-        return;
-      }
-    } catch {
-      // transient read error — keep polling until the deadline
-    }
-    if (Date.now() >= deadline) {
-      setStage("timed-out");
-      return;
-    }
-    setTimeout(() => pollForNewCapabilities(vendorId, baseline, deadline), POLL_INTERVAL_MS);
+  // The original poll deadline has already passed once we're in "timed-out"
+  // — resuming Milestone 2's auto-poll against a stale deadline would just
+  // time out again instantly, so give it a fresh budget before navigating.
+  function goToReviewScreen() {
+    const pending = getPendingSubmission();
+    if (pending) setPendingSubmission({ ...pending, deadline: Date.now() + POLL_TIMEOUT_MS });
+    router.push("/vendor/solution-dna");
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -105,7 +83,6 @@ export default function VendorOnboardingPage() {
           website: website.trim() || undefined,
           industry: existingVendorId ? undefined : industry,
           description: description.trim() || undefined,
-          directText: directText.trim() || undefined,
         }),
       });
       const data = await res.json().catch(() => ({}) as Record<string, unknown>);
@@ -115,14 +92,41 @@ export default function VendorOnboardingPage() {
         return;
       }
 
-      setRunId(typeof data?.workflowRunId === "string" ? data.workflowRunId : null);
+      const workflowRunId = typeof data?.workflowRunId === "string" ? data.workflowRunId : null;
+      setRunId(workflowRunId);
+      if (workflowRunId) addStoredWorkflowRunId(workflowRunId);
       if (!existingVendorId && companyName.trim()) setStoredVendorName(companyName.trim());
       setStage("processing");
       const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+      // Persisted before polling starts so Milestone 2 can pick up right
+      // where this leaves off if the vendor navigates away early — this
+      // page's own poll dies with the component on unmount.
       if (existingVendorId) {
-        pollForNewCapabilities(existingVendorId, baseline, deadline);
+        setPendingSubmission({ kind: "existing-vendor", vendorId: existingVendorId, baseline, deadline });
+        pollHandleRef.current = pollForNewCapabilities(
+          existingVendorId,
+          baseline,
+          deadline,
+          () => {
+            clearPendingSubmission();
+            router.push("/vendor/solution-dna");
+          },
+          () => setStage("timed-out")
+        );
       } else {
-        pollForNewVendor(companyName.trim(), triggeredAt, deadline);
+        setPendingSubmission({ kind: "new-vendor", companyName: companyName.trim(), afterIso: triggeredAt, deadline });
+        pollHandleRef.current = pollForNewVendorId(
+          companyName.trim(),
+          triggeredAt,
+          deadline,
+          (vendorId) => {
+            setStoredVendorId(vendorId);
+            clearPendingSubmission();
+            router.push("/vendor/solution-dna");
+          },
+          () => setStage("timed-out")
+        );
       }
     } catch {
       setError("Could not reach the submission endpoint. Check your connection and try again.");
@@ -136,7 +140,7 @@ export default function VendorOnboardingPage() {
         <PageHeader
           eyebrow="Milestone 1 — Ingest Vendor Sources and Build DNA Draft"
           title="Analyzing your submission…"
-          description="Crawling your site and ingesting text run in parallel; once both finish, the Vendor Intelligence Agent consolidates everything into your Solution DNA draft."
+          description="Crawling your site feeds the Vendor Intelligence Agent, which consolidates what it finds into your Solution DNA draft."
         />
         <Card className="max-w-md p-6 text-center">
           {stage === "processing" ? (
@@ -151,10 +155,10 @@ export default function VendorOnboardingPage() {
               <p className="mt-3 text-sm font-medium text-foreground">Still processing after a few minutes.</p>
               <p className="mt-1 text-sm text-muted">
                 Your submission is running — check{" "}
-                <button className="text-brand-600 underline dark:text-brand-400" onClick={() => router.push("/vendor/solution-dna")}>
+                <button className="text-brand-600 underline dark:text-brand-400" onClick={goToReviewScreen}>
                   the review screen
                 </button>{" "}
-                again shortly, or paste your vendor ID there once you have it.
+                — it keeps checking automatically and loads your draft the moment it&apos;s ready.
               </p>
               {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
             </>
@@ -169,7 +173,7 @@ export default function VendorOnboardingPage() {
       <PageHeader
         eyebrow="Milestone 1 — Ingest Vendor Sources and Build DNA Draft"
         title={existingVendorId ? "Add more sources" : "Register and submit your sources"}
-        description="Provide your company details plus a website URL and/or direct text — one submission kicks off extraction into your Solution DNA draft."
+        description="Provide your company details plus a website URL — one submission kicks off extraction into your Solution DNA draft."
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
@@ -217,29 +221,14 @@ export default function VendorOnboardingPage() {
               )}
 
               <div>
-                <Label htmlFor="website">Website URL {existingVendorId ? "" : "(crawled for capability extraction)"}</Label>
+                <Label htmlFor="website">Website URL (crawled for capability extraction)</Label>
                 <Input
                   id="website"
                   value={website}
                   onChange={(e) => setWebsite(e.target.value)}
                   placeholder="https://yourcompany.com"
+                  required
                 />
-              </div>
-
-              <div>
-                <Label htmlFor="direct-text">Direct capability input</Label>
-                <Textarea
-                  id="direct-text"
-                  value={directText}
-                  onChange={(e) => setDirectText(e.target.value)}
-                  rows={5}
-                  placeholder="Type capabilities, pricing rules, or FAQs directly — each statement is treated as its own claim. If you have supporting documents, paste their key excerpts here for now."
-                />
-              </div>
-
-              <div className="flex items-start gap-2 rounded-lg border border-border bg-surface-2/50 px-3 py-2.5 text-xs text-muted">
-                <PenLine className="mt-0.5 h-3.5 w-3.5 shrink-0 text-subtle" />
-                Document upload isn&apos;t wired to live extraction yet — paste key excerpts above instead of attaching files.
               </div>
 
               {stage === "error" && error && (
@@ -263,8 +252,8 @@ export default function VendorOnboardingPage() {
             <CardContent className="pt-5">
               <p className="text-sm font-semibold text-foreground">What happens next?</p>
               <p className="mt-2 text-sm text-muted">
-                Crawling your site and ingesting text run in parallel; once both finish, the Vendor Intelligence Agent
-                consolidates everything into your Solution DNA draft and you&apos;re taken to the review screen automatically.
+                Crawling your site feeds the Vendor Intelligence Agent, which consolidates what it finds into your
+                Solution DNA draft — you&apos;re taken to the review screen automatically once it&apos;s done.
               </p>
             </CardContent>
           </Card>
