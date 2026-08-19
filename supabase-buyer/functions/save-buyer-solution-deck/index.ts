@@ -3,6 +3,14 @@
 // regenerated deck after a What-If Scenarios change — same table, newest
 // row wins). Called by src/app/api/webhooks/yoxa-buyer-deck/route.ts.
 // verify_jwt: false, mirrors save-vendor-knowledge-document.
+//
+// Accepts either a fileUrl (fetched and re-uploaded) or fileBase64
+// (decoded), same defensive both-paths pattern as save-vendor-knowledge-
+// document, since Yoxa's real delivery shape for this Output Tool has not
+// been directly observed — this only matters once whatever calls this
+// function actually reaches it (a raw Output Tool artifact currently stays
+// inside Yoxa's own dashboard; nothing pushes it here yet — see the
+// yoxa-buyer-deck route's own comment and supabase-buyer/README.md).
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -47,6 +55,48 @@ Deno.serve(async (req) => {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey);
+
+  const fileUrl = body.fileUrl as string | undefined;
+  const fileBase64 = body.fileBase64 as string | undefined;
+  const fileName = body.fileName as string | undefined;
+
+  let pptxUrl: string | null = null;
+
+  try {
+    let bytes: Uint8Array | null = null;
+
+    if (fileBase64 && typeof fileBase64 === "string") {
+      const binary = atob(fileBase64.includes(",") ? fileBase64.split(",").pop()! : fileBase64);
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else if (fileUrl && typeof fileUrl === "string") {
+      const fileRes = await fetch(fileUrl);
+      if (fileRes.ok) bytes = new Uint8Array(await fileRes.arrayBuffer());
+    }
+
+    if (bytes) {
+      const safeName = (typeof fileName === "string" && fileName.trim()) || "solution-pitch-deck.pptx";
+      const path = `${buyerId}/${Date.now()}-${safeName}`;
+      const { error: uploadError } = await supabase.storage
+        .from("buyer-solution-pptx")
+        .upload(path, bytes, {
+          contentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          upsert: true,
+        });
+      if (!uploadError) {
+        pptxUrl = supabase.storage.from("buyer-solution-pptx").getPublicUrl(path).data.publicUrl;
+      }
+    } else if (fileUrl) {
+      // Fetch failed or was skipped for some reason but a URL was still
+      // supplied — fall back to linking it directly rather than losing it.
+      pptxUrl = fileUrl;
+    }
+  } catch {
+    // Fall through — still record the row (with rawPayload) even if the
+    // file itself couldn't be fetched/decoded/uploaded, so this is
+    // diagnosable from the stored raw_payload instead of silently vanishing.
+  }
+
   const { data, error } = await supabase
     .from("buyer_solution_decks")
     .insert({
@@ -55,8 +105,8 @@ Deno.serve(async (req) => {
       solution_model_id: (body.solutionModelId as string | undefined) ?? null,
       workflow_run_id: (body.workflowRunId as string | undefined) ?? null,
       title: (body.title as string | undefined) ?? "Solution Pitch Deck",
-      pptx_url: (body.fileUrl as string | undefined) ?? null,
-      status: body.fileUrl ? "ready" : "failed",
+      pptx_url: pptxUrl,
+      status: pptxUrl ? "ready" : "failed",
       raw_payload: body.rawPayload ?? body,
     })
     .select("id, buyer_id, pptx_url, status")
