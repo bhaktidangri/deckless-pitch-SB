@@ -10,12 +10,13 @@
 // before or independent of their own recommendation list.
 import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Building2, ChevronDown, Loader2, Search, Sparkles } from "lucide-react";
+import { Building2, ChevronDown, Loader2, Search, Sparkles, Wand2 } from "lucide-react";
 import { Modal } from "@/components/ui/drawer";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { EvidenceBadge } from "@/components/shared/status-badge";
 import { queryPublishedVendorSolutionDna, type PublishedCapability, type PublishedVendor } from "@/lib/api/buyer-vendor-dna";
+import { searchVendorCapabilities } from "@/lib/api/capability-search";
 import { cn } from "@/lib/utils";
 
 function vendorMatches(vendor: PublishedVendor, q: string): boolean {
@@ -27,6 +28,8 @@ function vendorMatches(vendor: PublishedVendor, q: string): boolean {
   if (haystack.includes(q)) return true;
   return vendor.capabilities.some((c) => capabilityMatches(c, q));
 }
+
+const EMPTY_MATCH_MAP: Map<string, number> = new Map();
 
 function capabilityMatches(capability: PublishedCapability, q: string): boolean {
   if (!q) return true;
@@ -44,6 +47,12 @@ export function GlobalCapabilitySearch() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // capabilityId -> similarity, for capabilities the meaning-based search
+  // surfaced that the plain substring filter below would miss entirely
+  // (different wording for the same thing — "instant loans" vs. this
+  // vendor's own "lending" capability, etc).
+  const [semanticMatches, setSemanticMatches] = useState<Map<string, number>>(new Map());
+  const [semanticLoading, setSemanticLoading] = useState(false);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -77,10 +86,46 @@ export function GlobalCapabilitySearch() {
   }, [open, vendors]);
 
   const q = query.trim().toLowerCase();
+
+  // Debounced meaning-based search — runs alongside the instant substring
+  // filter below rather than replacing it, so short/exact queries stay
+  // snappy with no network round trip.
+  useEffect(() => {
+    if (q.length < 3) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setSemanticLoading(true);
+      searchVendorCapabilities(q, 30)
+        .then((results) => {
+          if (cancelled) return;
+          setSemanticMatches(new Map(results.map((r) => [r.capabilityId, r.similarity])));
+        })
+        .catch(() => {
+          if (!cancelled) setSemanticMatches(new Map());
+        })
+        .finally(() => {
+          if (!cancelled) setSemanticLoading(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [q]);
+
+  // Stale results from a since-shortened query shouldn't linger — only
+  // trust semanticMatches while the current query still qualifies for it.
+  const activeSemanticMatches = q.length >= 3 ? semanticMatches : EMPTY_MATCH_MAP;
+
   const filtered = useMemo(() => {
     if (!vendors) return [];
-    return vendors.filter((v) => vendorMatches(v, q));
-  }, [vendors, q]);
+    if (activeSemanticMatches.size === 0) return vendors.filter((v) => vendorMatches(v, q));
+    // A vendor stays in the list if it matches by substring OR has at
+    // least one capability the semantic search surfaced.
+    return vendors.filter(
+      (v) => vendorMatches(v, q) || v.capabilities.some((c) => activeSemanticMatches.has(c.id))
+    );
+  }, [vendors, q, activeSemanticMatches]);
 
   return (
     <>
@@ -110,6 +155,7 @@ export function GlobalCapabilitySearch() {
             placeholder="Search capabilities, industries, or vendors…"
             className="h-auto border-0 px-0 py-0 focus:ring-0"
           />
+          {semanticLoading && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-subtle" />}
         </div>
 
         <div className="mt-3 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
@@ -124,7 +170,11 @@ export function GlobalCapabilitySearch() {
           )}
           {!loading &&
             filtered.map((vendor) => {
-              const matchingCapabilities = q ? vendor.capabilities.filter((c) => capabilityMatches(c, q)) : vendor.capabilities;
+              const matchingCapabilities = q
+                ? vendor.capabilities
+                    .filter((c) => capabilityMatches(c, q) || activeSemanticMatches.has(c.id))
+                    .sort((a, b) => (activeSemanticMatches.get(b.id) ?? 0) - (activeSemanticMatches.get(a.id) ?? 0))
+                : vendor.capabilities;
               const isExpanded = expandedId === vendor.vendorId;
               return (
                 <div key={vendor.vendorId} className="rounded-xl border border-border bg-surface-2/60">
@@ -167,7 +217,14 @@ export function GlobalCapabilitySearch() {
                                 <p className="flex items-center gap-1.5 text-sm font-medium text-foreground">
                                   <Sparkles className="h-3.5 w-3.5 shrink-0 text-brand-500" /> {c.name}
                                 </p>
-                                <EvidenceBadge status={c.verificationStatus} />
+                                <div className="flex shrink-0 items-center gap-1.5">
+                                  {!capabilityMatches(c, q) && activeSemanticMatches.has(c.id) && (
+                                    <Badge variant="brand" size="sm" className="gap-1">
+                                      <Wand2 className="h-3 w-3" /> Meaning match
+                                    </Badge>
+                                  )}
+                                  <EvidenceBadge status={c.verificationStatus} />
+                                </div>
                               </div>
                               {c.description && <p className="mt-1.5 text-xs text-muted">{c.description}</p>}
                               {c.tags.length > 0 && (
@@ -190,7 +247,14 @@ export function GlobalCapabilitySearch() {
 
         {!loading && !error && vendors && (
           <p className="mt-3 flex items-center gap-1.5 border-t border-border pt-3 text-[11px] text-subtle">
-            <Building2 className="h-3 w-3" /> Searching {vendors.length} published vendor{vendors.length === 1 ? "" : "s"} and their full Solution DNA.
+            <Building2 className="h-3 w-3" /> Searching {vendors.length} published vendor{vendors.length === 1 ? "" : "s"} and their full Solution DNA
+            {q.length >= 3 && (
+              <>
+                {" "}
+                — <Wand2 className="h-3 w-3" /> matched by meaning, not just keywords
+              </>
+            )}
+            .
           </p>
         )}
       </Modal>

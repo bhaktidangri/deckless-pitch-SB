@@ -24,6 +24,7 @@ import {
 import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
 import { getAuditEvents } from "@/lib/api/admin-lookup";
 import { getStoredVendorId } from "@/lib/vendor-session";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import type { AuditEvent } from "@/lib/types";
 
@@ -43,6 +44,20 @@ export default function VendorDashboardPage() {
   const [interestSeries, setInterestSeries] = useState<VendorInterestWeek[]>([]);
   const [outreachCount, setOutreachCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  useRealtimeRefresh(
+    vendorId
+      ? [
+          { table: "vendors", filter: `id=eq.${vendorId}` },
+          { table: "vendor_recommendations", filter: `vendor_id=eq.${vendorId}` },
+          { table: "capability_frontier", filter: `vendor_id=eq.${vendorId}` },
+          { table: "vendor_outreach_events", filter: `vendor_id=eq.${vendorId}` },
+        ]
+      : [],
+    () => setRealtimeBump((n) => n + 1),
+    [vendorId]
+  );
 
   useEffect(() => {
     const id = getStoredVendorId();
@@ -86,12 +101,12 @@ export default function VendorDashboardPage() {
       }
     }
     load();
-    const interval = setInterval(load, 15000);
+    const interval = setInterval(load, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [realtimeBump]);
 
   if (!vendorId) {
     return (

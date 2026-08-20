@@ -5,6 +5,8 @@
 // writes call the new resolve-capability-frontier-item /
 // confirm-vendor-discussion-meeting functions staged in supabase-buyer/.
 
+import type { EmailDeliveryStatus } from "@/lib/api/vendor-lookup";
+
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
@@ -101,11 +103,15 @@ export interface VendorMeetingRequestRow {
   meetingLink: string | null;
   durationMinutes: number;
   createdAt: string;
+  inviteEmailStatus: EmailDeliveryStatus;
+  inviteOpenedAt: string | null;
+  inviteClickedAt: string | null;
 }
 
 export async function getMeetingRequestsForVendor(vendorId: string): Promise<VendorMeetingRequestRow[]> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at",
+    select:
+      "id,buyer_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at,invite_email_status,invite_opened_at,invite_clicked_at",
     vendor_id: `eq.${vendorId}`,
     order: "created_at.desc",
   });
@@ -122,6 +128,9 @@ export async function getMeetingRequestsForVendor(vendorId: string): Promise<Ven
       meeting_link: string | null;
       duration_minutes: number | null;
       created_at: string;
+      invite_email_status: EmailDeliveryStatus | null;
+      invite_opened_at: string | null;
+      invite_clicked_at: string | null;
     }[]
   >(`meeting_requests?${params}`);
   return rows.map((r) => ({
@@ -136,6 +145,9 @@ export async function getMeetingRequestsForVendor(vendorId: string): Promise<Ven
     meetingLink: r.meeting_link,
     durationMinutes: r.duration_minutes ?? 30,
     createdAt: r.created_at,
+    inviteEmailStatus: r.invite_email_status ?? "not_sent",
+    inviteOpenedAt: r.invite_opened_at,
+    inviteClickedAt: r.invite_clicked_at,
   }));
 }
 

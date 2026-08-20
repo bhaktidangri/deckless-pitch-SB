@@ -7,6 +7,7 @@ import { Avatar } from "@/components/ui/avatar";
 import { ResponseStatusBadge } from "@/components/shared/status-badge";
 import { getLatestConversationMessages, type BuyerApprovalNodeKey, type ConversationMessageRow } from "@/lib/api/buyer-lookup";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn } from "@/lib/utils";
 
 // Real chat surface for the buyer workflow's two chat-shaped human_approval
@@ -38,25 +39,32 @@ export function LiveChatPanel({
   const [queued, setQueued] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const { approval, respond, responding } = usePendingApproval(nodeKey, { buyerId, workflowRunIds, enabled: !!buyerId });
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  // No conversation_id known ahead of time (getLatestConversationMessages
+  // resolves it itself), so this watches the whole messages table — the
+  // actual refetch below still stays buyer-scoped via that same call, this
+  // is just "something changed, go check".
+  useRealtimeRefresh(buyerId ? [{ table: "messages" }] : [], () => setRealtimeBump((n) => n + 1), [buyerId]);
 
   useEffect(() => {
     if (!buyerId) return;
     let cancelled = false;
     async function load() {
       try {
-        const rows = await getLatestConversationMessages(buyerId!);
+        const { messages: rows } = await getLatestConversationMessages(buyerId!);
         if (!cancelled) setMessages(rows);
       } catch {
         // transient — next tick retries
       }
     }
     load();
-    const interval = setInterval(load, 5000);
+    const interval = setInterval(load, 30000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [buyerId]);
+  }, [buyerId, realtimeBump]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });

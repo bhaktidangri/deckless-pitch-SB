@@ -334,6 +334,38 @@ export async function getSolutionModel(buyerId: string, vendorId: string): Promi
   };
 }
 
+// Whether the agent has actually finished building a solution, independent
+// of buyer_workflow_runs.status ever reaching "completed" — nothing in this
+// codebase currently sets that (the "scheduled Yoxa-sync task" its own
+// comments describe was never built), so a run can sit at status="running"
+// forever even long after the agent is done. finalize-solution-workspace's
+// last action is flipping the model to status="active" — that's the one
+// real, durable signal that Step 6 actually ran, so useAgentStatus treats it
+// as ground truth for "completed" instead of waiting on a signal that never
+// arrives. Not scoped to a vendorId (unlike getSolutionModel) since the
+// status pill only knows buyerId.
+export async function getActiveSolutionModelForBuyer(buyerId: string): Promise<SolutionModelRow | null> {
+  const params = new URLSearchParams({
+    select: "*",
+    buyer_id: `eq.${buyerId}`,
+    status: "eq.active",
+    order: "updated_at.desc.nullslast",
+    limit: "1",
+  });
+  const rows = await restGet<Record<string, unknown>[]>(`solution_models?${params}`);
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    id: row.id as string,
+    buyerId: row.buyer_id as string,
+    vendorId: row.vendor_id as string,
+    status: (row.status as string) ?? null,
+    version: (row.version as number) ?? null,
+    executiveSummary: (row.executive_summary as string) ?? null,
+    updatedAt: (row.updated_at as string) ?? null,
+  };
+}
+
 export async function getRoiProjection(solutionModelId: string): Promise<RoiProjectionRow | null> {
   const params = new URLSearchParams({
     select: "id,solution_model_id,current_annual_cost,projected_annual_cost,savings_percent,payback_months,three_year_savings,chart",
@@ -524,22 +556,45 @@ export interface BuyerSolutionDeckRow {
   title: string | null;
   pptxUrl: string | null;
   status: "ready" | "failed";
+  // "agent" = delivered by the Yoxa workflow webhook; "fallback" = built
+  // locally from Supabase data (src/app/api/buyer-solution-deck/generate-fallback)
+  // when the agent never delivered a working deck.
+  source: "agent" | "fallback";
   createdAt: string;
+}
+
+const SOLUTION_DECK_SELECT = "id,buyer_id,title,pptx_url,status,source,created_at";
+
+function mapSolutionDeckRow(row: {
+  id: string;
+  buyer_id: string;
+  title: string | null;
+  pptx_url: string | null;
+  status: "ready" | "failed";
+  source: "agent" | "fallback";
+  created_at: string;
+}): BuyerSolutionDeckRow {
+  return {
+    id: row.id,
+    buyerId: row.buyer_id,
+    title: row.title,
+    pptxUrl: row.pptx_url,
+    status: row.status,
+    source: row.source,
+    createdAt: row.created_at,
+  };
 }
 
 export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolutionDeckRow | null> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,title,pptx_url,status,created_at",
+    select: SOLUTION_DECK_SELECT,
     buyer_id: `eq.${buyerId}`,
     order: "created_at.desc",
     limit: "1",
   });
-  const rows = await restGet<
-    { id: string; buyer_id: string; title: string | null; pptx_url: string | null; status: "ready" | "failed"; created_at: string }[]
-  >(`buyer_solution_decks?${params}`);
+  const rows = await restGet<Parameters<typeof mapSolutionDeckRow>[0][]>(`buyer_solution_decks?${params}`);
   const row = rows[0];
-  if (!row) return null;
-  return { id: row.id, buyerId: row.buyer_id, title: row.title, pptxUrl: row.pptx_url, status: row.status, createdAt: row.created_at };
+  return row ? mapSolutionDeckRow(row) : null;
 }
 
 // Full deck history (every generated deck, not just the newest) — the
@@ -548,22 +603,47 @@ export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolut
 // only the current one.
 export async function getBuyerSolutionDecks(buyerId: string, limit = 10): Promise<BuyerSolutionDeckRow[]> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,title,pptx_url,status,created_at",
+    select: SOLUTION_DECK_SELECT,
     buyer_id: `eq.${buyerId}`,
     order: "created_at.desc",
     limit: String(limit),
   });
-  const rows = await restGet<
-    { id: string; buyer_id: string; title: string | null; pptx_url: string | null; status: "ready" | "failed"; created_at: string }[]
-  >(`buyer_solution_decks?${params}`);
-  return rows.map((row) => ({
-    id: row.id,
-    buyerId: row.buyer_id,
-    title: row.title,
-    pptxUrl: row.pptx_url,
-    status: row.status,
-    createdAt: row.created_at,
-  }));
+  const rows = await restGet<Parameters<typeof mapSolutionDeckRow>[0][]>(`buyer_solution_decks?${params}`);
+  return rows.map(mapSolutionDeckRow);
+}
+
+export class FallbackDeckError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "FallbackDeckError";
+    this.status = status;
+  }
+}
+
+// Triggers the local backup pitch deck: generates a real .pptx from
+// whatever this buyer's workspace already has in Supabase and uploads it
+// through the same path the Yoxa webhook uses. See
+// src/app/api/buyer-solution-deck/generate-fallback/route.ts.
+export async function generateFallbackSolutionDeck(buyerId: string, vendorId?: string | null): Promise<BuyerSolutionDeckRow> {
+  const res = await fetch("/api/buyer-solution-deck/generate-fallback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ buyerId, vendorId }),
+  });
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) {
+    throw new FallbackDeckError((data.error as string) ?? `Deck generation failed (${res.status}).`, res.status);
+  }
+  return {
+    id: data.id as string,
+    buyerId: data.buyerId as string,
+    title: (data.title as string) ?? "Solution Pitch Deck",
+    pptxUrl: (data.pptxUrl as string) ?? null,
+    status: data.status as "ready" | "failed",
+    source: "fallback",
+    createdAt: new Date().toISOString(),
+  };
 }
 
 // ---- buyer_workflow_runs (run-completion tracking) -------------------------
@@ -746,19 +826,28 @@ export async function getPendingApproval(opts: {
 
 // ---- conversations / messages -----------------------------------------------
 
+export interface CitedCapability {
+  capabilityId: string;
+  name: string;
+  category: string;
+  similarity: number;
+}
+
 export interface ConversationMessageRow {
   id: string;
   role: "user" | "assistant";
   content: string;
   responseStatus: "verified" | "modelled" | "escalated" | null;
+  evidence: CitedCapability[] | null;
   createdAt: string;
 }
 
 // Reads the buyer's most-recently-updated conversation and all its messages
 // — matches save-interaction-resolution's own "omit conversationId to reuse
 // the buyer's most recently updated conversation" default, so this is the
-// same thread the agent is appending to.
-export async function getLatestConversationMessages(buyerId: string): Promise<ConversationMessageRow[]> {
+// same thread the agent is appending to (and the same one
+// ask-grounded-question's own find-or-create logic reuses).
+export async function getLatestConversationMessages(buyerId: string): Promise<{ conversationId: string | null; messages: ConversationMessageRow[] }> {
   const convParams = new URLSearchParams({
     select: "id",
     buyer_id: `eq.${buyerId}`,
@@ -766,16 +855,75 @@ export async function getLatestConversationMessages(buyerId: string): Promise<Co
     limit: "1",
   });
   const conversations = await restGet<{ id: string }[]>(`conversations?${convParams}`);
-  const conversationId = conversations[0]?.id;
-  if (!conversationId) return [];
+  const conversationId = conversations[0]?.id ?? null;
+  if (!conversationId) return { conversationId: null, messages: [] };
 
   const msgParams = new URLSearchParams({
-    select: "id,role,content,response_status,created_at",
+    select: "id,role,content,response_status,evidence,created_at",
     conversation_id: `eq.${conversationId}`,
     order: "created_at.asc",
   });
   const rows = await restGet<
-    { id: string; role: "user" | "assistant"; content: string; response_status: "verified" | "modelled" | "escalated" | null; created_at: string }[]
+    {
+      id: string;
+      role: "user" | "assistant";
+      content: string;
+      response_status: "verified" | "modelled" | "escalated" | null;
+      evidence: CitedCapability[] | null;
+      created_at: string;
+    }[]
   >(`messages?${msgParams}`);
-  return rows.map((r) => ({ id: r.id, role: r.role, content: r.content, responseStatus: r.response_status, createdAt: r.created_at }));
+  return {
+    conversationId,
+    messages: rows.map((r) => ({
+      id: r.id,
+      role: r.role,
+      content: r.content,
+      responseStatus: r.response_status,
+      evidence: r.evidence,
+      createdAt: r.created_at,
+    })),
+  };
+}
+
+export class AskGroundedQuestionError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "AskGroundedQuestionError";
+    this.status = status;
+  }
+}
+
+export interface AskGroundedQuestionResult {
+  conversationId: string;
+  userMessage: ConversationMessageRow;
+  assistantMessage: ConversationMessageRow;
+  frontierItemId: string | null;
+  frontierItemCreated: boolean;
+}
+
+// Calls the real grounded-RAG chat backend (ask-grounded-question edge
+// function) — retrieves this buyer's vendor's own published capabilities +
+// evidence via pgvector, asks Gemini to answer using only that evidence,
+// and auto-escalates to capability_frontier when it can't. See that
+// function's own header comment for the full pipeline.
+export async function askGroundedQuestion(input: {
+  buyerId: string;
+  vendorId?: string | null;
+  question: string;
+  conversationId?: string | null;
+}): Promise<AskGroundedQuestionResult> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new AskGroundedQuestionError("Supabase is not configured.", 503);
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/ask-grounded-question`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+    body: JSON.stringify(input),
+  });
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) {
+    throw new AskGroundedQuestionError((data.error as string) ?? `ask-grounded-question failed (${res.status}).`, res.status);
+  }
+  return data as unknown as AskGroundedQuestionResult;
 }

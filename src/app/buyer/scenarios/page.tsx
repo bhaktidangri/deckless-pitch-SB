@@ -20,6 +20,7 @@ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn, formatNumber } from "@/lib/utils";
 import type { RoiProjection } from "@/lib/types";
 
@@ -84,9 +85,21 @@ export default function ScenariosPage() {
     }
   }
 
+  useRealtimeRefresh(
+    buyerId && vendorId
+      ? [
+          { table: "solution_models", filter: `buyer_id=eq.${buyerId}` },
+          { table: "client_reality_profiles", filter: `buyer_id=eq.${buyerId}` },
+          ...(solutionModelId ? [{ table: "roi_projections", filter: `solution_model_id=eq.${solutionModelId}` }] : []),
+        ]
+      : [],
+    refresh,
+    [buyerId, vendorId, solutionModelId]
+  );
+
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 8000);
+    const interval = setInterval(refresh, 45000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buyerId, vendorId]);

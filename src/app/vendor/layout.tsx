@@ -14,6 +14,7 @@ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
 import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
 import { useRequireAuth } from "@/lib/hooks/use-require-auth";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { UserCircle } from "lucide-react";
 
 const sections: NavSection[] = [
@@ -49,7 +50,14 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
   const [vendorName, setVendorName] = useState<string | null>(null);
   const [vendorId, setVendorId] = useState<string | null>(null);
   const [openFrontier, setOpenFrontier] = useState<number | undefined>(undefined);
+  const [realtimeBump, setRealtimeBump] = useState(0);
   const { ready } = useRequireAuth();
+
+  useRealtimeRefresh(
+    vendorId ? [{ table: "capability_frontier", filter: `vendor_id=eq.${vendorId}` }] : [],
+    () => setRealtimeBump((n) => n + 1),
+    [vendorId]
+  );
 
   useEffect(() => {
     const id = getStoredVendorId();
@@ -66,12 +74,12 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
       }
     }
     poll();
-    const interval = setInterval(poll, 15000);
+    const interval = setInterval(poll, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [realtimeBump]);
 
   const scopedSections = sections.map((section) => ({
     ...section,

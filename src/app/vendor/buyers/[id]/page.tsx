@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Building2, CalendarClock, FileSearch, TrendingUp, User } from "lucide-react";
+import { Building2, CalendarClock, FileSearch, TrendingUp, User } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -144,14 +144,11 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
 
   return (
     <div>
-      <Link href="/vendor/buyers" className="mb-4 inline-flex items-center gap-1.5 text-sm font-medium text-muted hover:text-foreground">
-        <ArrowLeft className="h-3.5 w-3.5" /> Back to buyers
-      </Link>
-
       <PageHeader
         eyebrow={buyer.industry ?? "Engagement"}
         title={buyer.companyName}
         description={`${buyer.industry ?? "Industry unknown"}${buyer.companySize ? ` · ${formatNumber(buyer.companySize)} users` : ""} · Engaged since ${new Date(buyer.createdAt).toLocaleDateString()}`}
+        backHref="/vendor/buyers"
         actions={
           <Link href="/vendor/meetings" className={cn(buttonVariants({ variant: "primary" }))}>
             <CalendarClock className="h-4 w-4" /> Prepare handoff

@@ -4,14 +4,22 @@
 // in the portal header (via PortalShell's headerSlot) so it's visible on
 // every buyer page, not just the one you happen to be on. Replaces the old
 // pattern of each page silently polling in isolation with no shared signal.
+import { useState } from "react";
 import Link from "next/link";
 import { motion, AnimatePresence } from "motion/react";
-import { Bot, CheckCircle2, PartyPopper, Sparkles } from "lucide-react";
+import { Bot, CheckCircle2, Gamepad2, PartyPopper, Sparkles } from "lucide-react";
+import { Drawer } from "@/components/ui/drawer";
+import { RunnerGame } from "@/components/shared/runner-game";
 import { cn } from "@/lib/utils";
 import { useAgentStatus } from "@/lib/hooks/use-agent-status";
+import { useElapsedSince, formatElapsed } from "@/lib/hooks/use-elapsed-since";
 
 export function AgentStatusPill({ buyerId }: { buyerId: string | null | undefined }) {
-  const { status, label, href } = useAgentStatus(buyerId);
+  const { status, label, href, startedAt } = useAgentStatus(buyerId);
+  const [gameOpen, setGameOpen] = useState(false);
+  // Ticks even while status isn't "working" — cheap, and avoids the hook
+  // being called conditionally across renders.
+  const elapsed = useElapsedSince(startedAt);
 
   if (status === "idle" && !buyerId) return null;
 
@@ -53,15 +61,52 @@ export function AgentStatusPill({ buyerId }: { buyerId: string | null | undefine
         )}
       </AnimatePresence>
       <span className="hidden sm:inline">{label}</span>
+      {/* Real elapsed time, not "since this component mounted" — stays
+          accurate whichever page you're on and however many times you've
+          navigated away from and back to it mid-run. */}
+      {status === "working" && startedAt && (
+        <span className="hidden tabular-nums opacity-70 md:inline">· {formatElapsed(elapsed)}</span>
+      )}
     </motion.div>
   );
 
-  if (href) {
-    return (
-      <Link href={href} aria-label={label}>
-        {content}
-      </Link>
-    );
-  }
-  return content;
+  const wrapped = href ? (
+    <Link href={href} aria-label={label}>
+      {content}
+    </Link>
+  ) : (
+    content
+  );
+
+  return (
+    <div className="flex items-center gap-1.5">
+      {wrapped}
+      {/* The agent keeps running server-side no matter what page you're on
+          — this just gives you something to do with the 2-3+ minutes,
+          reachable from anywhere instead of only the one screen that
+          triggered the run. */}
+      {status === "working" && (
+        <button
+          type="button"
+          onClick={() => setGameOpen(true)}
+          aria-label="Play while you wait"
+          title="Play while you wait"
+          className="flex h-7 w-7 items-center justify-center rounded-full border border-border bg-surface-2 text-muted transition-colors hover:text-foreground"
+        >
+          <Gamepad2 className="h-3.5 w-3.5" />
+        </button>
+      )}
+      <Drawer
+        open={gameOpen}
+        onClose={() => setGameOpen(false)}
+        title="Play while you wait"
+        description="Your agent is still working — it keeps running in the background no matter where you are in the app."
+        widthClassName="w-full max-w-lg"
+      >
+        <div className="p-5">
+          <RunnerGame compact />
+        </div>
+      </Drawer>
+    </div>
+  );
 }

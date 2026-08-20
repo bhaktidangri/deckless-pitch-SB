@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CalendarPlus, Download, ExternalLink, Send } from "lucide-react";
+import { CalendarPlus, CheckCheck, Download, ExternalLink, MousePointerClick, Send } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -24,9 +24,10 @@ const durationOptions = [15, 30, 45, 60, 90];
 
 // Schedules a meeting straight to "scheduled" (no waiting on a buyer request
 // first), logs it in meeting_requests for both portals' dashboards, and —
-// since there's no transactional email provider wired into this app — hands
-// the actual "send" off to the vendor's own email client via mailto: plus a
-// downloadable .ics so the buyer can add it to their calendar either way.
+// when SENDGRID_API_KEY is configured server-side — sends the buyer a real
+// invite email with a .ics attachment. Always also downloads the .ics
+// locally and offers a mailto: fallback, so the buyer still gets something
+// to add to their calendar even before real delivery is configured.
 export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyerEmail, vendorCompanyName, vendorEmail }: ScheduleMeetingCardProps) {
   const [title, setTitle] = useState(`${vendorCompanyName} <> ${buyerCompanyName} discussion`);
   // Default to "tomorrow, on the hour" — computed in an effect (not during
@@ -93,11 +94,17 @@ export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyer
           meetingLink: result.meetingLink,
           durationMinutes: result.durationMinutes,
           createdAt: result.proposedDate,
+          inviteEmailStatus: result.inviteEmailStatus,
+          inviteOpenedAt: null,
+          inviteClickedAt: null,
         },
         ...prev,
       ]);
       setScheduled(true);
 
+      // Always download locally too — a real send doesn't guarantee the
+      // buyer's client renders the .ics attachment the way they'd expect,
+      // and this costs nothing extra.
       downloadIcs(
         {
           uid: `${result.meetingRequestId}@deckless-pitch`,
@@ -112,7 +119,10 @@ export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyer
         `${title.trim().replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "meeting"}.ics`
       );
 
-      if (result.buyerEmail) {
+      // Only fall back to mailto: when a real invite email wasn't actually
+      // sent (no provider configured yet, or the send failed) — otherwise
+      // the buyer would get the meeting twice.
+      if (result.buyerEmail && result.inviteEmailStatus !== "sent") {
         const when = new Date(proposedDate).toLocaleString();
         const bodyLines = [
           `Hi ${buyerCompanyName} team,`,
@@ -184,7 +194,11 @@ export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyer
             <Button type="submit" loading={scheduling} disabled={scheduling}>
               <Send className="h-4 w-4" /> Schedule &amp; send
             </Button>
-            {scheduled && <span className="text-sm text-verified">Scheduled — invite downloaded.</span>}
+            {scheduled && (
+              <span className="text-sm text-verified">
+                Scheduled — invite downloaded{history[0]?.inviteEmailStatus === "sent" ? " and emailed." : "."}
+              </span>
+            )}
           </div>
         </form>
 
@@ -204,6 +218,21 @@ export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyer
                     <p className="mt-1 text-xs text-muted">
                       {new Date(m.proposedDate).toLocaleString()} · {m.durationMinutes} min · {formatRelativeTime(m.createdAt)}
                     </p>
+                  )}
+                  {(m.inviteEmailStatus === "sent" || m.inviteOpenedAt || m.inviteClickedAt) && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      {m.inviteEmailStatus === "sent" && (
+                        <Badge variant="verified" size="sm" className="gap-1">
+                          <CheckCheck className="h-3 w-3" /> Invite sent
+                        </Badge>
+                      )}
+                      {m.inviteOpenedAt && <Badge variant="brand" size="sm">Opened</Badge>}
+                      {m.inviteClickedAt && (
+                        <Badge variant="modelled" size="sm" className="gap-1">
+                          <MousePointerClick className="h-3 w-3" /> Clicked
+                        </Badge>
+                      )}
+                    </div>
                   )}
                   <div className="mt-2 flex flex-wrap items-center gap-3">
                     {m.meetingLink && (

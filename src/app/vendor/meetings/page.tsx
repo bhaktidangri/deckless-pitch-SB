@@ -12,6 +12,7 @@ import { getBuyer } from "@/lib/api/buyer-lookup";
 import { getVendorById } from "@/lib/api/vendor-lookup";
 import { confirmVendorDiscussionMeeting, getMeetingRequestsForVendor, type VendorMeetingRequestRow } from "@/lib/api/vendor-frontier";
 import { getStoredVendorId } from "@/lib/vendor-session";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { downloadIcs } from "@/lib/ics";
 import { cn } from "@/lib/utils";
 
@@ -60,9 +61,15 @@ export default function MeetingsPage() {
     }
   }
 
+  useRealtimeRefresh(
+    vendorId ? [{ table: "meeting_requests", filter: `vendor_id=eq.${vendorId}` }] : [],
+    refresh,
+    [vendorId]
+  );
+
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 8000);
+    const interval = setInterval(refresh, 45000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendorId]);

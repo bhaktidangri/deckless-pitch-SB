@@ -1,8 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { CalendarClock, Download, FileText, Loader2, MessageSquareText, Sparkles, SlidersHorizontal } from "lucide-react";
+import {
+  CalendarClock,
+  Download,
+  ExternalLink,
+  FileText,
+  Loader2,
+  MessageSquareText,
+  RefreshCw,
+  Sparkles,
+  SlidersHorizontal,
+} from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -12,10 +22,12 @@ import { MatchRow } from "@/components/shared/match-row";
 import { RoiWidget } from "@/components/shared/roi-widget";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import {
+  generateFallbackSolutionDeck,
   getBuyerSolutionDecks,
   getFitAndGapAssessment,
   getRoiProjection,
   getSolutionModel,
+  FallbackDeckError,
   type BuyerSolutionDeckRow,
   type GapItemRow,
   type RoiProjectionRow,
@@ -24,6 +36,8 @@ import {
 } from "@/lib/api/buyer-lookup";
 import { setStoredSolutionModelId } from "@/lib/buyer-session";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+import { useAgentStatus } from "@/lib/hooks/use-agent-status";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import type { GapItem, RoiProjection, SolutionMatch } from "@/lib/types";
 
@@ -62,6 +76,7 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
 
 export default function SolutionWorkspacePage() {
   const { buyerId, vendorId, vendorName } = useBuyerSession();
+  const { startedAt: agentStartedAt } = useAgentStatus(buyerId);
 
   const [matches, setMatches] = useState<SolutionMatchRow[]>([]);
   const [gaps, setGaps] = useState<GapItemRow[]>([]);
@@ -70,6 +85,25 @@ export default function SolutionWorkspacePage() {
   const [deck, setDeck] = useState<BuyerSolutionDeckRow | null>(null);
   const [deckHistory, setDeckHistory] = useState<BuyerSolutionDeckRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [generatingDeck, setGeneratingDeck] = useState(false);
+  const [deckError, setDeckError] = useState<string | null>(null);
+  const autoFallbackTriedRef = useRef(false);
+  // Bumped by realtime events to re-trigger the load effect below the
+  // instant something actually changes, instead of waiting up to 8s.
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  useRealtimeRefresh(
+    buyerId && vendorId
+      ? [
+          { table: "solution_matches", filter: `buyer_id=eq.${buyerId}` },
+          { table: "gap_items", filter: `buyer_id=eq.${buyerId}` },
+          { table: "solution_models", filter: `buyer_id=eq.${buyerId}` },
+          { table: "buyer_solution_decks", filter: `buyer_id=eq.${buyerId}` },
+        ]
+      : [],
+    () => setRealtimeBump((n) => n + 1),
+    [buyerId, vendorId]
+  );
 
   useEffect(() => {
     if (!buyerId || !vendorId) {
@@ -100,12 +134,47 @@ export default function SolutionWorkspacePage() {
       }
     }
     load();
-    const interval = setInterval(load, 8000);
+    // Realtime (above) is the primary signal now — this is just a safety
+    // net for a dropped socket, so it can be far less aggressive than the
+    // old 8s blind poll.
+    const interval = setInterval(load, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [buyerId, vendorId]);
+  }, [buyerId, vendorId, realtimeBump]);
+
+  // Backup path: the Yoxa agent's own "Generate Solution Pitch Deck" Output
+  // Tool doesn't reliably reach the buyer (every agent-sourced deck row
+  // observed so far ends up status=failed) — so once this workspace has
+  // enough real Supabase data to build a deck from and no ready deck has
+  // shown up, generate one locally instead of leaving the buyer staring at
+  // "Generating…" forever. Fires once per page visit.
+  useEffect(() => {
+    if (loading || generatingDeck || autoFallbackTriedRef.current) return;
+    if (!buyerId || !vendorId) return;
+    if (deck?.status === "ready") return;
+    const hasEnoughData = matches.length > 0 || gaps.length > 0 || Boolean(model?.executiveSummary);
+    if (!hasEnoughData) return;
+    autoFallbackTriedRef.current = true;
+    void runFallbackGeneration();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, deck, matches, gaps, model, buyerId, vendorId]);
+
+  async function runFallbackGeneration() {
+    if (!buyerId) return;
+    setGeneratingDeck(true);
+    setDeckError(null);
+    try {
+      const created = await generateFallbackSolutionDeck(buyerId, vendorId);
+      setDeck(created);
+      setDeckHistory((prev) => [created, ...prev]);
+    } catch (err) {
+      setDeckError(err instanceof FallbackDeckError ? err.message : "Could not build a backup deck right now.");
+    } finally {
+      setGeneratingDeck(false);
+    }
+  }
 
   if (!buyerId || !vendorId) {
     return (
@@ -173,6 +242,7 @@ export default function SolutionWorkspacePage() {
         ) : (
           <AgentWaitingState
             variant="card"
+            startedAt={agentStartedAt}
             title="Building your executive summary"
             description="The Solution Model Agent hasn't produced it yet — this fills in automatically once it does."
           />
@@ -183,23 +253,51 @@ export default function SolutionWorkspacePage() {
             <div className="flex items-center gap-3">
               <FileText className="h-5 w-5 shrink-0 text-brand-600 dark:text-brand-400" />
               <div>
-                <p className="text-sm font-semibold text-foreground">
-                  {deck?.status === "ready" ? "Your Solution Pitch Deck is ready" : deck?.status === "failed" ? "Deck generation failed" : "Your presentation-ready pitch deck"}
-                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-semibold text-foreground">
+                    {deck?.status === "ready" ? "Your Solution Pitch Deck is ready" : generatingDeck ? "Building your backup deck…" : "Your presentation-ready pitch deck"}
+                  </p>
+                  {deck?.status === "ready" && (
+                    <Badge variant={deck.source === "agent" ? "verified" : "modelled"} size="sm">
+                      {deck.source === "agent" ? "from your AI agent" : "auto-generated backup"}
+                    </Badge>
+                  )}
+                </div>
                 <p className="text-xs text-muted">
                   {deck?.title ?? "A polished .pptx — not this page — is the deliverable handed to you."}
                 </p>
+                {deckError && <p className="mt-1 text-xs text-escalated">{deckError}</p>}
               </div>
             </div>
-            {deck?.pptxUrl ? (
-              <a href={deck.pptxUrl} target="_blank" rel="noreferrer" className={cn(buttonVariants({ size: "sm" }))}>
-                <Download className="h-3.5 w-3.5" /> Download .pptx
-              </a>
-            ) : (
-              <span className="flex items-center gap-1.5 text-xs text-subtle">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
-              </span>
-            )}
+            <div className="flex shrink-0 items-center gap-2">
+              {deck?.pptxUrl ? (
+                <>
+                  <a
+                    href={`https://view.officeapps.live.com/op/view.aspx?src=${encodeURIComponent(deck.pptxUrl)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className={cn(buttonVariants({ variant: "secondary", size: "sm" }))}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" /> Open
+                  </a>
+                  <a href={deck.pptxUrl} target="_blank" rel="noreferrer" download className={cn(buttonVariants({ size: "sm" }))}>
+                    <Download className="h-3.5 w-3.5" /> Download .pptx
+                  </a>
+                </>
+              ) : generatingDeck ? (
+                <span className="flex items-center gap-1.5 text-xs text-subtle">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void runFallbackGeneration()}
+                  className={cn(buttonVariants({ variant: "secondary", size: "sm" }))}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" /> Generate deck now
+                </button>
+              )}
+            </div>
           </CardContent>
         </Card>
 
@@ -215,6 +313,9 @@ export default function SolutionWorkspacePage() {
                     <FileText className="h-3.5 w-3.5 shrink-0 text-subtle" />
                     <span className="truncate text-sm text-foreground">{d.title ?? "Solution Pitch Deck"}</span>
                     {d.status === "failed" && <Badge variant="escalated" size="sm">failed</Badge>}
+                    {d.status === "ready" && d.source === "fallback" && (
+                      <Badge variant="modelled" size="sm">backup</Badge>
+                    )}
                   </div>
                   <div className="flex shrink-0 items-center gap-3">
                     <span className="text-xs text-subtle">{formatRelativeTime(d.createdAt)}</span>
@@ -259,6 +360,7 @@ export default function SolutionWorkspacePage() {
         {matches.length === 0 && gaps.length === 0 && (
           <AgentWaitingState
             variant="card"
+            startedAt={agentStartedAt}
             title="Assessing fit and gaps"
             description={`Comparing your requirements against ${vendorName ?? "your vendor"}'s published capabilities.`}
           />

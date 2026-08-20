@@ -9,6 +9,7 @@ import { RequirementCard } from "@/components/shared/requirement-card";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
 import type { Requirement } from "@/lib/types";
 
@@ -20,6 +21,18 @@ export default function RequirementsPage() {
   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
   const [profile, setProfile] = useState<ClientRealityProfileRow | null>(null);
   const [loading, setLoading] = useState(true);
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  useRealtimeRefresh(
+    buyerId
+      ? [
+          { table: "buyer_requirements", filter: `buyer_id=eq.${buyerId}` },
+          { table: "client_reality_profiles", filter: `buyer_id=eq.${buyerId}` },
+        ]
+      : [],
+    () => setRealtimeBump((n) => n + 1),
+    [buyerId]
+  );
 
   useEffect(() => {
     if (!buyerId) {
@@ -39,12 +52,12 @@ export default function RequirementsPage() {
       }
     }
     load();
-    const interval = setInterval(load, 8000);
+    const interval = setInterval(load, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [buyerId]);
+  }, [buyerId, realtimeBump]);
 
   if (!buyerId) {
     return (

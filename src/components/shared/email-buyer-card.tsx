@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Clock, Mail, Send } from "lucide-react";
+import { CheckCheck, Clock, Mail, MousePointerClick, Send } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Input, Label, Textarea } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { recordVendorOutreach } from "@/lib/api/account";
@@ -19,18 +20,18 @@ interface EmailBuyerCardProps {
 
 // Logs the outreach through record-vendor-outreach (real backend tracking —
 // feeds the vendor dashboard's outreach stat and this buyer's history below)
-// then, if the buyer's login email is on file, opens the vendor's own email
-// client via mailto: to actually send it. There's no transactional email
-// provider wired into this app, so "send" here means "hand off to your own
-// inbox" rather than a backend relay — the logging is what's real and
-// durable, not a simulated delivery receipt.
+// which — when SENDGRID_API_KEY is configured server-side — also actually
+// sends it via SendGrid. emailStatus on the response says whether that really
+// happened: "sent" means it's genuinely on its way (no mailto: needed),
+// "not_sent"/"failed" fall back to opening the vendor's own email client so
+// the message still gets out one way or another.
 export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail, vendorCompanyName }: EmailBuyerCardProps) {
   const [subject, setSubject] = useState(`${vendorCompanyName} <> ${buyerCompanyName}`);
   const [message, setMessage] = useState(
     `Hi ${buyerCompanyName} team,\n\nWe noticed you're exploring solutions like ours and wanted to reach out directly. Happy to walk through fit whenever works for you.\n\n— ${vendorCompanyName}`
   );
   const [sending, setSending] = useState(false);
-  const [sent, setSent] = useState(false);
+  const [sentState, setSentState] = useState<"sent" | "mailto" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<VendorOutreachEventRow[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
@@ -54,18 +55,38 @@ export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail
     e.preventDefault();
     setSending(true);
     setError(null);
-    setSent(false);
+    setSentState(null);
     try {
       const trimmedSubject = subject.trim();
       const trimmedMessage = message.trim();
       const result = await recordVendorOutreach({ buyerId, subject: trimmedSubject, message: trimmedMessage });
       setHistory((prev) => [
-        { id: result.id, buyerId, channel: "email", subject: trimmedSubject, message: trimmedMessage, createdAt: result.createdAt },
+        {
+          id: result.id,
+          buyerId,
+          channel: "email",
+          subject: trimmedSubject,
+          message: trimmedMessage,
+          createdAt: result.createdAt,
+          emailStatus: result.emailStatus,
+          emailError: result.emailError,
+          openedAt: null,
+          openCount: 0,
+          clickedAt: null,
+          clickCount: 0,
+        },
         ...prev,
       ]);
-      setSent(true);
-      if (result.buyerEmail) {
+      if (result.emailStatus === "sent") {
+        setSentState("sent");
+      } else if (result.buyerEmail) {
+        // Not really sent yet (no provider configured, or the send failed) —
+        // fall back to the vendor's own email client so the message still
+        // goes out.
+        setSentState("mailto");
         window.location.href = `mailto:${result.buyerEmail}?subject=${encodeURIComponent(trimmedSubject)}&body=${encodeURIComponent(trimmedMessage)}`;
+      } else {
+        setSentState("sent");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not log this outreach.");
@@ -82,7 +103,7 @@ export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail
         </CardTitle>
         <CardDescription>
           {buyerEmail
-            ? `Opens your email client addressed to ${buyerEmail} — also logged below for tracking.`
+            ? `Sends a real email to ${buyerEmail} and tracks opens/clicks below — falls back to your own email client if delivery isn't configured yet.`
             : "This buyer hasn't linked a login email yet, so this only logs your outreach for now."}
         </CardDescription>
       </CardHeader>
@@ -101,9 +122,10 @@ export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail
 
           <div className="flex items-center gap-3">
             <Button type="submit" loading={sending} disabled={sending}>
-              <Send className="h-4 w-4" /> {buyerEmail ? "Open email" : "Log outreach"}
+              <Send className="h-4 w-4" /> {buyerEmail ? "Send email" : "Log outreach"}
             </Button>
-            {sent && <span className="text-sm text-verified">Logged.</span>}
+            {sentState === "sent" && <span className="text-sm text-verified">Sent.</span>}
+            {sentState === "mailto" && <span className="text-sm text-modelled">Logged — opened in your email client.</span>}
           </div>
         </form>
 
@@ -114,9 +136,27 @@ export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail
               {history.slice(0, 5).map((h) => (
                 <div key={h.id} className="flex items-start gap-2 text-sm">
                   <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-subtle" />
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <p className="truncate text-foreground">{h.subject ?? "(no subject)"}</p>
-                    <p className="text-xs text-subtle">{formatRelativeTime(h.createdAt)}</p>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <p className="text-xs text-subtle">{formatRelativeTime(h.createdAt)}</p>
+                      {h.emailStatus === "sent" && (
+                        <Badge variant="verified" size="sm" className="gap-1">
+                          <CheckCheck className="h-3 w-3" /> Sent
+                        </Badge>
+                      )}
+                      {h.emailStatus === "failed" && (
+                        <Badge variant="escalated" size="sm">Failed to send</Badge>
+                      )}
+                      {h.openCount > 0 && (
+                        <Badge variant="brand" size="sm">Opened{h.openCount > 1 ? ` ×${h.openCount}` : ""}</Badge>
+                      )}
+                      {h.clickCount > 0 && (
+                        <Badge variant="modelled" size="sm" className="gap-1">
+                          <MousePointerClick className="h-3 w-3" /> Clicked
+                        </Badge>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}

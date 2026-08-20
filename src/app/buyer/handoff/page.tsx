@@ -15,6 +15,7 @@ import { getCapabilityFrontierItems, getMeetingRequests, getBuyer, type Capabili
 import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { downloadIcs } from "@/lib/ics";
 import { cn } from "@/lib/utils";
 import type { CapabilityFrontierItem } from "@/lib/types";
@@ -71,9 +72,20 @@ export default function HandoffPage() {
     }
   }
 
+  useRealtimeRefresh(
+    buyerId
+      ? [
+          { table: "capability_frontier", filter: `buyer_id=eq.${buyerId}` },
+          { table: "meeting_requests", filter: `buyer_id=eq.${buyerId}` },
+        ]
+      : [],
+    refresh,
+    [buyerId]
+  );
+
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 6000);
+    const interval = setInterval(refresh, 45000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buyerId]);

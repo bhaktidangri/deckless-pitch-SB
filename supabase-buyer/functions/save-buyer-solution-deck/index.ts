@@ -107,9 +107,12 @@ Deno.serve(async (req) => {
       title: (body.title as string | undefined) ?? "Solution Pitch Deck",
       pptx_url: pptxUrl,
       status: pptxUrl ? "ready" : "failed",
+      // "agent" (Yoxa webhook) unless the caller is the local fallback
+      // generator, which always sends source: "fallback" explicitly.
+      source: (body.source as string | undefined) === "fallback" ? "fallback" : "agent",
       raw_payload: body.rawPayload ?? body,
     })
-    .select("id, buyer_id, pptx_url, status")
+    .select("id, buyer_id, pptx_url, status, source")
     .single();
 
   if (error) {
@@ -119,7 +122,7 @@ Deno.serve(async (req) => {
     });
   }
 
-  return new Response(JSON.stringify({ id: data.id, buyerId: data.buyer_id, pptxUrl: data.pptx_url, status: data.status }), {
+  return new Response(JSON.stringify({ id: data.id, buyerId: data.buyer_id, pptxUrl: data.pptx_url, status: data.status, source: data.source }), {
     status: 200,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });

@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getPendingApproval, type BuyerApprovalNodeKey, type BuyerApprovalRequestRow } from "@/lib/api/buyer-lookup";
 import { respondToApproval } from "@/lib/api/buyer-approvals";
 import { POLL_INTERVAL_MS } from "@/lib/buyer-poll";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 
 export function usePendingApproval(
   nodeKey: BuyerApprovalNodeKey,
@@ -44,6 +45,12 @@ export function usePendingApproval(
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
   }, [refresh]);
+
+  useRealtimeRefresh(
+    enabled && buyerId ? [{ table: "buyer_workflow_approval_requests", filter: `buyer_id=eq.${buyerId}` }] : [],
+    refresh,
+    [enabled, buyerId]
+  );
 
   const respond = useCallback(
     async (answer: { optionId?: string; text?: string; numericValue?: Record<string, number> }) => {

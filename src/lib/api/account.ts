@@ -6,6 +6,7 @@
 // anon key, because they're deployed with verify_jwt:true and need a real
 // user identity to resolve/link/edit against.
 import { getSupabaseClient } from "@/lib/supabase-client";
+import type { EmailDeliveryStatus } from "@/lib/api/vendor-lookup";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 
@@ -112,12 +113,18 @@ export interface RecordedVendorOutreach {
   buyerEmail: string | null;
   buyerContactName: string | null;
   vendorCompanyName: string;
+  emailStatus: EmailDeliveryStatus;
+  emailProviderId: string | null;
+  emailError: string | null;
 }
 
-// Logs the outreach for the vendor's own tracking dashboard and returns the
-// buyer's contact email so the caller can open a mailto: link — this app has
-// no transactional email provider wired up, so actual sending happens
-// through the vendor's own email client, not a backend relay.
+// Logs the outreach for the vendor's own tracking dashboard and, when
+// SENDGRID_API_KEY is configured server-side, actually sends it via SendGrid —
+// emailStatus tells the caller whether that really happened ("sent"),
+// wasn't attempted yet ("not_sent" — no provider configured), failed, or
+// was skipped because this buyer has no email on file. buyerEmail is still
+// returned either way so a mailto: fallback stays available when it wasn't
+// really sent.
 export function recordVendorOutreach(input: RecordVendorOutreachInput): Promise<RecordedVendorOutreach> {
   return callAuthedFunction<RecordedVendorOutreach>("record-vendor-outreach", input);
 }
@@ -144,12 +151,17 @@ export interface ScheduledMeeting {
   buyerContactName: string | null;
   buyerCompanyName: string;
   vendorCompanyName: string;
+  inviteEmailStatus: EmailDeliveryStatus;
+  inviteEmailError: string | null;
 }
 
 // Directly schedules (or reschedules, when meetingRequestId is passed) a
 // meeting with a buyer — status goes straight to "scheduled" instead of
-// waiting on a buyer-initiated "requested" row. Returns everything needed to
-// build a calendar invite (.ics) and a mailto: link client-side.
+// waiting on a buyer-initiated "requested" row. When SENDGRID_API_KEY is
+// configured server-side, also sends the buyer a real invite email with a
+// .ics attachment (inviteEmailStatus: "sent"); either way still returns
+// everything needed to build a calendar invite and a mailto: link
+// client-side as a fallback.
 export function scheduleMeetingDirect(input: ScheduleMeetingInput): Promise<ScheduledMeeting> {
   return callAuthedFunction<ScheduledMeeting>("schedule-meeting-direct", input);
 }

@@ -17,6 +17,7 @@ import { Gamepad2, Sparkles } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { RunnerGame } from "@/components/shared/runner-game";
+import { useElapsedSince, formatElapsed } from "@/lib/hooks/use-elapsed-since";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_MESSAGES = [
@@ -30,30 +31,13 @@ const DEFAULT_MESSAGES = [
 // that's about to resolve on its own anyway.
 const GAME_OFFER_THRESHOLD_MS = 7000;
 
-function useElapsedMs() {
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const start = Date.now();
-    const id = setInterval(() => setElapsed(Date.now() - start), 1000);
-    return () => clearInterval(id);
-  }, []);
-  return elapsed;
-}
-
-function formatElapsed(ms: number) {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  return `${m}m ${rem}s`;
-}
-
 export function AgentWaitingState({
   title,
   description,
   messages = DEFAULT_MESSAGES,
   variant = "card",
   className,
+  startedAt,
 }: {
   title: string;
   description?: React.ReactNode;
@@ -62,8 +46,15 @@ export function AgentWaitingState({
   /** "fullpage" for a page that has nothing else to show yet; "card" to sit inline among other content. */
   variant?: "fullpage" | "card";
   className?: string;
+  /**
+   * ISO timestamp the underlying work actually started, if known (e.g. a
+   * buyer_workflow_runs.started_at) — makes the elapsed readout survive
+   * navigating away and back instead of restarting from 0s every remount.
+   * Omit to just count from first render, as before.
+   */
+  startedAt?: string | null;
 }) {
-  const elapsed = useElapsedMs();
+  const elapsed = useElapsedSince(startedAt);
   const [messageIndex, setMessageIndex] = useState(0);
   const [gameOpen, setGameOpen] = useState(false);
 

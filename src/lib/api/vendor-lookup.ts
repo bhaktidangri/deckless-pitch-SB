@@ -386,6 +386,8 @@ export async function getRealityProfileForBuyer(buyerId: string): Promise<Vendor
 // edge function, read here the same public-anon-key way as every other
 // vendor-scoped table in this file.
 
+export type EmailDeliveryStatus = "not_sent" | "sent" | "failed" | "skipped_no_email";
+
 export interface VendorOutreachEventRow {
   id: string;
   buyerId: string;
@@ -393,18 +395,50 @@ export interface VendorOutreachEventRow {
   subject: string | null;
   message: string | null;
   createdAt: string;
+  emailStatus: EmailDeliveryStatus;
+  emailError: string | null;
+  openedAt: string | null;
+  openCount: number;
+  clickedAt: string | null;
+  clickCount: number;
 }
 
 export async function getVendorOutreachEvents(vendorId: string): Promise<VendorOutreachEventRow[]> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,channel,subject,message,created_at",
+    select: "id,buyer_id,channel,subject,message,created_at,email_status,email_error,opened_at,open_count,clicked_at,click_count",
     vendor_id: `eq.${vendorId}`,
     order: "created_at.desc",
   });
   const rows = await restGet<
-    { id: string; buyer_id: string; channel: string; subject: string | null; message: string | null; created_at: string }[]
+    {
+      id: string;
+      buyer_id: string;
+      channel: string;
+      subject: string | null;
+      message: string | null;
+      created_at: string;
+      email_status: EmailDeliveryStatus | null;
+      email_error: string | null;
+      opened_at: string | null;
+      open_count: number | null;
+      clicked_at: string | null;
+      click_count: number | null;
+    }[]
   >(`vendor_outreach_events?${params}`);
-  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, channel: r.channel, subject: r.subject, message: r.message, createdAt: r.created_at }));
+  return rows.map((r) => ({
+    id: r.id,
+    buyerId: r.buyer_id,
+    channel: r.channel,
+    subject: r.subject,
+    message: r.message,
+    createdAt: r.created_at,
+    emailStatus: r.email_status ?? "not_sent",
+    emailError: r.email_error,
+    openedAt: r.opened_at,
+    openCount: r.open_count ?? 0,
+    clickedAt: r.clicked_at,
+    clickCount: r.click_count ?? 0,
+  }));
 }
 
 export async function getFrontierCountForVendor(vendorId: string): Promise<number> {

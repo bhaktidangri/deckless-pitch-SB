@@ -25,6 +25,7 @@ import { getBuyerRequirements, getClientRealityProfile, linkBuyerWorkflowRun, ty
 import { linkBuyerAccount } from "@/lib/api/account";
 import { POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { cn } from "@/lib/utils";
 
 const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
@@ -54,10 +55,45 @@ export default function DiscoverPage() {
   const [timelineMonths, setTimelineMonths] = useState("");
   const [compliance, setCompliance] = useState("");
 
-  const [stage, setStage] = useState<Stage>(existingBuyerId ? "ready" : "idle");
+  // A submission that was still waiting on its buyerId when the buyer left
+  // this page (navigated elsewhere, or closed the tab) — before this, stage
+  // only ever became "processing" from handleSubmit's own call site, so
+  // returning here mid-wait silently dropped back to the blank form with no
+  // sign anything was ever submitted, even though the agent kept running
+  // the whole time server-side. setPendingBuyerSubmission (buyer-session.ts)
+  // was already being written for exactly this purpose; nothing ever read
+  // it back on mount. existingBuyerId being set already means this
+  // submission finished (or this is a returning buyer) — nothing to resume.
+  const resumablePending = existingBuyerId ? null : getPendingBuyerSubmission();
+
+  const [stage, setStage] = useState<Stage>(() => {
+    if (existingBuyerId) return "ready";
+    if (!resumablePending) return "idle";
+    return Date.now() >= resumablePending.deadline ? "timed-out" : "processing";
+  });
   const [buyerId, setBuyerId] = useState<string | null>(existingBuyerId);
   const [error, setError] = useState<string | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
+  const [runId, setRunId] = useState<string | null>(() => (resumablePending ? (getStoredBuyerWorkflowRunIds()[0] ?? null) : null));
+
+  useEffect(() => {
+    if (!resumablePending || Date.now() >= resumablePending.deadline) return;
+    pollHandleRef.current = pollForNewBuyerId(
+      resumablePending.companyName,
+      resumablePending.afterIso,
+      resumablePending.deadline,
+      (id) => {
+        setStoredBuyerId(id);
+        setBuyerId(id);
+        clearPendingBuyerSubmission();
+        setStage("ready");
+        const [mostRecentRunId] = getStoredBuyerWorkflowRunIds();
+        if (mostRecentRunId) linkBuyerWorkflowRun(mostRecentRunId, id);
+        linkBuyerAccount(id).catch(() => {});
+      },
+      () => setStage("timed-out")
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
   const [profile, setProfile] = useState<ClientRealityProfileRow | null>(null);
@@ -69,6 +105,18 @@ export default function DiscoverPage() {
     workflowRunIds: getStoredBuyerWorkflowRunIds(),
     enabled: stage === "ready",
   });
+
+  const [realtimeBump, setRealtimeBump] = useState(0);
+  useRealtimeRefresh(
+    stage === "ready" && buyerId
+      ? [
+          { table: "buyer_requirements", filter: `buyer_id=eq.${buyerId}` },
+          { table: "client_reality_profiles", filter: `buyer_id=eq.${buyerId}` },
+        ]
+      : [],
+    () => setRealtimeBump((n) => n + 1),
+    [stage, buyerId]
+  );
 
   useEffect(() => {
     if (stage !== "ready" || !buyerId) return;
@@ -85,12 +133,13 @@ export default function DiscoverPage() {
       }
     }
     load();
-    const interval = setInterval(load, 5000);
+    // Realtime (above) is primary now — this is just a dropped-socket safety net.
+    const interval = setInterval(load, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [stage, buyerId]);
+  }, [stage, buyerId, realtimeBump]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -196,6 +245,7 @@ export default function DiscoverPage() {
         />
         <AgentWaitingState
           variant="fullpage"
+          startedAt={resumablePending?.afterIso ?? null}
           title={stage === "timed-out" ? "Still processing after a few minutes" : "Setting up your workspace"}
           description={
             stage === "timed-out" ? (
@@ -208,7 +258,7 @@ export default function DiscoverPage() {
                 .
               </>
             ) : (
-              "This usually takes a minute or two while the agent parses your submission."
+              "This usually takes a minute or two while the agent parses your submission — feel free to look around the rest of the portal, it keeps running in the background and this page will pick up right where it left off when you come back."
             )
           }
           messages={[

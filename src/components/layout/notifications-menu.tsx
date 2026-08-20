@@ -5,6 +5,7 @@ import { Bell, CircleAlert, MessageSquare, RefreshCw, Sparkles } from "lucide-re
 import { motion, AnimatePresence } from "motion/react";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { getBuyerNotifications, getVendorNotifications, getAdminNotifications, type NotificationItem } from "@/lib/api/notifications";
+import { useRealtimeRefresh, type RealtimeWatch } from "@/lib/hooks/use-realtime-refresh";
 
 const toneClass: Record<string, string> = {
   escalated: "bg-escalated-bg text-escalated",
@@ -32,7 +33,27 @@ export function NotificationsMenu({
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<NotificationItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [realtimeBump, setRealtimeBump] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
+
+  const watches: RealtimeWatch[] =
+    role === "buyer" && buyerId
+      ? [
+          { table: "capability_frontier", filter: `buyer_id=eq.${buyerId}` },
+          { table: "meeting_requests", filter: `buyer_id=eq.${buyerId}` },
+          { table: "buyer_workflow_runs", filter: `buyer_id=eq.${buyerId}` },
+        ]
+      : role === "vendor" && vendorId
+        ? [
+            { table: "capability_frontier", filter: `vendor_id=eq.${vendorId}` },
+            { table: "meeting_requests", filter: `vendor_id=eq.${vendorId}` },
+            { table: "vendor_recommendations", filter: `vendor_id=eq.${vendorId}` },
+          ]
+        : role === "admin"
+          ? [{ table: "audit_events" }, { table: "organizations" }]
+          : [];
+
+  useRealtimeRefresh(watches, () => setRealtimeBump((n) => n + 1), [role, buyerId, vendorId]);
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -58,12 +79,12 @@ export function NotificationsMenu({
       }
     }
     load();
-    const interval = setInterval(load, 20000);
+    const interval = setInterval(load, 60000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [role, buyerId, vendorId]);
+  }, [role, buyerId, vendorId, realtimeBump]);
 
   return (
     <div className="relative" ref={ref}>

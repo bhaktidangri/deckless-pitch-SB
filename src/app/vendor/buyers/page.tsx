@@ -18,6 +18,7 @@ import {
 } from "@/lib/api/vendor-lookup";
 import { getFrontierItemsForVendor } from "@/lib/api/vendor-frontier";
 import { getStoredVendorId } from "@/lib/vendor-session";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { formatRelativeTime } from "@/lib/utils";
 
 interface BuyerEngagement {
@@ -33,6 +34,20 @@ export default function VendorBuyersPage() {
   const [engagements, setEngagements] = useState<BuyerEngagement[]>([]);
   const [loading, setLoading] = useState(true);
   const [vendorId, setVendorId] = useState<string | null>(null);
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  useRealtimeRefresh(
+    vendorId
+      ? [
+          { table: "vendor_recommendations", filter: `vendor_id=eq.${vendorId}` },
+          { table: "buyer_vendor_selections", filter: `vendor_id=eq.${vendorId}` },
+          { table: "capability_frontier", filter: `vendor_id=eq.${vendorId}` },
+          { table: "vendor_outreach_events", filter: `vendor_id=eq.${vendorId}` },
+        ]
+      : [],
+    () => setRealtimeBump((n) => n + 1),
+    [vendorId]
+  );
 
   useEffect(() => {
     const id = getStoredVendorId();
@@ -69,12 +84,12 @@ export default function VendorBuyersPage() {
       }
     }
     load();
-    const interval = setInterval(load, 15000);
+    const interval = setInterval(load, 45000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [realtimeBump]);
 
   const filtered = engagements.filter((e) => e.buyer.companyName.toLowerCase().includes(query.toLowerCase()));
 

@@ -3,12 +3,11 @@
 import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { LiveChatPanel } from "@/components/shared/live-chat-panel";
-import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
+import { GroundedChatPanel } from "@/components/shared/grounded-chat-panel";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 
 export default function BuyerChatPage() {
-  const { buyerId, vendorName, companyName } = useBuyerSession();
+  const { buyerId, vendorId, vendorName, companyName } = useBuyerSession();
 
   return (
     <div>
@@ -20,7 +19,7 @@ export default function BuyerChatPage() {
 
       <div className="grid gap-6 lg:grid-cols-3">
         <Card className="h-[640px] lg:col-span-2">
-          <LiveChatPanel buyerId={buyerId} workflowRunIds={getStoredBuyerWorkflowRunIds()} nodeKey="query_workspace_evidence" />
+          <GroundedChatPanel buyerId={buyerId} vendorId={vendorId} vendorName={vendorName} />
         </Card>
 
         <div className="space-y-4">

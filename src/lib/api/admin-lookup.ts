@@ -123,6 +123,40 @@ export async function getPlatformActivitySeries(weeks = 6): Promise<PlatformActi
   }));
 }
 
+// ---- buyer funnel (discover -> requirements -> vendor -> solution -> meeting) ----
+// Every buyer row only ever exists because a discovery submission created
+// it, so "total buyers" doubles as the funnel's first stage. The rest are
+// distinct-buyer counts computed client-side from raw rows (same pattern as
+// getOpenFrontierCountsByBuyer just below) since PostgREST's exact-count
+// header counts rows, not distinct values, and there's no aggregation
+// endpoint for that here.
+
+export interface BuyerFunnelStage {
+  stage: string;
+  count: number;
+}
+
+function distinctBuyerCount(rows: { buyer_id: string }[]): number {
+  return new Set(rows.map((r) => r.buyer_id)).size;
+}
+
+export async function getBuyerFunnelStages(): Promise<BuyerFunnelStage[]> {
+  const [totalBuyers, requirementRows, activeSelectionRows, activeModelRows, meetingRows] = await Promise.all([
+    restCount("buyers?select=id"),
+    restGet<{ buyer_id: string }[]>(`buyer_requirements?select=buyer_id`),
+    restGet<{ buyer_id: string }[]>(`buyer_vendor_selections?select=buyer_id&is_active=eq.true`),
+    restGet<{ buyer_id: string }[]>(`solution_models?select=buyer_id&status=eq.active`),
+    restGet<{ buyer_id: string }[]>(`meeting_requests?select=buyer_id`),
+  ]);
+  return [
+    { stage: "Discover", count: totalBuyers },
+    { stage: "Requirements", count: distinctBuyerCount(requirementRows) },
+    { stage: "Vendor selected", count: distinctBuyerCount(activeSelectionRows) },
+    { stage: "Solution built", count: distinctBuyerCount(activeModelRows) },
+    { stage: "Meeting", count: distinctBuyerCount(meetingRows) },
+  ];
+}
+
 // ---- cross-portal engagement (every recommendation / selection) ----------
 // Unfiltered reads of the same two tables vendor-lookup.ts reads scoped to
 // one vendor — the admin buyers table needs "this buyer's best fit + stage

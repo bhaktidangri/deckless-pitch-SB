@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/input";
 import { getBuyer } from "@/lib/api/buyer-lookup";
 import { getFrontierItemsForVendor, resolveCapabilityFrontierItem, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
 import { getStoredVendorId } from "@/lib/vendor-session";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import type { FrontierStatus } from "@/lib/types";
 
 const tabs: { key: FrontierStatus | "all"; label: string }[] = [
@@ -65,9 +66,15 @@ export default function CapabilityFrontierPage() {
     }
   }
 
+  useRealtimeRefresh(
+    vendorId ? [{ table: "capability_frontier", filter: `vendor_id=eq.${vendorId}` }] : [],
+    refresh,
+    [vendorId]
+  );
+
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 8000);
+    const interval = setInterval(refresh, 45000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendorId]);

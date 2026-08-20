@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Building2, FileCheck2, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
@@ -15,46 +15,68 @@ import {
   getPlatformActivitySeries,
   getRecentOrganizations,
   getAuditEvents,
+  getBuyerFunnelStages,
   type PlatformStats,
   type PlatformActivityWeek,
   type OrganizationRow,
+  type BuyerFunnelStage,
 } from "@/lib/api/admin-lookup";
+import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { formatRelativeTime } from "@/lib/utils";
 import type { AuditEvent } from "@/lib/types";
+
+const FUNNEL_COLORS = ["var(--brand-600)", "var(--brand-500)", "var(--brand-400)", "var(--brand-300)", "var(--brand-200)"];
 
 export default function AdminDashboardPage() {
   const [stats, setStats] = useState<PlatformStats | null>(null);
   const [activity, setActivity] = useState<PlatformActivityWeek[]>([]);
   const [orgs, setOrgs] = useState<OrganizationRow[]>([]);
   const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [funnel, setFunnel] = useState<BuyerFunnelStage[]>([]);
   const [loading, setLoading] = useState(true);
+  const [realtimeBump, setRealtimeBump] = useState(0);
+
+  useRealtimeRefresh(
+    [
+      { table: "organizations" },
+      { table: "vendors" },
+      { table: "buyers" },
+      { table: "solution_models" },
+      { table: "capability_frontier" },
+      { table: "audit_events" },
+    ],
+    () => setRealtimeBump((n) => n + 1),
+    []
+  );
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       try {
-        const [s, a, o, e] = await Promise.all([
+        const [s, a, o, e, f] = await Promise.all([
           getPlatformStats(),
           getPlatformActivitySeries(6),
           getRecentOrganizations(6),
           getAuditEvents(10),
+          getBuyerFunnelStages(),
         ]);
         if (cancelled) return;
         setStats(s);
         setActivity(a);
         setOrgs(o);
         setEvents(e);
+        setFunnel(f);
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
     load();
-    const interval = setInterval(load, 20000);
+    const interval = setInterval(load, 60000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [realtimeBump]);
 
   if (loading || !stats) {
     return (
@@ -141,6 +163,54 @@ export default function AdminDashboardPage() {
           </CardContent>
         </Card>
       </div>
+
+      {funnel.length > 0 && funnel[0].count > 0 && (
+        <Card className="mt-6">
+          <CardHeader>
+            <CardTitle>Buyer funnel</CardTitle>
+          </CardHeader>
+          <CardContent className="pt-2">
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={funnel} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
+                  <XAxis type="number" allowDecimals={false} tick={{ fill: "var(--muted)", fontSize: 11 }} axisLine={false} tickLine={false} />
+                  <YAxis
+                    type="category"
+                    dataKey="stage"
+                    tick={{ fill: "var(--foreground)", fontSize: 12 }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={110}
+                  />
+                  <Tooltip
+                    formatter={(value) => {
+                      const n = typeof value === "number" ? value : Number(value ?? 0);
+                      const pct = funnel[0].count > 0 ? ` (${Math.round((n / funnel[0].count) * 100)}%)` : "";
+                      return [`${n} buyer${n === 1 ? "" : "s"}${pct}`, "Reached this stage"];
+                    }}
+                    contentStyle={{
+                      background: "var(--surface)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 10,
+                      fontSize: 12,
+                      color: "var(--foreground)",
+                    }}
+                  />
+                  <Bar dataKey="count" radius={[0, 4, 4, 0]}>
+                    {funnel.map((stage, i) => (
+                      <Cell key={stage.stage} fill={FUNNEL_COLORS[i] ?? FUNNEL_COLORS[FUNNEL_COLORS.length - 1]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="mt-2 text-center text-xs text-subtle">
+              Every buyer who has ever submitted a discovery request, by how far they got — live counts, not a fixed conversion model.
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       <Card className="mt-6">
         <CardHeader>

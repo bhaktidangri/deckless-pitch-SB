@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Sparkles, CheckCircle2 } from "lucide-react";
+import { BackButton } from "@/components/layout/back-button";
 import { ThemeToggle } from "@/components/theme-toggle";
 
 const highlights = [
@@ -40,6 +41,7 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
 
       <div className="flex flex-col">
         <div className="flex items-center justify-between p-6">
+          <BackButton href="/" />
           <Link href="/" className="flex items-center gap-2 lg:hidden">
             <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-accent-500 text-white">
               <Sparkles className="h-3.5 w-3.5" />
