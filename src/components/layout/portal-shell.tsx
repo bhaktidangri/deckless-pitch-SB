@@ -22,6 +22,9 @@ export function PortalShell({
   userName,
   userRole,
   vendorSubLabel,
+  buyerSubLabel,
+  buyerId,
+  vendorId,
   headerSlot,
   children,
 }: {
@@ -31,6 +34,11 @@ export function PortalShell({
   userRole: string;
   /** Real registered vendor name, once known — overrides the role switcher's "CloudNova" demo placeholder. */
   vendorSubLabel?: string;
+  /** Real signed-in buyer's company name, once known — overrides the role switcher's "Meridian Retail Group" demo placeholder. */
+  buyerSubLabel?: string;
+  /** Real buyer/vendor id, once known — lets NotificationsMenu fetch role-scoped real notifications instead of a static fake list. */
+  buyerId?: string | null;
+  vendorId?: string | null;
   /** Optional extra content rendered in the sticky header, left of notifications — e.g. a cross-page status indicator. */
   headerSlot?: React.ReactNode;
   children: React.ReactNode;
@@ -47,7 +55,7 @@ export function PortalShell({
       </div>
 
       <div className="px-3">
-        <RoleSwitcher current={role} vendorSubLabel={vendorSubLabel} />
+        <RoleSwitcher current={role} vendorSubLabel={vendorSubLabel} buyerSubLabel={buyerSubLabel} />
       </div>
 
       <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-5">
@@ -100,7 +108,7 @@ export function PortalShell({
           </Link>
           <div className="ml-auto flex items-center gap-2 sm:gap-3">
             {headerSlot}
-            <NotificationsMenu />
+            <NotificationsMenu role={role} buyerId={buyerId} vendorId={vendorId} />
             <ThemeToggle />
           </div>
         </header>

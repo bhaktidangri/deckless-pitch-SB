@@ -10,10 +10,8 @@ import {
   CalendarClock,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
-import { capabilityFrontierItems } from "@/lib/dummy-data";
-import { getStoredVendorName } from "@/lib/vendor-session";
-
-const openFrontier = capabilityFrontierItems.filter((f) => f.status === "open" || f.status === "vendor_review").length;
+import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
+import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
 
 const sections: NavSection[] = [
   {
@@ -30,7 +28,7 @@ const sections: NavSection[] = [
     title: "Engagement",
     items: [
       { href: "/vendor/buyers", label: "Buyers", icon: Users },
-      { href: "/vendor/capability-frontier", label: "Capability Frontier", icon: FileSearch, badge: openFrontier },
+      { href: "/vendor/capability-frontier", label: "Capability Frontier", icon: FileSearch },
       { href: "/vendor/meetings", label: "Meetings", icon: CalendarClock },
     ],
   },
@@ -42,15 +40,46 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
   // (src/lib/vendor-session.ts), instead of the static "CloudNova" demo
   // placeholder, so the shell doesn't look like it ignored a real submission.
   const [vendorName, setVendorName] = useState<string | null>(null);
-  useEffect(() => setVendorName(getStoredVendorName()), []);
+  const [vendorId, setVendorId] = useState<string | null>(null);
+  const [openFrontier, setOpenFrontier] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    const id = getStoredVendorId();
+    setVendorName(getStoredVendorName());
+    setVendorId(id);
+    if (!id) return;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const count = await getFrontierCountForVendor(id!);
+        if (!cancelled) setOpenFrontier(count);
+      } catch {
+        // best-effort — badge just stays hidden
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  const scopedSections = sections.map((section) => ({
+    ...section,
+    items: section.items.map((item) =>
+      item.href === "/vendor/capability-frontier" ? { ...item, badge: openFrontier || undefined } : item
+    ),
+  }));
 
   return (
     <PortalShell
       role="vendor"
-      sections={sections}
+      sections={scopedSections}
       userName={vendorName ? `${vendorName} Admin` : "Not registered yet"}
       userRole="Vendor Admin"
       vendorSubLabel={vendorName ?? "No vendor registered"}
+      vendorId={vendorId}
     >
       {children}
     </PortalShell>

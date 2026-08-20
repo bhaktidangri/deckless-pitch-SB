@@ -15,15 +15,23 @@ const roles = [
 export function RoleSwitcher({
   current,
   vendorSubLabel,
+  buyerSubLabel,
 }: {
   current: "vendor" | "buyer" | "admin";
   /** Overrides the vendor row's demo "CloudNova" sub-label with the real registered vendor, once known. */
   vendorSubLabel?: string;
+  /** Overrides the buyer row's demo "Meridian Retail Group" sub-label with the real signed-in buyer, once known. */
+  buyerSubLabel?: string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const active = roles.find((r) => r.key === current)!;
-  const activeSub = current === "vendor" && vendorSubLabel ? vendorSubLabel : active.sub;
+  const activeSub =
+    current === "vendor" && vendorSubLabel
+      ? vendorSubLabel
+      : current === "buyer" && buyerSubLabel
+        ? buyerSubLabel
+        : active.sub;
 
   useEffect(() => {
     function onClick(e: MouseEvent) {

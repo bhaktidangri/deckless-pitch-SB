@@ -57,6 +57,8 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
       sections={sections}
       userName={companyName ?? "Not started yet"}
       userRole="Buyer"
+      buyerSubLabel={companyName ?? undefined}
+      buyerId={buyerId}
       headerSlot={
         <>
           <GlobalCapabilitySearch />

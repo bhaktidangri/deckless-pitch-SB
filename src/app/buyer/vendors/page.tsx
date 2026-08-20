@@ -8,10 +8,12 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoadingState } from "@/components/shared/loading-state";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+import { Globe, ArrowUpRight } from "lucide-react";
 import {
   getActiveVendorSelection,
   getVendorRecommendations,
@@ -55,6 +57,7 @@ export default function BuyerVendorsPage() {
   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
+  const [view, setView] = useState<"recommended" | "all">("recommended");
 
   const selection = usePendingApproval("confirm_vendor_selection", {
     buyerId,
@@ -117,6 +120,16 @@ export default function BuyerVendorsPage() {
     });
   }, [query, recommendations, vendorsById]);
 
+  const allVendors = useMemo(() => Object.values(vendorsById), [vendorsById]);
+  const filteredAllVendors = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allVendors;
+    return allVendors.filter((vendor) => {
+      const fields = [vendor.companyName, vendor.industry, vendor.tagline, vendor.description, ...vendor.industries].filter(Boolean).join(" ").toLowerCase();
+      return fields.includes(q) || capabilityHaystack(vendor).includes(q);
+    });
+  }, [query, allVendors]);
+
   if (!buyerId) {
     return (
       <div>
@@ -177,57 +190,126 @@ export default function BuyerVendorsPage() {
         )
       )}
 
-      {!loading && recommendations.length > 0 && (
-        <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="relative max-w-sm flex-1">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search by capability, industry, or vendor…"
-              className="pl-9 pr-9"
-              aria-label="Search vendors by capability"
-            />
-            {query && (
-              <button
-                type="button"
-                onClick={() => setQuery("")}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
-                aria-label="Clear search"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            )}
+      {!loading && (recommendations.length > 0 || allVendors.length > 0) && (
+        <>
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <Tabs value={view} onValueChange={(v) => setView(v as "recommended" | "all")}>
+              <TabsList>
+                <TabsTrigger value="recommended">Recommended for you ({recommendations.length})</TabsTrigger>
+                <TabsTrigger value="all">All vendors ({allVendors.length})</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <div className="relative max-w-sm flex-1 sm:max-w-xs">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search by capability, industry, or vendor…"
+                className="pl-9 pr-9"
+                aria-label="Search vendors by capability"
+              />
+              {query && (
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
+                  aria-label="Clear search"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              )}
+            </div>
           </div>
-          {query && (
-            <p className="text-xs text-muted">
-              {filteredRecommendations.length} of {recommendations.length} vendor{recommendations.length === 1 ? "" : "s"} match
-            </p>
-          )}
-        </div>
+        </>
       )}
 
       {loading ? (
         <LoadingState variant="cards" count={3} />
-      ) : recommendations.length === 0 ? (
-        <Card className="p-6 text-center text-sm text-muted">No vendor recommendations yet — check back shortly.</Card>
-      ) : filteredRecommendations.length === 0 ? (
+      ) : view === "recommended" ? (
+        recommendations.length === 0 ? (
+          <Card className="p-6 text-center text-sm text-muted">
+            No vendor recommendations yet — check back shortly, or browse the full catalog in the &ldquo;All vendors&rdquo; tab above.
+          </Card>
+        ) : filteredRecommendations.length === 0 ? (
+          <Card className="p-6 text-center text-sm text-muted">
+            No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
+          </Card>
+        ) : (
+          <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+            {filteredRecommendations.map((r) => {
+              const vendor = vendorsById[r.vendorId];
+              const matched = matchingCapabilityName(vendor, query);
+              return (
+                <div key={r.id} className="flex flex-col gap-2">
+                  {matched && (
+                    <Badge variant="brand" size="sm" className="w-fit">
+                      Matches: {matched}
+                    </Badge>
+                  )}
+                  <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
+                </div>
+              );
+            })}
+          </div>
+        )
+      ) : allVendors.length === 0 ? (
+        <Card className="p-6 text-center text-sm text-muted">No vendors have published their Solution DNA yet.</Card>
+      ) : filteredAllVendors.length === 0 ? (
         <Card className="p-6 text-center text-sm text-muted">
           No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
         </Card>
       ) : (
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
-          {filteredRecommendations.map((r) => {
-            const vendor = vendorsById[r.vendorId];
+          {filteredAllVendors.map((vendor) => {
             const matched = matchingCapabilityName(vendor, query);
+            const rec = recommendations.find((r) => r.vendorId === vendor.vendorId);
             return (
-              <div key={r.id} className="flex flex-col gap-2">
+              <div key={vendor.vendorId} className="flex flex-col gap-2">
                 {matched && (
                   <Badge variant="brand" size="sm" className="w-fit">
                     Matches: {matched}
                   </Badge>
                 )}
-                <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
+                <Card className="group flex flex-col overflow-hidden transition-all hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
+                  <div className="flex items-start justify-between gap-3 p-5 pb-4">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-accent-500 text-sm font-bold text-white">
+                        {vendor.companyName.slice(0, 2).toUpperCase()}
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-semibold text-foreground">{vendor.companyName}</h3>
+                        <p className="flex items-center gap-1 text-xs text-muted">
+                          {vendor.industry && <Globe className="h-3 w-3" />} {vendor.industry ?? "—"}
+                        </p>
+                      </div>
+                    </div>
+                    {rec?.fitScore != null && (
+                      <div className="flex flex-col items-end shrink-0">
+                        <span className="text-lg font-bold text-brand-600 dark:text-brand-400">{rec.fitScore}%</span>
+                        <span className="text-[10px] uppercase tracking-wide text-subtle">fit</span>
+                      </div>
+                    )}
+                  </div>
+                  {vendor.description && (
+                    <div className="px-5">
+                      <p className="text-sm text-muted line-clamp-2">{vendor.description}</p>
+                    </div>
+                  )}
+                  {vendor.industries.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-1.5 px-5">
+                      {vendor.industries.slice(0, 3).map((ind) => (
+                        <Badge key={ind} variant="outline" size="sm">
+                          {ind}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-auto flex gap-2 border-t border-border p-3">
+                    <Link href={`/buyer/vendors/${vendor.vendorId}`} className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "flex-1")}>
+                      View profile <ArrowUpRight className="h-3.5 w-3.5" />
+                    </Link>
+                  </div>
+                </Card>
               </div>
             );
           })}

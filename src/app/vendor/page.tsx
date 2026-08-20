@@ -1,24 +1,116 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, CircleAlert, Clock, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
+import { ArrowUpRight, CircleAlert, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
 import { AuditTimeline } from "@/components/shared/audit-timeline";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
-import { auditEvents, capabilityFrontierItems, dashboardStats, otherBuyerEngagements, primaryVendor } from "@/lib/dummy-data";
+import {
+  getVendorRecommendationsForVendor,
+  getBuyersByIds,
+  getVendorById,
+  type LeadBuyerRow,
+  type VendorDetailRow,
+} from "@/lib/api/vendor-lookup";
+import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
+import { getAuditEvents } from "@/lib/api/admin-lookup";
+import { getStoredVendorId } from "@/lib/vendor-session";
 import { cn, formatRelativeTime } from "@/lib/utils";
+import type { AuditEvent } from "@/lib/types";
+
+interface EngagementSummary {
+  buyer: LeadBuyerRow;
+  fitScore: number | null;
+  frontierOpen: number;
+}
 
 export default function VendorDashboardPage() {
-  const stats = dashboardStats.vendor;
-  const openFrontier = capabilityFrontierItems.filter((f) => f.status === "open");
+  const [vendorId, setVendorId] = useState<string | null>(null);
+  const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
+  const [engagements, setEngagements] = useState<EngagementSummary[]>([]);
+  const [openFrontier, setOpenFrontier] = useState<VendorFrontierItemRow[]>([]);
+  const [buyersById, setBuyersById] = useState<Record<string, LeadBuyerRow>>({});
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const id = getStoredVendorId();
+    setVendorId(id);
+    if (!id) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      try {
+        const [v, recs, frontier, auditEvents] = await Promise.all([
+          getVendorById(id!),
+          getVendorRecommendationsForVendor(id!),
+          getFrontierItemsForVendor(id!),
+          getAuditEvents(5),
+        ]);
+        const buyerIds = Array.from(new Set(recs.map((r) => r.buyerId)));
+        const buyers = await getBuyersByIds(buyerIds);
+        if (cancelled) return;
+        const byId = Object.fromEntries(buyers.map((b) => [b.id, b]));
+        setBuyersById(byId);
+        setVendor(v);
+        setEvents(auditEvents);
+        setEngagements(
+          recs
+            .filter((r) => byId[r.buyerId])
+            .map((r) => ({
+              buyer: byId[r.buyerId],
+              fitScore: r.fitScore,
+              frontierOpen: frontier.filter((f) => f.buyerId === r.buyerId && (f.status === "open" || f.status === "vendor_review")).length,
+            }))
+        );
+        setOpenFrontier(frontier.filter((f) => f.status === "open"));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    const interval = setInterval(load, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  if (!vendorId) {
+    return (
+      <div>
+        <PageHeader eyebrow="Vendor" title="Vendor Dashboard" description="Register your solution first." />
+        <Card className="max-w-md p-6 text-center">
+          <p className="text-sm text-muted">No vendor session found in this browser yet.</p>
+          <Link href="/vendor/onboarding" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
+            Submit sources
+          </Link>
+        </Card>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <AgentWaitingState variant="fullpage" title="Loading your dashboard" description="Pulling live buyer engagement and evidence data." />
+      </div>
+    );
+  }
+
+  const avgFit = engagements.length > 0 ? Math.round(engagements.reduce((sum, e) => sum + (e.fitScore ?? 0), 0) / engagements.length) : null;
 
   return (
     <div>
       <PageHeader
-        eyebrow={primaryVendor.name}
+        eyebrow={vendor?.companyName ?? "Vendor"}
         title="Vendor Dashboard"
         description="Track buyer engagement, Solution DNA health, and unresolved requirements at a glance."
         actions={
@@ -28,12 +120,11 @@ export default function VendorDashboardPage() {
         }
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        <StatCard label="Active buyers" value={String(stats.activeBuyers)} icon={Users} trend="+3 this week" />
-        <StatCard label="Solutions generated" value={String(stats.solutionsGenerated)} icon={Sparkles} tone="accent" />
-        <StatCard label="Open frontier items" value={String(stats.openFrontierItems)} icon={FileSearch} tone="escalated" />
-        <StatCard label="Avg. requirement fit" value={`${stats.avgFitScore}%`} icon={TrendingUp} tone="verified" />
-        <StatCard label="Presales hours saved" value={String(stats.presalesHoursSaved)} icon={Clock} tone="modelled" />
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard label="Active buyers" value={String(engagements.length)} icon={Users} index={0} />
+        <StatCard label="Solutions generated" value={String(engagements.length)} icon={Sparkles} tone="accent" index={1} />
+        <StatCard label="Open frontier items" value={String(openFrontier.length)} icon={FileSearch} tone="escalated" index={2} />
+        <StatCard label="Avg. requirement fit" value={avgFit != null ? `${avgFit}%` : "—"} icon={TrendingUp} tone="verified" index={3} />
       </div>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-3">
@@ -45,12 +136,15 @@ export default function VendorDashboardPage() {
             </Link>
           </CardHeader>
           <CardContent className="pt-4">
-            <div className="divide-y divide-border">
-              <EngagementRow name="Meridian Retail Group" industry="Retail" stage="Solution Workspace" fitScore={92} frontierOpen={2} lastActive="2026-08-16T07:40:00Z" />
-              {otherBuyerEngagements.map((e) => (
-                <EngagementRow key={e.id} name={e.buyerName} industry={e.industry} stage={e.stage} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.lastActive} />
-              ))}
-            </div>
+            {engagements.length === 0 ? (
+              <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
+            ) : (
+              <div className="divide-y divide-border">
+                {engagements.slice(0, 6).map((e) => (
+                  <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -59,7 +153,7 @@ export default function VendorDashboardPage() {
             <CardTitle>Agent activity</CardTitle>
           </CardHeader>
           <CardContent className="pt-4">
-            <AuditTimeline events={auditEvents.slice(0, 5)} />
+            {events.length > 0 ? <AuditTimeline events={events} /> : <p className="py-8 text-center text-sm text-muted">No agent activity recorded yet.</p>}
           </CardContent>
         </Card>
       </div>
@@ -74,27 +168,31 @@ export default function VendorDashboardPage() {
           </Link>
         </CardHeader>
         <CardContent className="grid gap-3 pt-4 sm:grid-cols-2">
-          {openFrontier.map((item) => (
-            <div key={item.id} className="rounded-xl border border-border bg-surface-2 p-4">
-              <div className="flex items-start justify-between gap-2">
-                <p className="text-sm font-medium text-foreground">{item.question}</p>
-                <Badge variant="escalated" size="sm">Open</Badge>
+          {openFrontier.length === 0 ? (
+            <p className="col-span-2 py-4 text-center text-sm text-muted">No open questions right now.</p>
+          ) : (
+            openFrontier.map((item) => (
+              <div key={item.id} className="rounded-xl border border-border bg-surface-2 p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <p className="text-sm font-medium text-foreground">{item.question}</p>
+                  <Badge variant="escalated" size="sm">Open</Badge>
+                </div>
+                <p className="mt-1.5 text-xs text-muted">{buyersById[item.buyerId]?.companyName ?? "A buyer"} &middot; {formatRelativeTime(item.createdAt)}</p>
               </div>
-              <p className="mt-1.5 text-xs text-muted">{item.buyerName} &middot; {formatRelativeTime(item.createdAt)}</p>
-            </div>
-          ))}
+            ))
+          )}
         </CardContent>
       </Card>
     </div>
   );
 }
 
-function EngagementRow({ name, industry, stage, fitScore, frontierOpen, lastActive }: { name: string; industry: string; stage: string; fitScore: number; frontierOpen: number; lastActive: string }) {
+function EngagementRow({ id, name, industry, fitScore, frontierOpen, lastActive }: { id: string; name: string; industry: string | null; fitScore: number | null; frontierOpen: number; lastActive: string }) {
   return (
-    <Link href="/vendor/buyers/b-meridian" className="flex items-center justify-between gap-3 py-3.5 transition-colors hover:bg-surface-2 -mx-1 px-1 rounded-lg">
+    <Link href={`/vendor/buyers/${id}`} className="flex items-center justify-between gap-3 py-3.5 transition-colors hover:bg-surface-2 -mx-1 px-1 rounded-lg">
       <div className="min-w-0">
         <p className="truncate text-sm font-medium text-foreground">{name}</p>
-        <p className="text-xs text-muted">{industry} &middot; {stage}</p>
+        <p className="text-xs text-muted">{industry ?? "Industry unknown"}</p>
       </div>
       <div className="flex shrink-0 items-center gap-3">
         {frontierOpen > 0 && (
@@ -102,7 +200,7 @@ function EngagementRow({ name, industry, stage, fitScore, frontierOpen, lastActi
             <FileSearch className="h-3.5 w-3.5" /> {frontierOpen}
           </span>
         )}
-        <span className="text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>
+        {fitScore != null && <span className="text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>}
         <span className="hidden text-xs text-subtle sm:block">{formatRelativeTime(lastActive)}</span>
       </div>
     </Link>
