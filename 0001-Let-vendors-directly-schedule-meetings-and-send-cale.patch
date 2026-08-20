@@ -1,0 +1,754 @@
+From 1cbb65a8204ca8f23b8f56f6caedd37cdd801731 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 09:52:05 +0000
+Subject: [PATCH] Let vendors directly schedule meetings and send calendar
+ invites by mail
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a new schedule-meeting-direct edge function so a vendor can put a
+meeting straight to "scheduled" from a buyer's detail page — title, date,
+duration, join link, and notes — instead of only confirming a buyer-
+initiated request. On submit it downloads a real .ics calendar invite and
+opens a mailto: draft to the buyer (no transactional email provider is
+configured, so sending is a client-side handoff, not a backend relay). Both
+the vendor meetings list and the buyer handoff page now show the join link,
+duration, and notes, with their own "download .ics" action.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZibWYPysw75xiFQpbHszf
+---
+ src/app/buyer/handoff/page.tsx                |  50 +++-
+ src/app/vendor/buyers/[id]/page.tsx           |  12 +
+ src/app/vendor/meetings/page.tsx              |  70 ++++-
+ .../shared/schedule-meeting-card.tsx          | 246 ++++++++++++++++++
+ src/lib/api/account.ts                        |  32 +++
+ src/lib/api/buyer-lookup.ts                   |  24 +-
+ src/lib/api/vendor-frontier.ts                |  24 +-
+ src/lib/ics.ts                                |  63 +++++
+ 8 files changed, 502 insertions(+), 19 deletions(-)
+ create mode 100644 src/components/shared/schedule-meeting-card.tsx
+ create mode 100644 src/lib/ics.ts
+
+diff --git a/src/app/buyer/handoff/page.tsx b/src/app/buyer/handoff/page.tsx
+index 214e36d..2c86b0f 100644
+--- a/src/app/buyer/handoff/page.tsx
++++ b/src/app/buyer/handoff/page.tsx
+@@ -2,7 +2,7 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { CalendarCheck2, CheckCircle2, MessageSquareText } from "lucide-react";
++import { CalendarCheck2, CheckCircle2, Download, ExternalLink, MessageSquareText } from "lucide-react";
+ import { motion } from "motion/react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+@@ -11,10 +11,11 @@ import { buttonVariants } from "@/components/ui/button";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
+ import { FrontierCard } from "@/components/shared/frontier-card";
+ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+-import { getCapabilityFrontierItems, getMeetingRequests, type CapabilityFrontierRow, type MeetingRequestRow } from "@/lib/api/buyer-lookup";
++import { getCapabilityFrontierItems, getMeetingRequests, getBuyer, type CapabilityFrontierRow, type MeetingRequestRow } from "@/lib/api/buyer-lookup";
+ import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
+ import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
++import { downloadIcs } from "@/lib/ics";
+ import { cn } from "@/lib/utils";
+ import type { CapabilityFrontierItem } from "@/lib/types";
+ 
+@@ -50,6 +51,7 @@ export default function HandoffPage() {
+ 
+   const [items, setItems] = useState<CapabilityFrontierRow[]>([]);
+   const [meetings, setMeetings] = useState<MeetingRequestRow[]>([]);
++  const [buyerEmail, setBuyerEmail] = useState<string | null>(null);
+   const [loading, setLoading] = useState(true);
+ 
+   const handoffApproval = usePendingApproval("approve_human_handoff", { buyerId, workflowRunIds, enabled: !!buyerId });
+@@ -60,9 +62,10 @@ export default function HandoffPage() {
+       return;
+     }
+     try {
+-      const [f, m] = await Promise.all([getCapabilityFrontierItems(buyerId), getMeetingRequests(buyerId)]);
++      const [f, m, b] = await Promise.all([getCapabilityFrontierItems(buyerId), getMeetingRequests(buyerId), getBuyer(buyerId).catch(() => null)]);
+       setItems(f);
+       setMeetings(m);
++      setBuyerEmail(b?.email ?? null);
+     } finally {
+       setLoading(false);
+     }
+@@ -138,11 +141,48 @@ export default function HandoffPage() {
+                       <Badge variant={cfg.variant}>{cfg.label}</Badge>
+                       {m.unresolvedCount > 0 && <span className="text-xs text-escalated">{m.unresolvedCount} unresolved</span>}
+                     </div>
+-                    {m.expert && <p className="mt-2 text-sm text-foreground">Recommended: {m.expert}</p>}
+-                    {m.proposedDate && <p className="text-xs text-muted">{new Date(m.proposedDate).toLocaleString()}</p>}
++                    {m.title && <p className="mt-2 text-sm font-medium text-foreground">{m.title}</p>}
++                    {m.expert && <p className="mt-1 text-sm text-foreground">Recommended: {m.expert}</p>}
++                    {m.proposedDate && (
++                      <p className="text-xs text-muted">
++                        {new Date(m.proposedDate).toLocaleString()} · {m.durationMinutes} min
++                      </p>
++                    )}
++                    {m.notes && <p className="mt-1 text-xs text-muted">{m.notes}</p>}
+                     {m.status === "scheduled" && (
+                       <p className="mt-2 flex items-center gap-1.5 text-xs text-verified"><CheckCircle2 className="h-3.5 w-3.5" /> Confirmed by {vendorName}</p>
+                     )}
++                    {m.status === "scheduled" && (
++                      <div className="mt-2 flex flex-wrap items-center gap-3">
++                        {m.meetingLink && (
++                          <a href={m.meetingLink} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                            <ExternalLink className="h-3 w-3" /> Join link
++                          </a>
++                        )}
++                        {m.proposedDate && (
++                          <button
++                            type="button"
++                            onClick={() =>
++                              downloadIcs(
++                                {
++                                  uid: `${m.id}@deckless-pitch`,
++                                  title: m.title ?? `Meeting with ${vendorName}`,
++                                  description: m.notes ?? undefined,
++                                  location: m.meetingLink ?? undefined,
++                                  startIso: m.proposedDate!,
++                                  durationMinutes: m.durationMinutes,
++                                  attendeeEmail: buyerEmail,
++                                },
++                                `${(m.title ?? "meeting").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.ics`
++                              )
++                            }
++                            className="flex items-center gap-1 text-xs font-medium text-muted hover:text-foreground"
++                          >
++                            <Download className="h-3 w-3" /> Add to calendar
++                          </button>
++                        )}
++                      </div>
++                    )}
+                   </motion.div>
+                 );
+               })}
+diff --git a/src/app/vendor/buyers/[id]/page.tsx b/src/app/vendor/buyers/[id]/page.tsx
+index 0f78350..3ac73ca 100644
+--- a/src/app/vendor/buyers/[id]/page.tsx
++++ b/src/app/vendor/buyers/[id]/page.tsx
+@@ -13,6 +13,7 @@ import { MatchRow } from "@/components/shared/match-row";
+ import { FrontierCard } from "@/components/shared/frontier-card";
+ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { EmailBuyerCard } from "@/components/shared/email-buyer-card";
++import { ScheduleMeetingCard } from "@/components/shared/schedule-meeting-card";
+ import {
+   getBuyerById,
+   getVendorById,
+@@ -229,6 +230,17 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
+             </CardContent>
+           </Card>
+ 
++          {vendorId && (
++            <ScheduleMeetingCard
++              vendorId={vendorId}
++              buyerId={buyer.id}
++              buyerCompanyName={buyer.companyName}
++              buyerEmail={buyer.email}
++              vendorCompanyName={vendor?.companyName ?? "Us"}
++              vendorEmail={vendor?.email ?? null}
++            />
++          )}
++
+           {vendorId && (
+             <EmailBuyerCard
+               vendorId={vendorId}
+diff --git a/src/app/vendor/meetings/page.tsx b/src/app/vendor/meetings/page.tsx
+index 9857877..79671e8 100644
+--- a/src/app/vendor/meetings/page.tsx
++++ b/src/app/vendor/meetings/page.tsx
+@@ -1,15 +1,18 @@
+ "use client";
+ 
+ import { useEffect, useState } from "react";
+-import { CalendarCheck2, CalendarClock, CheckCircle2, ChevronDown, ClipboardList, Loader2 } from "lucide-react";
++import Link from "next/link";
++import { CalendarCheck2, CalendarClock, CheckCircle2, ChevronDown, ClipboardList, Download, ExternalLink, Loader2 } from "lucide-react";
+ import { motion } from "motion/react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { Button } from "@/components/ui/button";
+ import { getBuyer } from "@/lib/api/buyer-lookup";
++import { getVendorById } from "@/lib/api/vendor-lookup";
+ import { confirmVendorDiscussionMeeting, getMeetingRequestsForVendor, type VendorMeetingRequestRow } from "@/lib/api/vendor-frontier";
+ import { getStoredVendorId } from "@/lib/vendor-session";
++import { downloadIcs } from "@/lib/ics";
+ import { cn } from "@/lib/utils";
+ 
+ const statusConfig = {
+@@ -25,7 +28,8 @@ const statusConfig = {
+ export default function MeetingsPage() {
+   const vendorId = getStoredVendorId();
+   const [meetings, setMeetings] = useState<VendorMeetingRequestRow[]>([]);
+-  const [buyerNames, setBuyerNames] = useState<Record<string, string>>({});
++  const [buyerInfo, setBuyerInfo] = useState<Record<string, { companyName: string; email: string | null }>>({});
++  const [vendorEmail, setVendorEmail] = useState<string | null>(null);
+   const [loading, setLoading] = useState(true);
+   const [expandedId, setExpandedId] = useState<string | null>(null);
+   const [confirming, setConfirming] = useState<string | null>(null);
+@@ -36,16 +40,17 @@ export default function MeetingsPage() {
+       return;
+     }
+     try {
+-      const rows = await getMeetingRequestsForVendor(vendorId);
++      const [rows, vendor] = await Promise.all([getMeetingRequestsForVendor(vendorId), getVendorById(vendorId).catch(() => null)]);
+       setMeetings(rows);
++      setVendorEmail(vendor?.email ?? null);
+       if (!expandedId && rows[0]) setExpandedId(rows[0].id);
+-      const unknownBuyerIds = [...new Set(rows.map((r) => r.buyerId))].filter((id) => !buyerNames[id]);
++      const unknownBuyerIds = [...new Set(rows.map((r) => r.buyerId))].filter((id) => !buyerInfo[id]);
+       if (unknownBuyerIds.length > 0) {
+         const buyers = await Promise.all(unknownBuyerIds.map((id) => getBuyer(id).catch(() => null)));
+-        setBuyerNames((prev) => {
++        setBuyerInfo((prev) => {
+           const next = { ...prev };
+           buyers.forEach((b) => {
+-            if (b) next[b.id] = b.companyName;
++            if (b) next[b.id] = { companyName: b.companyName, email: b.email };
+           });
+           return next;
+         });
+@@ -105,8 +110,11 @@ export default function MeetingsPage() {
+                       <cfg.icon className="h-4.5 w-4.5" />
+                     </div>
+                     <div>
+-                      <p className="text-sm font-semibold text-foreground">{buyerNames[m.buyerId] ?? "Buyer"}</p>
+-                      <p className="text-xs text-muted">Recommended expert: {m.expert ?? "—"}</p>
++                      <p className="text-sm font-semibold text-foreground">{m.title ?? buyerInfo[m.buyerId]?.companyName ?? "Buyer"}</p>
++                      <p className="text-xs text-muted">
++                        {buyerInfo[m.buyerId]?.companyName ?? "Buyer"}
++                        {m.expert ? ` · Recommended expert: ${m.expert}` : ""}
++                      </p>
+                     </div>
+                   </div>
+                   <div className="flex items-center gap-3">
+@@ -124,14 +132,56 @@ export default function MeetingsPage() {
+                 >
+                   <CardContent className="border-t border-border pt-4">
+                     {m.proposedDate && (
+-                      <p className="mb-3 text-sm text-foreground">Proposed: {new Date(m.proposedDate).toLocaleString()}</p>
++                      <p className="mb-1 text-sm text-foreground">
++                        {new Date(m.proposedDate).toLocaleString()} · {m.durationMinutes} min
++                      </p>
+                     )}
+-                    <div className="flex gap-2">
++                    {m.notes && <p className="mb-3 text-sm text-muted">{m.notes}</p>}
++                    <div className="flex flex-wrap items-center gap-2">
+                       {m.status === "requested" && (
+                         <Button size="sm" loading={confirming === m.id} onClick={() => confirm(m.id)}>
+                           <CalendarCheck2 className="h-3.5 w-3.5" /> Confirm meeting slot
+                         </Button>
+                       )}
++                      {m.meetingLink && (
++                        <a
++                          href={m.meetingLink}
++                          target="_blank"
++                          rel="noreferrer"
++                          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-surface-2"
++                        >
++                          <ExternalLink className="h-3.5 w-3.5" /> Join link
++                        </a>
++                      )}
++                      {m.proposedDate && (
++                        <button
++                          type="button"
++                          onClick={() =>
++                            downloadIcs(
++                              {
++                                uid: `${m.id}@deckless-pitch`,
++                                title: m.title ?? buyerInfo[m.buyerId]?.companyName ?? "Meeting",
++                                description: m.notes ?? undefined,
++                                location: m.meetingLink ?? undefined,
++                                startIso: m.proposedDate!,
++                                durationMinutes: m.durationMinutes,
++                                organizerEmail: vendorEmail,
++                                attendeeEmail: buyerInfo[m.buyerId]?.email ?? null,
++                              },
++                              `${(m.title ?? "meeting").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.ics`
++                            )
++                          }
++                          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted hover:bg-surface-2 hover:text-foreground"
++                        >
++                          <Download className="h-3.5 w-3.5" /> Download .ics
++                        </button>
++                      )}
++                      <Link
++                        href={`/vendor/buyers/${m.buyerId}`}
++                        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted hover:bg-surface-2 hover:text-foreground"
++                      >
++                        Reschedule from buyer page
++                      </Link>
+                     </div>
+                   </CardContent>
+                 </motion.div>
+diff --git a/src/components/shared/schedule-meeting-card.tsx b/src/components/shared/schedule-meeting-card.tsx
+new file mode 100644
+index 0000000..fc444c2
+--- /dev/null
++++ b/src/components/shared/schedule-meeting-card.tsx
+@@ -0,0 +1,246 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { CalendarPlus, Download, ExternalLink, Send } from "lucide-react";
++import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
++import { Input, Label, Select, Textarea } from "@/components/ui/input";
++import { Button } from "@/components/ui/button";
++import { Badge } from "@/components/ui/badge";
++import { scheduleMeetingDirect } from "@/lib/api/account";
++import { getMeetingRequestsForVendor, type VendorMeetingRequestRow } from "@/lib/api/vendor-frontier";
++import { downloadIcs } from "@/lib/ics";
++import { formatRelativeTime } from "@/lib/utils";
++
++interface ScheduleMeetingCardProps {
++  vendorId: string;
++  buyerId: string;
++  buyerCompanyName: string;
++  buyerEmail: string | null;
++  vendorCompanyName: string;
++  vendorEmail: string | null;
++}
++
++const durationOptions = [15, 30, 45, 60, 90];
++
++// Schedules a meeting straight to "scheduled" (no waiting on a buyer request
++// first), logs it in meeting_requests for both portals' dashboards, and —
++// since there's no transactional email provider wired into this app — hands
++// the actual "send" off to the vendor's own email client via mailto: plus a
++// downloadable .ics so the buyer can add it to their calendar either way.
++export function ScheduleMeetingCard({ vendorId, buyerId, buyerCompanyName, buyerEmail, vendorCompanyName, vendorEmail }: ScheduleMeetingCardProps) {
++  const [title, setTitle] = useState(`${vendorCompanyName} <> ${buyerCompanyName} discussion`);
++  // Default to "tomorrow, on the hour" — computed in an effect (not during
++  // render) since Date.now() is impure and the rules of React forbid impure
++  // calls in the render path; an empty initial value just means the picker
++  // briefly shows blank before this fills in.
++  const [dateTime, setDateTime] = useState("");
++  useEffect(() => {
++    const d = new Date(Date.now() + 24 * 60 * 60 * 1000);
++    d.setMinutes(0, 0, 0);
++    d.setHours(d.getHours() + 1);
++    const pad = (n: number) => String(n).padStart(2, "0");
++    setDateTime(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`);
++  }, []);
++  const [duration, setDuration] = useState(30);
++  const [meetingLink, setMeetingLink] = useState("");
++  const [notes, setNotes] = useState("");
++  const [scheduling, setScheduling] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [scheduled, setScheduled] = useState(false);
++  const [history, setHistory] = useState<VendorMeetingRequestRow[]>([]);
++  const [historyLoading, setHistoryLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    getMeetingRequestsForVendor(vendorId)
++      .then((rows) => {
++        if (!cancelled) setHistory(rows.filter((r) => r.buyerId === buyerId));
++      })
++      .catch(() => {})
++      .finally(() => {
++        if (!cancelled) setHistoryLoading(false);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [vendorId, buyerId]);
++
++  async function handleSchedule(e: React.FormEvent) {
++    e.preventDefault();
++    setScheduling(true);
++    setError(null);
++    setScheduled(false);
++    try {
++      const proposedDate = new Date(dateTime).toISOString();
++      const result = await scheduleMeetingDirect({
++        buyerId,
++        title: title.trim(),
++        proposedDate,
++        durationMinutes: duration,
++        meetingLink: meetingLink.trim() || undefined,
++        notes: notes.trim() || undefined,
++      });
++      setHistory((prev) => [
++        {
++          id: result.meetingRequestId,
++          buyerId,
++          status: "scheduled",
++          proposedDate: result.proposedDate,
++          expert: null,
++          unresolvedCount: 0,
++          title: result.title,
++          notes: result.notes,
++          meetingLink: result.meetingLink,
++          durationMinutes: result.durationMinutes,
++          createdAt: result.proposedDate,
++        },
++        ...prev,
++      ]);
++      setScheduled(true);
++
++      downloadIcs(
++        {
++          uid: `${result.meetingRequestId}@deckless-pitch`,
++          title: title.trim(),
++          description: notes.trim() || undefined,
++          location: meetingLink.trim() || undefined,
++          startIso: proposedDate,
++          durationMinutes: duration,
++          organizerEmail: vendorEmail,
++          attendeeEmail: result.buyerEmail,
++        },
++        `${title.trim().replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "meeting"}.ics`
++      );
++
++      if (result.buyerEmail) {
++        const when = new Date(proposedDate).toLocaleString();
++        const bodyLines = [
++          `Hi ${buyerCompanyName} team,`,
++          "",
++          `We've scheduled a meeting: ${title.trim()}`,
++          `When: ${when} (${duration} min)`,
++          meetingLink.trim() ? `Join: ${meetingLink.trim()}` : "",
++          notes.trim() ? `\n${notes.trim()}` : "",
++          "",
++          `A calendar invite (.ics) was just downloaded — attach it to this email or import it into your calendar.`,
++          "",
++          `— ${vendorCompanyName}`,
++        ].filter(Boolean);
++        window.location.href = `mailto:${result.buyerEmail}?subject=${encodeURIComponent(title.trim())}&body=${encodeURIComponent(bodyLines.join("\n"))}`;
++      }
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not schedule this meeting.");
++    } finally {
++      setScheduling(false);
++    }
++  }
++
++  return (
++    <Card>
++      <CardHeader>
++        <CardTitle className="flex items-center gap-2">
++          <CalendarPlus className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Schedule a meeting
++        </CardTitle>
++        <CardDescription>
++          {buyerEmail
++            ? `Schedules directly, downloads a calendar invite, and opens your email client addressed to ${buyerEmail}.`
++            : "Schedules directly and downloads a calendar invite — this buyer hasn't linked a login email yet, so no mailto: is opened."}
++        </CardDescription>
++      </CardHeader>
++      <CardContent>
++        <form onSubmit={handleSchedule} className="space-y-3">
++          <div>
++            <Label htmlFor="meeting-title">Title</Label>
++            <Input id="meeting-title" value={title} onChange={(e) => setTitle(e.target.value)} required />
++          </div>
++          <div className="grid gap-4 sm:grid-cols-2">
++            <div>
++              <Label htmlFor="meeting-when">Date &amp; time</Label>
++              <Input id="meeting-when" type="datetime-local" value={dateTime} onChange={(e) => setDateTime(e.target.value)} required />
++            </div>
++            <div>
++              <Label htmlFor="meeting-duration">Duration</Label>
++              <Select id="meeting-duration" value={duration} onChange={(e) => setDuration(Number(e.target.value))}>
++                {durationOptions.map((d) => (
++                  <option key={d} value={d}>
++                    {d} min
++                  </option>
++                ))}
++              </Select>
++            </div>
++          </div>
++          <div>
++            <Label htmlFor="meeting-link">Meeting link (optional)</Label>
++            <Input id="meeting-link" value={meetingLink} onChange={(e) => setMeetingLink(e.target.value)} placeholder="https://meet.google.com/..." />
++          </div>
++          <div>
++            <Label htmlFor="meeting-notes">Agenda / notes (optional)</Label>
++            <Textarea id="meeting-notes" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} />
++          </div>
++
++          {error && <p className="text-sm text-escalated">{error}</p>}
++
++          <div className="flex items-center gap-3">
++            <Button type="submit" loading={scheduling} disabled={scheduling}>
++              <Send className="h-4 w-4" /> Schedule &amp; send
++            </Button>
++            {scheduled && <span className="text-sm text-verified">Scheduled — invite downloaded.</span>}
++          </div>
++        </form>
++
++        {!historyLoading && history.length > 0 && (
++          <div className="mt-5 border-t border-border pt-4">
++            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-subtle">Meetings with this buyer</p>
++            <div className="space-y-2.5">
++              {history.slice(0, 5).map((m) => (
++                <div key={m.id} className="rounded-lg border border-border bg-surface-2 p-3 text-sm">
++                  <div className="flex items-center justify-between gap-2">
++                    <p className="font-medium text-foreground">{m.title ?? "Meeting"}</p>
++                    <Badge variant={m.status === "scheduled" ? "modelled" : m.status === "completed" ? "verified" : "outline"} size="sm" className="capitalize">
++                      {m.status}
++                    </Badge>
++                  </div>
++                  {m.proposedDate && (
++                    <p className="mt-1 text-xs text-muted">
++                      {new Date(m.proposedDate).toLocaleString()} · {m.durationMinutes} min · {formatRelativeTime(m.createdAt)}
++                    </p>
++                  )}
++                  <div className="mt-2 flex flex-wrap items-center gap-3">
++                    {m.meetingLink && (
++                      <a href={m.meetingLink} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                        <ExternalLink className="h-3 w-3" /> Join link
++                      </a>
++                    )}
++                    {m.proposedDate && (
++                      <button
++                        type="button"
++                        onClick={() =>
++                          downloadIcs(
++                            {
++                              uid: `${m.id}@deckless-pitch`,
++                              title: m.title ?? "Meeting",
++                              description: m.notes ?? undefined,
++                              location: m.meetingLink ?? undefined,
++                              startIso: m.proposedDate!,
++                              durationMinutes: m.durationMinutes,
++                              organizerEmail: vendorEmail,
++                              attendeeEmail: buyerEmail,
++                            },
++                            `${(m.title ?? "meeting").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.ics`
++                          )
++                        }
++                        className="flex items-center gap-1 text-xs font-medium text-muted hover:text-foreground"
++                      >
++                        <Download className="h-3 w-3" /> Download .ics
++                      </button>
++                    )}
++                  </div>
++                </div>
++              ))}
++            </div>
++          </div>
++        )}
++      </CardContent>
++    </Card>
++  );
++}
+diff --git a/src/lib/api/account.ts b/src/lib/api/account.ts
+index bdcedef..8951292 100644
+--- a/src/lib/api/account.ts
++++ b/src/lib/api/account.ts
+@@ -121,3 +121,35 @@ export interface RecordedVendorOutreach {
+ export function recordVendorOutreach(input: RecordVendorOutreachInput): Promise<RecordedVendorOutreach> {
+   return callAuthedFunction<RecordedVendorOutreach>("record-vendor-outreach", input);
+ }
++
++export interface ScheduleMeetingInput {
++  buyerId: string;
++  meetingRequestId?: string;
++  title: string;
++  proposedDate: string;
++  durationMinutes?: number;
++  meetingLink?: string;
++  notes?: string;
++}
++
++export interface ScheduledMeeting {
++  meetingRequestId: string;
++  status: string;
++  proposedDate: string;
++  title: string | null;
++  notes: string | null;
++  meetingLink: string | null;
++  durationMinutes: number;
++  buyerEmail: string | null;
++  buyerContactName: string | null;
++  buyerCompanyName: string;
++  vendorCompanyName: string;
++}
++
++// Directly schedules (or reschedules, when meetingRequestId is passed) a
++// meeting with a buyer — status goes straight to "scheduled" instead of
++// waiting on a buyer-initiated "requested" row. Returns everything needed to
++// build a calendar invite (.ics) and a mailto: link client-side.
++export function scheduleMeetingDirect(input: ScheduleMeetingInput): Promise<ScheduledMeeting> {
++  return callAuthedFunction<ScheduledMeeting>("schedule-meeting-direct", input);
++}
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index b392731..6dbb0d1 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -448,16 +448,32 @@ export interface MeetingRequestRow {
+   proposedDate: string | null;
+   expert: string | null;
+   unresolvedCount: number;
++  title: string | null;
++  notes: string | null;
++  meetingLink: string | null;
++  durationMinutes: number;
+ }
+ 
+ export async function getMeetingRequests(buyerId: string): Promise<MeetingRequestRow[]> {
+   const params = new URLSearchParams({
+-    select: "id,buyer_id,vendor_id,status,proposed_date,expert,unresolved_count,created_at",
++    select: "id,buyer_id,vendor_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at",
+     buyer_id: `eq.${buyerId}`,
+     order: "created_at.desc",
+   });
+   const rows = await restGet<
+-    { id: string; buyer_id: string; vendor_id: string; status: MeetingRequestRow["status"]; proposed_date: string | null; expert: string | null; unresolved_count: number | null }[]
++    {
++      id: string;
++      buyer_id: string;
++      vendor_id: string;
++      status: MeetingRequestRow["status"];
++      proposed_date: string | null;
++      expert: string | null;
++      unresolved_count: number | null;
++      title: string | null;
++      notes: string | null;
++      meeting_link: string | null;
++      duration_minutes: number | null;
++    }[]
+   >(`meeting_requests?${params}`);
+   return rows.map((r) => ({
+     id: r.id,
+@@ -467,6 +483,10 @@ export async function getMeetingRequests(buyerId: string): Promise<MeetingReques
+     proposedDate: r.proposed_date,
+     expert: r.expert,
+     unresolvedCount: r.unresolved_count ?? 0,
++    title: r.title,
++    notes: r.notes,
++    meetingLink: r.meeting_link,
++    durationMinutes: r.duration_minutes ?? 30,
+   }));
+ }
+ 
+diff --git a/src/lib/api/vendor-frontier.ts b/src/lib/api/vendor-frontier.ts
+index 0e21e8e..9a05096 100644
+--- a/src/lib/api/vendor-frontier.ts
++++ b/src/lib/api/vendor-frontier.ts
+@@ -96,17 +96,33 @@ export interface VendorMeetingRequestRow {
+   proposedDate: string | null;
+   expert: string | null;
+   unresolvedCount: number;
++  title: string | null;
++  notes: string | null;
++  meetingLink: string | null;
++  durationMinutes: number;
+   createdAt: string;
+ }
+ 
+ export async function getMeetingRequestsForVendor(vendorId: string): Promise<VendorMeetingRequestRow[]> {
+   const params = new URLSearchParams({
+-    select: "id,buyer_id,status,proposed_date,expert,unresolved_count,created_at",
++    select: "id,buyer_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at",
+     vendor_id: `eq.${vendorId}`,
+     order: "created_at.desc",
+   });
+   const rows = await restGet<
+-    { id: string; buyer_id: string; status: VendorMeetingRequestRow["status"]; proposed_date: string | null; expert: string | null; unresolved_count: number | null; created_at: string }[]
++    {
++      id: string;
++      buyer_id: string;
++      status: VendorMeetingRequestRow["status"];
++      proposed_date: string | null;
++      expert: string | null;
++      unresolved_count: number | null;
++      title: string | null;
++      notes: string | null;
++      meeting_link: string | null;
++      duration_minutes: number | null;
++      created_at: string;
++    }[]
+   >(`meeting_requests?${params}`);
+   return rows.map((r) => ({
+     id: r.id,
+@@ -115,6 +131,10 @@ export async function getMeetingRequestsForVendor(vendorId: string): Promise<Ven
+     proposedDate: r.proposed_date,
+     expert: r.expert,
+     unresolvedCount: r.unresolved_count ?? 0,
++    title: r.title,
++    notes: r.notes,
++    meetingLink: r.meeting_link,
++    durationMinutes: r.duration_minutes ?? 30,
+     createdAt: r.created_at,
+   }));
+ }
+diff --git a/src/lib/ics.ts b/src/lib/ics.ts
+new file mode 100644
+index 0000000..495faf3
+--- /dev/null
++++ b/src/lib/ics.ts
+@@ -0,0 +1,63 @@
++// Minimal RFC 5545 .ics builder — no dependency needed for a single VEVENT.
++// Used everywhere a scheduled meeting needs to become a downloadable
++// calendar invite: this app has no transactional email provider, so an .ics
++// file plus a mailto: link (see ScheduleMeetingCard) is the real, working
++// substitute for a backend-sent calendar invite.
++
++export interface IcsEventInput {
++  uid: string;
++  title: string;
++  description?: string;
++  location?: string;
++  startIso: string;
++  durationMinutes: number;
++  organizerEmail?: string | null;
++  attendeeEmail?: string | null;
++}
++
++function toIcsDate(iso: string): string {
++  // UTC, basic format: YYYYMMDDTHHMMSSZ
++  return new Date(iso).toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
++}
++
++function escapeIcsText(text: string): string {
++  return text.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
++}
++
++export function buildIcsContent(event: IcsEventInput): string {
++  const start = toIcsDate(event.startIso);
++  const end = toIcsDate(new Date(new Date(event.startIso).getTime() + event.durationMinutes * 60 * 1000).toISOString());
++  const stamp = toIcsDate(new Date(event.startIso).toISOString());
++  const lines = [
++    "BEGIN:VCALENDAR",
++    "VERSION:2.0",
++    "PRODID:-//Deckless Pitch//Meeting Scheduler//EN",
++    "CALSCALE:GREGORIAN",
++    "METHOD:PUBLISH",
++    "BEGIN:VEVENT",
++    `UID:${event.uid}`,
++    `DTSTAMP:${stamp}`,
++    `DTSTART:${start}`,
++    `DTEND:${end}`,
++    `SUMMARY:${escapeIcsText(event.title)}`,
++  ];
++  if (event.description) lines.push(`DESCRIPTION:${escapeIcsText(event.description)}`);
++  if (event.location) lines.push(`LOCATION:${escapeIcsText(event.location)}`);
++  if (event.organizerEmail) lines.push(`ORGANIZER:mailto:${event.organizerEmail}`);
++  if (event.attendeeEmail) lines.push(`ATTENDEE;RSVP=TRUE:mailto:${event.attendeeEmail}`);
++  lines.push("END:VEVENT", "END:VCALENDAR");
++  return lines.join("\r\n");
++}
++
++export function downloadIcs(event: IcsEventInput, filename = "meeting.ics") {
++  const content = buildIcsContent(event);
++  const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement("a");
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  document.body.removeChild(a);
++  URL.revokeObjectURL(url);
++}
+-- 
+2.43.0
+

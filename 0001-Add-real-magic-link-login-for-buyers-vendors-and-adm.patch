@@ -1,0 +1,1775 @@
+From bd83b7bd417127bba4f4c20c01c8f74f2db0e747 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 09:28:46 +0000
+Subject: [PATCH] Add real magic-link login for buyers, vendors, and admin with
+ session-linked profiles
+
+Replaces the fake demo login/signup with Supabase Auth OTP email sign-in, links
+each account to its Yoxa-created buyer/vendor record by email (no session
+"claiming"), gates admin behind an allow-list, and adds editable profile +
+progress pages for both portals.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZibWYPysw75xiFQpbHszf
+---
+ package-lock.json                      | 102 +++++++++++
+ package.json                           |   1 +
+ src/app/(auth)/login/page.tsx          | 116 ++++++++----
+ src/app/(auth)/signup/page.tsx         | 212 +++++++++-------------
+ src/app/admin/layout.tsx               |  15 ++
+ src/app/auth/callback/page.tsx         | 100 +++++++++++
+ src/app/buyer/discover/page.tsx        |   4 +
+ src/app/buyer/layout.tsx               |  16 ++
+ src/app/buyer/profile/page.tsx         | 214 ++++++++++++++++++++++
+ src/app/vendor/layout.tsx              |  16 ++
+ src/app/vendor/onboarding/page.tsx     |   3 +
+ src/app/vendor/profile/page.tsx        | 236 +++++++++++++++++++++++++
+ src/components/layout/portal-shell.tsx |  29 ++-
+ src/lib/api/account.ts                 | 100 +++++++++++
+ src/lib/api/buyer-lookup.ts            |  11 +-
+ src/lib/api/vendor-lookup.ts           |   5 +-
+ src/lib/hooks/use-auth-session.ts      |  45 +++++
+ src/lib/hooks/use-require-admin.ts     |  45 +++++
+ src/lib/hooks/use-require-auth.ts      |  22 +++
+ src/lib/supabase-client.ts             |  24 +++
+ 20 files changed, 1149 insertions(+), 167 deletions(-)
+ create mode 100644 src/app/auth/callback/page.tsx
+ create mode 100644 src/app/buyer/profile/page.tsx
+ create mode 100644 src/app/vendor/profile/page.tsx
+ create mode 100644 src/lib/api/account.ts
+ create mode 100644 src/lib/hooks/use-auth-session.ts
+ create mode 100644 src/lib/hooks/use-require-admin.ts
+ create mode 100644 src/lib/hooks/use-require-auth.ts
+ create mode 100644 src/lib/supabase-client.ts
+
+diff --git a/package-lock.json b/package-lock.json
+index 6d139d8..32c3290 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,7 @@
+       "name": "yujx26",
+       "version": "0.1.0",
+       "dependencies": {
++        "@supabase/supabase-js": "^2.112.3",
+         "class-variance-authority": "^0.7.1",
+         "clsx": "^2.1.1",
+         "lucide-react": "^1.31.0",
+@@ -1365,6 +1366,98 @@
+       "integrity": "sha512-e7Mew686owMaPJVNNLs55PUvgz371nKgwsc4vxE49zsODpJEnxgxRo2y/OKrqueavXgZNMDVj3DdHFlaSAeU8g==",
+       "license": "MIT"
+     },
++    "node_modules/@supabase/auth-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/auth-js/-/auth-js-2.112.3.tgz",
++      "integrity": "sha512-NA0rsgAlWZPvbhw8aUdmgfpHVgUAcd8zK5ov43l++o1bLIPXZhRiAlRobhwF5AatQuovpqxsMH50F4oyyV4XZw==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/functions-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/functions-js/-/functions-js-2.112.3.tgz",
++      "integrity": "sha512-gfv481mTOVWtZIJgXupxZpni2V2UWPf6jeF/jOK7HdMHdH+mt6sU0sHHwf0POsPip8ltlulu9OUHgwVzl5ddRw==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/phoenix": {
++      "version": "0.4.5",
++      "resolved": "https://registry.npmjs.org/@supabase/phoenix/-/phoenix-0.4.5.tgz",
++      "integrity": "sha512-aAn9H9ovVyeApKy11OWOrrOGq8DV68yWeH4ud2lN9fzn4aO8Zb5GLL9m1pUg9nLqIcT+ZDfAcsZe0E/nqdv2lw==",
++      "license": "MIT"
++    },
++    "node_modules/@supabase/postgrest-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/postgrest-js/-/postgrest-js-2.112.3.tgz",
++      "integrity": "sha512-+Mf6uCpzr00bqxwX8hTK2X2L9eAL/1vuOjdEjx6upz9ulb0RmQT16XeU/JkMUlVHw/B46ZnPa2busY4Kd9YCzw==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/realtime-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/realtime-js/-/realtime-js-2.112.3.tgz",
++      "integrity": "sha512-E6wljXWs7DUOloyIB69i3YFInWE6IyCvgTAbQ0KYxOHv26FdA1KzEXTuzxrYEdf70t406Z9BRwUlGyclGF2FXA==",
++      "license": "MIT",
++      "dependencies": {
++        "@supabase/phoenix": "0.4.5",
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/storage-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/storage-js/-/storage-js-2.112.3.tgz",
++      "integrity": "sha512-oSK61tzlUvg+BWPqpKQCu9qqonsO26btaoAR9D6Gest2aj7xUqToj9rKyaoYOJczkhg9BjqA1REbYy9tPI4bDA==",
++      "license": "MIT",
++      "dependencies": {
++        "iceberg-js": "^0.8.1",
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/supabase-js": {
++      "version": "2.112.3",
++      "resolved": "https://registry.npmjs.org/@supabase/supabase-js/-/supabase-js-2.112.3.tgz",
++      "integrity": "sha512-Jv1bxVQmEJNkjvPEhFaKjPzsh+Ozyew6lWGD+SoYcsclDEP1z7yEvKvfUQfzy0DkxRIQnZNxmmWtAzw5XLTQoA==",
++      "license": "MIT",
++      "dependencies": {
++        "@supabase/auth-js": "2.112.3",
++        "@supabase/functions-js": "2.112.3",
++        "@supabase/postgrest-js": "2.112.3",
++        "@supabase/realtime-js": "2.112.3",
++        "@supabase/storage-js": "2.112.3"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      },
++      "peerDependencies": {
++        "@opentelemetry/api": ">=1.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@opentelemetry/api": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/@swc/helpers": {
+       "version": "0.5.23",
+       "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.23.tgz",
+@@ -4407,6 +4500,15 @@
+         "hermes-estree": "0.25.1"
+       }
+     },
++    "node_modules/iceberg-js": {
++      "version": "0.8.1",
++      "resolved": "https://registry.npmjs.org/iceberg-js/-/iceberg-js-0.8.1.tgz",
++      "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
+     "node_modules/ignore": {
+       "version": "5.3.2",
+       "resolved": "https://registry.npmjs.org/ignore/-/ignore-5.3.2.tgz",
+diff --git a/package.json b/package.json
+index 8d9957e..068daa5 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,7 @@
+     "lint": "eslint"
+   },
+   "dependencies": {
++    "@supabase/supabase-js": "^2.112.3",
+     "class-variance-authority": "^0.7.1",
+     "clsx": "^2.1.1",
+     "lucide-react": "^1.31.0",
+diff --git a/src/app/(auth)/login/page.tsx b/src/app/(auth)/login/page.tsx
+index 7291f80..e4f5abe 100644
+--- a/src/app/(auth)/login/page.tsx
++++ b/src/app/(auth)/login/page.tsx
+@@ -2,25 +2,45 @@
+ 
+ import { useState } from "react";
+ import Link from "next/link";
+-import { useRouter } from "next/navigation";
+ import { motion } from "motion/react";
+-import { Building2, ShoppingBag, Lock, Mail, ArrowRight } from "lucide-react";
++import { Building2, ShoppingBag, Mail, ArrowRight, CheckCircle2, AlertTriangle } from "lucide-react";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { Input, Label } from "@/components/ui/input";
+ import { Button } from "@/components/ui/button";
++import { getSupabaseClient } from "@/lib/supabase-client";
+ import { cn } from "@/lib/utils";
+ 
++// Real auth: Supabase magic-link / OTP email, no password anywhere. The role
++// tab only decides where a brand-new (never-linked) account lands after
++// verifying — resolve-account-session (called from /auth/callback) is what
++// actually determines whether this email is a buyer, a vendor, or an
++// allow-listed platform admin, so picking "Buyer" here can't grant vendor or
++// admin access; it's just a landing-page hint for people with no linked
++// record yet.
+ export default function LoginPage() {
+-  const router = useRouter();
+   const [role, setRole] = useState<"vendor" | "buyer">("buyer");
+-  const [loading, setLoading] = useState(false);
++  const [email, setEmail] = useState("");
++  const [status, setStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
++  const [error, setError] = useState<string | null>(null);
+ 
+-  function handleSubmit(e: React.FormEvent) {
++  async function handleSubmit(e: React.FormEvent) {
+     e.preventDefault();
+-    setLoading(true);
+-    setTimeout(() => {
+-      router.push(role === "vendor" ? "/vendor" : "/buyer");
+-    }, 600);
++    if (!email.trim()) return;
++    setStatus("sending");
++    setError(null);
++    try {
++      const supabase = getSupabaseClient();
++      const redirectTo = `${window.location.origin}/auth/callback?role=${role}`;
++      const { error: otpError } = await supabase.auth.signInWithOtp({
++        email: email.trim(),
++        options: { emailRedirectTo: redirectTo },
++      });
++      if (otpError) throw otpError;
++      setStatus("sent");
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not send the sign-in link.");
++      setStatus("error");
++    }
+   }
+ 
+   return (
+@@ -28,41 +48,65 @@ export default function LoginPage() {
+       <Card>
+         <CardHeader>
+           <CardTitle className="text-xl">Welcome back</CardTitle>
+-          <CardDescription>Sign in to continue your solution exploration.</CardDescription>
++          <CardDescription>Sign in with your work email — no password, we&apos;ll send you a secure link.</CardDescription>
+         </CardHeader>
+         <CardContent>
+-          <div className="mb-5 grid grid-cols-2 gap-2 rounded-xl border border-border bg-surface-2 p-1">
+-            <RoleTab active={role === "buyer"} onClick={() => setRole("buyer")} icon={ShoppingBag} label="Buyer" />
+-            <RoleTab active={role === "vendor"} onClick={() => setRole("vendor")} icon={Building2} label="Vendor" />
+-          </div>
+-
+-          <form onSubmit={handleSubmit} className="space-y-4">
+-            <div>
+-              <Label htmlFor="email">Work email</Label>
+-              <div className="relative">
+-                <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+-                <Input id="email" type="email" placeholder={role === "vendor" ? "you@cloudnova.io" : "you@meridianretail.com"} defaultValue={role === "vendor" ? "admin@cloudnova.io" : "priya.sharma@meridianretail.com"} className="pl-9" required />
++          {status === "sent" ? (
++            <div className="flex flex-col items-center gap-3 py-6 text-center">
++              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-verified-bg text-verified">
++                <CheckCircle2 className="h-6 w-6" />
+               </div>
++              <p className="text-sm font-medium text-foreground">Check your email</p>
++              <p className="max-w-xs text-sm text-muted">
++                We sent a sign-in link to <span className="font-medium text-foreground">{email}</span>. Open it on this device to
++                continue.
++              </p>
++              <button type="button" onClick={() => setStatus("idle")} className="mt-2 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                Use a different email
++              </button>
+             </div>
+-            <div>
+-              <div className="flex items-center justify-between">
+-                <Label htmlFor="password">Password</Label>
+-                <a href="#" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">Forgot password?</a>
+-              </div>
+-              <div className="relative">
+-                <Lock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+-                <Input id="password" type="password" placeholder="••••••••" defaultValue="demopassword" className="pl-9" required />
++          ) : (
++            <>
++              <div className="mb-5 grid grid-cols-2 gap-2 rounded-xl border border-border bg-surface-2 p-1">
++                <RoleTab active={role === "buyer"} onClick={() => setRole("buyer")} icon={ShoppingBag} label="Buyer" />
++                <RoleTab active={role === "vendor"} onClick={() => setRole("vendor")} icon={Building2} label="Vendor" />
+               </div>
+-            </div>
+-            <Button type="submit" className="w-full" loading={loading}>
+-              Sign in as {role === "vendor" ? "Vendor" : "Buyer"} <ArrowRight className="h-4 w-4" />
+-            </Button>
+-          </form>
++
++              <form onSubmit={handleSubmit} className="space-y-4">
++                <div>
++                  <Label htmlFor="email">Work email</Label>
++                  <div className="relative">
++                    <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
++                    <Input
++                      id="email"
++                      type="email"
++                      placeholder="you@company.com"
++                      value={email}
++                      onChange={(e) => setEmail(e.target.value)}
++                      className="pl-9"
++                      required
++                    />
++                  </div>
++                </div>
++
++                {status === "error" && error && (
++                  <div className="flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
++                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
++                    {error}
++                  </div>
++                )}
++
++                <Button type="submit" className="w-full" loading={status === "sending"}>
++                  Send sign-in link <ArrowRight className="h-4 w-4" />
++                </Button>
++              </form>
++            </>
++          )}
+ 
+           <p className="mt-6 text-center text-sm text-muted">
+-            Don&apos;t have an account?{" "}
++            New here?{" "}
+             <Link href="/signup" className="font-medium text-brand-600 hover:underline dark:text-brand-400">
+-              Create one
++              Create an account
+             </Link>
+           </p>
+         </CardContent>
+diff --git a/src/app/(auth)/signup/page.tsx b/src/app/(auth)/signup/page.tsx
+index 4360eae..d93046a 100644
+--- a/src/app/(auth)/signup/page.tsx
++++ b/src/app/(auth)/signup/page.tsx
+@@ -2,124 +2,106 @@
+ 
+ import { useState } from "react";
+ import Link from "next/link";
+-import { useRouter } from "next/navigation";
+-import { AnimatePresence, motion } from "motion/react";
+-import { ArrowLeft, ArrowRight, Building2, Check, ShoppingBag } from "lucide-react";
++import { motion } from "motion/react";
++import { ArrowRight, Building2, CheckCircle2, Mail, ShoppingBag, AlertTriangle } from "lucide-react";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+-import { Input, Label, Select } from "@/components/ui/input";
++import { Input, Label } from "@/components/ui/input";
+ import { Button } from "@/components/ui/button";
++import { getSupabaseClient } from "@/lib/supabase-client";
+ import { cn } from "@/lib/utils";
+ 
+-type Role = "vendor" | "buyer";
+-
++// Passwordless auth means "sign up" and "sign in" are the same mechanism —
++// Supabase creates the auth.users row automatically the first time an email
++// verifies its magic link. This page exists for the "I'm new here" framing
++// and copy, but sends the exact same signInWithOtp call as /login. Company
++// details (name, website, industry...) aren't collected here — they're
++// captured by the real Discover / vendor onboarding flow right after first
++// sign-in, which is also what actually creates the buyer/vendor record.
+ export default function SignupPage() {
+-  const router = useRouter();
+-  const [step, setStep] = useState(1);
+-  const [role, setRole] = useState<Role | null>(null);
+-  const [loading, setLoading] = useState(false);
++  const [role, setRole] = useState<"vendor" | "buyer">("buyer");
++  const [email, setEmail] = useState("");
++  const [status, setStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
++  const [error, setError] = useState<string | null>(null);
+ 
+-  function handleSubmit(e: React.FormEvent) {
++  async function handleSubmit(e: React.FormEvent) {
+     e.preventDefault();
+-    setLoading(true);
+-    setTimeout(() => {
+-      router.push(role === "vendor" ? "/vendor/onboarding" : "/buyer/discover");
+-    }, 700);
++    if (!email.trim()) return;
++    setStatus("sending");
++    setError(null);
++    try {
++      const supabase = getSupabaseClient();
++      const redirectTo = `${window.location.origin}/auth/callback?role=${role}`;
++      const { error: otpError } = await supabase.auth.signInWithOtp({
++        email: email.trim(),
++        options: { emailRedirectTo: redirectTo },
++      });
++      if (otpError) throw otpError;
++      setStatus("sent");
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not send the sign-in link.");
++      setStatus("error");
++    }
+   }
+ 
+   return (
+-    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="w-full max-w-lg">
++    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="w-full max-w-md">
+       <Card>
+         <CardHeader>
+-          <div className="mb-2 flex items-center gap-2">
+-            <Step number={1} label="Role" active={step === 1} done={step > 1} />
+-            <div className="h-px flex-1 bg-border" />
+-            <Step number={2} label="Details" active={step === 2} done={false} />
+-          </div>
+           <CardTitle className="text-xl">Create your account</CardTitle>
+-          <CardDescription>
+-            {step === 1 ? "Tell us which side of the platform you're joining." : `Set up your ${role} workspace.`}
+-          </CardDescription>
++          <CardDescription>Tell us which side of the platform you&apos;re joining, then verify your email — no password needed.</CardDescription>
+         </CardHeader>
+         <CardContent>
+-          <AnimatePresence mode="wait">
+-            {step === 1 ? (
+-              <motion.div
+-                key="step1"
+-                initial={{ opacity: 0, x: 16 }}
+-                animate={{ opacity: 1, x: 0 }}
+-                exit={{ opacity: 0, x: -16 }}
+-                transition={{ duration: 0.25 }}
+-                className="grid gap-3 sm:grid-cols-2"
+-              >
+-                <RoleCard
+-                  icon={Building2}
+-                  title="I'm a Vendor"
+-                  desc="Register your solution capabilities and reach qualified buyers."
+-                  active={role === "vendor"}
+-                  onClick={() => setRole("vendor")}
+-                />
+-                <RoleCard
+-                  icon={ShoppingBag}
+-                  title="I'm a Buyer"
+-                  desc="Describe your requirement and get a personalized solution."
+-                  active={role === "buyer"}
+-                  onClick={() => setRole("buyer")}
+-                />
+-                <Button
+-                  type="button"
+-                  disabled={!role}
+-                  onClick={() => setStep(2)}
+-                  className="col-span-full mt-2"
+-                >
+-                  Continue <ArrowRight className="h-4 w-4" />
+-                </Button>
+-              </motion.div>
+-            ) : (
+-              <motion.form
+-                key="step2"
+-                initial={{ opacity: 0, x: 16 }}
+-                animate={{ opacity: 1, x: 0 }}
+-                exit={{ opacity: 0, x: -16 }}
+-                transition={{ duration: 0.25 }}
+-                onSubmit={handleSubmit}
+-                className="space-y-4"
+-              >
+-                <div>
+-                  <Label htmlFor="company">Company name</Label>
+-                  <Input id="company" placeholder={role === "vendor" ? "CloudNova" : "Meridian Retail Group"} required />
+-                </div>
+-                <div>
+-                  <Label htmlFor="website">Website</Label>
+-                  <Input id="website" placeholder="https://yourcompany.com" required />
+-                </div>
+-                <div>
+-                  <Label htmlFor="industry">Industry</Label>
+-                  <Select id="industry" defaultValue="">
+-                    <option value="" disabled>Select industry</option>
+-                    <option>Cloud Infrastructure</option>
+-                    <option>Retail</option>
+-                    <option>Manufacturing</option>
+-                    <option>BFSI</option>
+-                    <option>Healthcare</option>
+-                    <option>SaaS</option>
+-                    <option>Other</option>
+-                  </Select>
+-                </div>
++          {status === "sent" ? (
++            <div className="flex flex-col items-center gap-3 py-6 text-center">
++              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-verified-bg text-verified">
++                <CheckCircle2 className="h-6 w-6" />
++              </div>
++              <p className="text-sm font-medium text-foreground">Check your email</p>
++              <p className="max-w-xs text-sm text-muted">
++                We sent a verification link to <span className="font-medium text-foreground">{email}</span>. Open it on this device
++                — we&apos;ll take you straight to {role === "vendor" ? "vendor onboarding" : "discovery"}.
++              </p>
++              <button type="button" onClick={() => setStatus("idle")} className="mt-2 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                Use a different email
++              </button>
++            </div>
++          ) : (
++            <>
++              <div className="mb-5 grid grid-cols-2 gap-2 rounded-xl border border-border bg-surface-2 p-1">
++                <RoleTab active={role === "buyer"} onClick={() => setRole("buyer")} icon={ShoppingBag} label="I'm a Buyer" />
++                <RoleTab active={role === "vendor"} onClick={() => setRole("vendor")} icon={Building2} label="I'm a Vendor" />
++              </div>
++
++              <form onSubmit={handleSubmit} className="space-y-4">
+                 <div>
+-                  <Label htmlFor="work-email">Work email</Label>
+-                  <Input id="work-email" type="email" placeholder="you@company.com" required />
++                  <Label htmlFor="email">Work email</Label>
++                  <div className="relative">
++                    <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
++                    <Input
++                      id="email"
++                      type="email"
++                      placeholder="you@company.com"
++                      value={email}
++                      onChange={(e) => setEmail(e.target.value)}
++                      className="pl-9"
++                      required
++                    />
++                  </div>
+                 </div>
+-                <div className="flex gap-2 pt-2">
+-                  <Button type="button" variant="secondary" onClick={() => setStep(1)}>
+-                    <ArrowLeft className="h-4 w-4" /> Back
+-                  </Button>
+-                  <Button type="submit" className="flex-1" loading={loading}>
+-                    Create {role} workspace <ArrowRight className="h-4 w-4" />
+-                  </Button>
+-                </div>
+-              </motion.form>
+-            )}
+-          </AnimatePresence>
++
++                {status === "error" && error && (
++                  <div className="flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
++                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
++                    {error}
++                  </div>
++                )}
++
++                <Button type="submit" className="w-full" loading={status === "sending"}>
++                  Continue as {role === "vendor" ? "Vendor" : "Buyer"} <ArrowRight className="h-4 w-4" />
++                </Button>
++              </form>
++            </>
++          )}
+ 
+           <p className="mt-6 text-center text-sm text-muted">
+             Already have an account?{" "}
+@@ -133,37 +115,17 @@ export default function SignupPage() {
+   );
+ }
+ 
+-function RoleCard({ icon: Icon, title, desc, active, onClick }: { icon: React.ElementType; title: string; desc: string; active: boolean; onClick: () => void }) {
++function RoleTab({ active, onClick, icon: Icon, label }: { active: boolean; onClick: () => void; icon: React.ElementType; label: string }) {
+   return (
+     <button
+       type="button"
+       onClick={onClick}
+       className={cn(
+-        "flex flex-col items-start gap-2 rounded-xl border p-4 text-left transition-all",
+-        active ? "border-brand-500 bg-brand-50 ring-2 ring-brand-500/20 dark:bg-brand-950/30" : "border-border bg-surface hover:border-border-strong"
++        "flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-medium transition-all",
++        active ? "bg-surface text-foreground shadow-sm" : "text-muted hover:text-foreground"
+       )}
+     >
+-      <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg", active ? "bg-brand-600 text-white" : "bg-surface-2 text-muted")}>
+-        <Icon className="h-4 w-4" />
+-      </div>
+-      <p className="text-sm font-semibold text-foreground">{title}</p>
+-      <p className="text-xs text-muted">{desc}</p>
++      <Icon className="h-3.5 w-3.5" /> {label}
+     </button>
+   );
+ }
+-
+-function Step({ number, label, active, done }: { number: number; label: string; active: boolean; done: boolean }) {
+-  return (
+-    <div className="flex items-center gap-2">
+-      <div
+-        className={cn(
+-          "flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold",
+-          done ? "bg-brand-600 text-white" : active ? "bg-brand-100 text-brand-700 dark:bg-brand-950 dark:text-brand-300" : "bg-surface-2 text-subtle"
+-        )}
+-      >
+-        {done ? <Check className="h-3.5 w-3.5" /> : number}
+-      </div>
+-      <span className={cn("text-xs font-medium", active || done ? "text-foreground" : "text-subtle")}>{label}</span>
+-    </div>
+-  );
+-}
+diff --git a/src/app/admin/layout.tsx b/src/app/admin/layout.tsx
+index c14727b..7c36682 100644
+--- a/src/app/admin/layout.tsx
++++ b/src/app/admin/layout.tsx
+@@ -2,6 +2,8 @@
+ 
+ import { LayoutDashboard, Building2, Users, FileClock, Settings } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { useRequireAdmin } from "@/lib/hooks/use-require-admin";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -24,6 +26,19 @@ const sections: NavSection[] = [
+ ];
+ 
+ export default function AdminLayout({ children }: { children: React.ReactNode }) {
++  // Being logged in isn't enough here — the email must also be on
++  // admin_allowlist (verified server-side by resolve-account-session via
++  // useRequireAdmin), unlike buyer/vendor which only need any real session.
++  const { ready } = useRequireAdmin();
++
++  if (!ready) {
++    return (
++      <div className="flex min-h-screen items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Checking your access" description="One moment…" />
++      </div>
++    );
++  }
++
+   return (
+     <PortalShell role="admin" sections={sections} userName="Platform Admin" userRole="Super Admin">
+       {children}
+diff --git a/src/app/auth/callback/page.tsx b/src/app/auth/callback/page.tsx
+new file mode 100644
+index 0000000..f17157f
+--- /dev/null
++++ b/src/app/auth/callback/page.tsx
+@@ -0,0 +1,100 @@
++"use client";
++
++import { Suspense, useEffect, useRef, useState } from "react";
++import { useRouter, useSearchParams } from "next/navigation";
++import { AlertTriangle } from "lucide-react";
++import { Card } from "@/components/ui/card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { getSupabaseClient } from "@/lib/supabase-client";
++import { resolveAccountSession } from "@/lib/api/account";
++import { setStoredBuyerId, setStoredCompanyName } from "@/lib/buyer-session";
++import { setStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
++
++// Lands here right after the magic-link email is opened. supabase-js's
++// browser client auto-detects the session from the URL (detectSessionInUrl
++// in supabase-client.ts) as soon as it initializes, so this page just waits
++// for that SIGNED_IN event, then asks resolve-account-session which
++// business record (if any) this verified email is linked to and routes
++// accordingly — admin takes priority since an allow-listed email is always
++// meant for /admin regardless of which role tab was picked at /login.
++function CallbackInner() {
++  const router = useRouter();
++  const searchParams = useSearchParams();
++  const roleHint = searchParams.get("role") === "vendor" ? "vendor" : "buyer";
++  const [error, setError] = useState<string | null>(null);
++  const resolvedOnce = useRef(false);
++
++  useEffect(() => {
++    const supabase = getSupabaseClient();
++
++    async function resolve() {
++      if (resolvedOnce.current) return;
++      resolvedOnce.current = true;
++      try {
++        const result = await resolveAccountSession();
++        if (result.isAdmin) {
++          router.replace("/admin");
++        } else if (result.buyer) {
++          setStoredBuyerId(result.buyer.id);
++          setStoredCompanyName(result.buyer.companyName);
++          router.replace("/buyer");
++        } else if (result.vendor) {
++          setStoredVendorId(result.vendor.id);
++          setStoredVendorName(result.vendor.companyName);
++          router.replace("/vendor");
++        } else if (roleHint === "vendor") {
++          router.replace("/vendor/onboarding");
++        } else {
++          router.replace("/buyer/discover");
++        }
++      } catch (err) {
++        setError(err instanceof Error ? err.message : "Could not complete sign-in.");
++      }
++    }
++
++    // If the session is already there (fast case), resolve immediately;
++    // otherwise wait for the SIGNED_IN event supabase-js fires once it's
++    // finished parsing the magic-link tokens out of the URL.
++    supabase.auth.getSession().then(({ data }) => {
++      if (data.session) resolve();
++    });
++    const { data: subscription } = supabase.auth.onAuthStateChange((event) => {
++      if (event === "SIGNED_IN") resolve();
++    });
++
++    const timeout = setTimeout(() => {
++      if (!resolvedOnce.current) setError("This sign-in link is invalid or has expired. Please request a new one.");
++    }, 15000);
++
++    return () => {
++      subscription.subscription.unsubscribe();
++      clearTimeout(timeout);
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  if (error) {
++    return (
++      <Card className="max-w-md p-6 text-center">
++        <AlertTriangle className="mx-auto h-6 w-6 text-escalated" />
++        <p className="mt-3 text-sm font-medium text-foreground">Sign-in failed</p>
++        <p className="mt-1 text-sm text-muted">{error}</p>
++        <a href="/login" className="mt-4 inline-block text-sm font-medium text-brand-600 hover:underline dark:text-brand-400">
++          Back to sign in
++        </a>
++      </Card>
++    );
++  }
++
++  return <AgentWaitingState variant="fullpage" title="Signing you in" description="Verifying your link and finding your workspace." />;
++}
++
++export default function AuthCallbackPage() {
++  return (
++    <div className="flex min-h-screen items-center justify-center px-4">
++      <Suspense fallback={<AgentWaitingState variant="fullpage" title="Signing you in" description="Verifying your link and finding your workspace." />}>
++        <CallbackInner />
++      </Suspense>
++    </div>
++  );
++}
+diff --git a/src/app/buyer/discover/page.tsx b/src/app/buyer/discover/page.tsx
+index d655fd2..310c14b 100644
+--- a/src/app/buyer/discover/page.tsx
++++ b/src/app/buyer/discover/page.tsx
+@@ -22,6 +22,7 @@ import {
+   setStoredCompanyName,
+ } from "@/lib/buyer-session";
+ import { getBuyerRequirements, getClientRealityProfile, linkBuyerWorkflowRun, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
++import { linkBuyerAccount } from "@/lib/api/account";
+ import { POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn } from "@/lib/utils";
+@@ -133,6 +134,7 @@ export default function DiscoverPage() {
+         setBuyerId(existingBuyerId);
+         setStage("ready");
+         if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, existingBuyerId);
++        linkBuyerAccount(existingBuyerId).catch(() => {});
+         return;
+       }
+ 
+@@ -149,6 +151,7 @@ export default function DiscoverPage() {
+           clearPendingBuyerSubmission();
+           setStage("ready");
+           if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, id);
++          linkBuyerAccount(id).catch(() => {});
+         },
+         () => setStage("timed-out")
+       );
+@@ -177,6 +180,7 @@ export default function DiscoverPage() {
+         // most recent stored run id is the one this submission created.
+         const [mostRecentRunId] = getStoredBuyerWorkflowRunIds();
+         if (mostRecentRunId) linkBuyerWorkflowRun(mostRecentRunId, id);
++        linkBuyerAccount(id).catch(() => {});
+       },
+       () => setStage("timed-out")
+     );
+diff --git a/src/app/buyer/layout.tsx b/src/app/buyer/layout.tsx
+index 6280ee6..6376b71 100644
+--- a/src/app/buyer/layout.tsx
++++ b/src/app/buyer/layout.tsx
+@@ -9,12 +9,15 @@ import {
+   SlidersHorizontal,
+   MessageSquareText,
+   CalendarClock,
++  UserCircle,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+ import { PageTransition } from "@/components/layout/page-transition";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { AgentStatusPill } from "@/components/shared/agent-status-pill";
+ import { GlobalCapabilitySearch } from "@/components/shared/global-capability-search";
+ import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
++import { useRequireAuth } from "@/lib/hooks/use-require-auth";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -40,6 +43,10 @@ const sections: NavSection[] = [
+     title: "Closure",
+     items: [{ href: "/buyer/handoff", label: "Expert handoff", icon: CalendarClock }],
+   },
++  {
++    title: "Account",
++    items: [{ href: "/buyer/profile", label: "Profile", icon: UserCircle }],
++  },
+ ];
+ 
+ export default function BuyerLayout({ children }: { children: React.ReactNode }) {
+@@ -50,6 +57,15 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
+   // unmounts while the buyer navigates the portal — it needs to notice
+   // buyerId/companyName appearing mid-session, not just at first paint.
+   const { companyName, buyerId } = useBuyerSession();
++  const { ready } = useRequireAuth();
++
++  if (!ready) {
++    return (
++      <div className="flex min-h-screen items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Checking your session" description="One moment…" />
++      </div>
++    );
++  }
+ 
+   return (
+     <PortalShell
+diff --git a/src/app/buyer/profile/page.tsx b/src/app/buyer/profile/page.tsx
+new file mode 100644
+index 0000000..4d66916
+--- /dev/null
++++ b/src/app/buyer/profile/page.tsx
+@@ -0,0 +1,214 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { CheckCircle2, Circle, Mail, Save } from "lucide-react";
++import { PageHeader } from "@/components/layout/page-header";
++import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
++import { Input, Label, Select } from "@/components/ui/input";
++import { Button, buttonVariants } from "@/components/ui/button";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
++import { useAuthSession } from "@/lib/hooks/use-auth-session";
++import { getBuyer, getBuyerRequirements, getActiveVendorSelection, getBuyerWorkflowRunHistory, type BuyerRow } from "@/lib/api/buyer-lookup";
++import { updateBuyerProfile } from "@/lib/api/account";
++import { cn } from "@/lib/utils";
++
++const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
++
++export default function BuyerProfilePage() {
++  const { buyerId } = useBuyerSession();
++  const { email } = useAuthSession();
++
++  const [buyer, setBuyer] = useState<BuyerRow | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [saving, setSaving] = useState(false);
++  const [saved, setSaved] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const [companyName, setCompanyName] = useState("");
++  const [industry, setIndustry] = useState("");
++  const [companySize, setCompanySize] = useState("");
++  const [contactName, setContactName] = useState("");
++  const [contactRole, setContactRole] = useState("");
++
++  const [hasRequirements, setHasRequirements] = useState(false);
++  const [hasVendor, setHasVendor] = useState(false);
++  const [hasCompletedRun, setHasCompletedRun] = useState(false);
++
++  useEffect(() => {
++    if (!buyerId) {
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    async function load() {
++      try {
++        const [b, reqs, selection, runs] = await Promise.all([
++          getBuyer(buyerId!),
++          getBuyerRequirements(buyerId!),
++          getActiveVendorSelection(buyerId!),
++          getBuyerWorkflowRunHistory(buyerId!, 5),
++        ]);
++        if (cancelled) return;
++        if (b) {
++          setBuyer(b);
++          setCompanyName(b.companyName);
++          setIndustry(b.industry ?? industryOptions[0]);
++          setCompanySize(b.companySize ? String(b.companySize) : "");
++          setContactName(b.contactName ?? "");
++          setContactRole(b.contactRole ?? "");
++        }
++        setHasRequirements(reqs.length > 0);
++        setHasVendor(!!selection);
++        setHasCompletedRun(runs.some((r) => r.status === "completed"));
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    return () => {
++      cancelled = true;
++    };
++  }, [buyerId]);
++
++  async function handleSave(e: React.FormEvent) {
++    e.preventDefault();
++    setSaving(true);
++    setError(null);
++    setSaved(false);
++    try {
++      const updated = await updateBuyerProfile({
++        companyName: companyName.trim(),
++        industry,
++        companySize: companySize.trim() ? Number(companySize) : undefined,
++        contactName: contactName.trim(),
++        contactRole: contactRole.trim(),
++      });
++      setBuyer((prev) => (prev ? { ...prev, companyName: updated.companyName, industry: updated.industry, companySize: updated.companySize, contactName: updated.contactName, contactRole: updated.contactRole } : prev));
++      setSaved(true);
++      setTimeout(() => setSaved(false), 3000);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not save changes.");
++    } finally {
++      setSaving(false);
++    }
++  }
++
++  if (!buyerId) {
++    return (
++      <div>
++        <PageHeader eyebrow="Account" title="Your profile" description="Start a discovery submission first." />
++        <Card className="max-w-md p-6 text-center">
++          <p className="text-sm text-muted">No buyer record linked to your account yet.</p>
++          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Go to Discover
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (loading) {
++    return (
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading your profile" />
++      </div>
++    );
++  }
++
++  const checklist = [
++    { label: "Discovery submitted", done: hasRequirements },
++    { label: "Vendor selected", done: hasVendor },
++    { label: "A solution run completed", done: hasCompletedRun },
++  ];
++
++  return (
++    <div>
++      <PageHeader eyebrow="Account" title="Your profile" description="Manage your company details and see where you are in the process." />
++
++      <div className="grid gap-6 lg:grid-cols-3">
++        <Card className="lg:col-span-2">
++          <CardHeader>
++            <CardTitle>Company details</CardTitle>
++            <CardDescription>Visible to the vendor you&apos;re working with.</CardDescription>
++          </CardHeader>
++          <CardContent>
++            <form onSubmit={handleSave} className="space-y-4">
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="companyName">Company name</Label>
++                  <Input id="companyName" value={companyName} onChange={(e) => setCompanyName(e.target.value)} required />
++                </div>
++                <div>
++                  <Label htmlFor="industry">Industry</Label>
++                  <Select id="industry" value={industry} onChange={(e) => setIndustry(e.target.value)}>
++                    {industryOptions.map((opt) => (
++                      <option key={opt}>{opt}</option>
++                    ))}
++                  </Select>
++                </div>
++              </div>
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="companySize">Company size</Label>
++                  <Input id="companySize" type="number" min={1} value={companySize} onChange={(e) => setCompanySize(e.target.value)} placeholder="500" />
++                </div>
++                <div>
++                  <Label htmlFor="contactName">Your name</Label>
++                  <Input id="contactName" value={contactName} onChange={(e) => setContactName(e.target.value)} />
++                </div>
++              </div>
++              <div>
++                <Label htmlFor="contactRole">Your role</Label>
++                <Input id="contactRole" value={contactRole} onChange={(e) => setContactRole(e.target.value)} placeholder="VP of Technology" />
++              </div>
++
++              {error && <p className="text-sm text-escalated">{error}</p>}
++
++              <div className="flex items-center gap-3 pt-2">
++                <Button type="submit" loading={saving} disabled={saving}>
++                  <Save className="h-4 w-4" /> Save changes
++                </Button>
++                {saved && <span className="text-sm text-verified">Saved.</span>}
++              </div>
++            </form>
++          </CardContent>
++        </Card>
++
++        <div className="space-y-6">
++          <Card>
++            <CardHeader>
++              <CardTitle className="text-sm">Account</CardTitle>
++            </CardHeader>
++            <CardContent className="pt-2">
++              <p className="flex items-center gap-2 text-sm text-muted">
++                <Mail className="h-3.5 w-3.5" /> {email ?? "—"}
++              </p>
++              {!buyer?.email && (
++                <p className="mt-2 text-xs text-subtle">This buyer record isn&apos;t linked to your login email yet — it links automatically the next time you submit a discovery form.</p>
++              )}
++            </CardContent>
++          </Card>
++
++          <Card>
++            <CardHeader>
++              <CardTitle className="text-sm">Your progress</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-3 pt-2">
++              {checklist.map((item) => (
++                <div key={item.label} className="flex items-center gap-2.5 text-sm">
++                  {item.done ? <CheckCircle2 className="h-4 w-4 shrink-0 text-verified" /> : <Circle className="h-4 w-4 shrink-0 text-subtle" />}
++                  <span className={item.done ? "text-foreground" : "text-muted"}>{item.label}</span>
++                </div>
++              ))}
++              <Link href="/buyer" className="mt-2 inline-block text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                View full dashboard
++              </Link>
++            </CardContent>
++          </Card>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/app/vendor/layout.tsx b/src/app/vendor/layout.tsx
+index 8744f01..793c70c 100644
+--- a/src/app/vendor/layout.tsx
++++ b/src/app/vendor/layout.tsx
+@@ -10,8 +10,11 @@ import {
+   CalendarClock,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
+ import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
++import { useRequireAuth } from "@/lib/hooks/use-require-auth";
++import { UserCircle } from "lucide-react";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -32,6 +35,10 @@ const sections: NavSection[] = [
+       { href: "/vendor/meetings", label: "Meetings", icon: CalendarClock },
+     ],
+   },
++  {
++    title: "Account",
++    items: [{ href: "/vendor/profile", label: "Profile", icon: UserCircle }],
++  },
+ ];
+ 
+ export default function VendorLayout({ children }: { children: React.ReactNode }) {
+@@ -42,6 +49,7 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
+   const [vendorName, setVendorName] = useState<string | null>(null);
+   const [vendorId, setVendorId] = useState<string | null>(null);
+   const [openFrontier, setOpenFrontier] = useState<number | undefined>(undefined);
++  const { ready } = useRequireAuth();
+ 
+   useEffect(() => {
+     const id = getStoredVendorId();
+@@ -72,6 +80,14 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
+     ),
+   }));
+ 
++  if (!ready) {
++    return (
++      <div className="flex min-h-screen items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Checking your session" description="One moment…" />
++      </div>
++    );
++  }
++
+   return (
+     <PortalShell
+       role="vendor"
+diff --git a/src/app/vendor/onboarding/page.tsx b/src/app/vendor/onboarding/page.tsx
+index 87c049c..634deb5 100644
+--- a/src/app/vendor/onboarding/page.tsx
++++ b/src/app/vendor/onboarding/page.tsx
+@@ -17,6 +17,7 @@ import {
+   setStoredVendorName,
+ } from "@/lib/vendor-session";
+ import { countDraftCapabilities } from "@/lib/api/vendor-lookup";
++import { linkVendorAccount } from "@/lib/api/account";
+ import { POLL_TIMEOUT_MS, pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
+ 
+ const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
+@@ -103,6 +104,7 @@ export default function VendorOnboardingPage() {
+       // where this leaves off if the vendor navigates away early — this
+       // page's own poll dies with the component on unmount.
+       if (existingVendorId) {
++        linkVendorAccount(existingVendorId).catch(() => {});
+         setPendingSubmission({ kind: "existing-vendor", vendorId: existingVendorId, baseline, deadline });
+         pollHandleRef.current = pollForNewCapabilities(
+           existingVendorId,
+@@ -122,6 +124,7 @@ export default function VendorOnboardingPage() {
+           deadline,
+           (vendorId) => {
+             setStoredVendorId(vendorId);
++            linkVendorAccount(vendorId).catch(() => {});
+             clearPendingSubmission();
+             router.push("/vendor/solution-dna");
+           },
+diff --git a/src/app/vendor/profile/page.tsx b/src/app/vendor/profile/page.tsx
+new file mode 100644
+index 0000000..df77200
+--- /dev/null
++++ b/src/app/vendor/profile/page.tsx
+@@ -0,0 +1,236 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { CheckCircle2, Circle, Mail, Save } from "lucide-react";
++import { PageHeader } from "@/components/layout/page-header";
++import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
++import { Input, Label, Select, Textarea } from "@/components/ui/input";
++import { Button, buttonVariants } from "@/components/ui/button";
++import { Badge } from "@/components/ui/badge";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { useAuthSession } from "@/lib/hooks/use-auth-session";
++import { getVendorById, getVendorRecommendationsForVendor, countDraftCapabilities, type VendorDetailRow } from "@/lib/api/vendor-lookup";
++import { updateVendorProfile } from "@/lib/api/account";
++import { getStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
++import { cn } from "@/lib/utils";
++
++const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
++
++export default function VendorProfilePage() {
++  const vendorId = getStoredVendorId();
++  const { email } = useAuthSession();
++
++  const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [saving, setSaving] = useState(false);
++  const [saved, setSaved] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const [companyName, setCompanyName] = useState("");
++  const [industry, setIndustry] = useState("");
++  const [website, setWebsite] = useState("");
++  const [tagline, setTagline] = useState("");
++  const [description, setDescription] = useState("");
++  const [hq, setHq] = useState("");
++  const [employeeRange, setEmployeeRange] = useState("");
++
++  const [capabilityCount, setCapabilityCount] = useState(0);
++  const [buyerCount, setBuyerCount] = useState(0);
++
++  useEffect(() => {
++    if (!vendorId) {
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    async function load() {
++      try {
++        const [v, recs, capCount] = await Promise.all([
++          getVendorById(vendorId!),
++          getVendorRecommendationsForVendor(vendorId!),
++          countDraftCapabilities(vendorId!).catch(() => 0),
++        ]);
++        if (cancelled) return;
++        if (v) {
++          setVendor(v);
++          setCompanyName(v.companyName);
++          setIndustry(v.industry ?? industryOptions[0]);
++          setWebsite(v.website ?? "");
++          setTagline(v.tagline ?? "");
++          setDescription(v.description ?? "");
++          setHq(v.hq ?? "");
++          setEmployeeRange(v.employeeRange ?? "");
++        }
++        setBuyerCount(recs.length);
++        setCapabilityCount(capCount);
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    return () => {
++      cancelled = true;
++    };
++  }, [vendorId]);
++
++  async function handleSave(e: React.FormEvent) {
++    e.preventDefault();
++    setSaving(true);
++    setError(null);
++    setSaved(false);
++    try {
++      const updated = await updateVendorProfile({
++        companyName: companyName.trim(),
++        industry,
++        website: website.trim(),
++        tagline: tagline.trim(),
++        description: description.trim(),
++        hq: hq.trim(),
++        employeeRange: employeeRange.trim(),
++      });
++      setVendor((prev) =>
++        prev
++          ? { ...prev, companyName: updated.companyName, industry: updated.industry, website: updated.website, tagline: updated.tagline, description: updated.description, hq: updated.hq, employeeRange: updated.employeeRange }
++          : prev
++      );
++      setStoredVendorName(updated.companyName);
++      setSaved(true);
++      setTimeout(() => setSaved(false), 3000);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not save changes.");
++    } finally {
++      setSaving(false);
++    }
++  }
++
++  if (!vendorId) {
++    return (
++      <div>
++        <PageHeader eyebrow="Account" title="Your profile" description="Register your solution first." />
++        <Card className="max-w-md p-6 text-center">
++          <p className="text-sm text-muted">No vendor record linked to your account yet.</p>
++          <Link href="/vendor/onboarding" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Go to onboarding
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (loading) {
++    return (
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading your profile" />
++      </div>
++    );
++  }
++
++  const checklist = [
++    { label: "Sources submitted", done: capabilityCount > 0 },
++    { label: "Capabilities published", done: vendor?.verificationStatus === "verified" },
++    { label: "Engaging with buyers", done: buyerCount > 0 },
++  ];
++
++  return (
++    <div>
++      <PageHeader eyebrow="Account" title="Your profile" description="Manage your company details and see where you are in the process." />
++
++      <div className="grid gap-6 lg:grid-cols-3">
++        <Card className="lg:col-span-2">
++          <CardHeader>
++            <CardTitle>Company details</CardTitle>
++            <CardDescription>Shown to buyers browsing the vendor catalog.</CardDescription>
++          </CardHeader>
++          <CardContent>
++            <form onSubmit={handleSave} className="space-y-4">
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="companyName">Company name</Label>
++                  <Input id="companyName" value={companyName} onChange={(e) => setCompanyName(e.target.value)} required />
++                </div>
++                <div>
++                  <Label htmlFor="industry">Primary industry</Label>
++                  <Select id="industry" value={industry} onChange={(e) => setIndustry(e.target.value)}>
++                    {industryOptions.map((opt) => (
++                      <option key={opt}>{opt}</option>
++                    ))}
++                  </Select>
++                </div>
++              </div>
++              <div>
++                <Label htmlFor="tagline">Tagline</Label>
++                <Input id="tagline" value={tagline} onChange={(e) => setTagline(e.target.value)} placeholder="Cloud transformation, verified end to end." />
++              </div>
++              <div>
++                <Label htmlFor="description">Description</Label>
++                <Textarea id="description" rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />
++              </div>
++              <div className="grid gap-4 sm:grid-cols-2">
++                <div>
++                  <Label htmlFor="website">Website</Label>
++                  <Input id="website" value={website} onChange={(e) => setWebsite(e.target.value)} placeholder="https://yourcompany.com" />
++                </div>
++                <div>
++                  <Label htmlFor="hq">Headquarters</Label>
++                  <Input id="hq" value={hq} onChange={(e) => setHq(e.target.value)} placeholder="Bengaluru, India" />
++                </div>
++              </div>
++              <div>
++                <Label htmlFor="employeeRange">Company size</Label>
++                <Input id="employeeRange" value={employeeRange} onChange={(e) => setEmployeeRange(e.target.value)} placeholder="500-1,000" />
++              </div>
++
++              {error && <p className="text-sm text-escalated">{error}</p>}
++
++              <div className="flex items-center gap-3 pt-2">
++                <Button type="submit" loading={saving} disabled={saving}>
++                  <Save className="h-4 w-4" /> Save changes
++                </Button>
++                {saved && <span className="text-sm text-verified">Saved.</span>}
++              </div>
++            </form>
++          </CardContent>
++        </Card>
++
++        <div className="space-y-6">
++          <Card>
++            <CardHeader>
++              <CardTitle className="text-sm">Account</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-2 pt-2">
++              <p className="flex items-center gap-2 text-sm text-muted">
++                <Mail className="h-3.5 w-3.5" /> {email ?? "—"}
++              </p>
++              {vendor && (
++                <Badge variant={vendor.verificationStatus === "verified" ? "verified" : "modelled"} size="sm" className="capitalize">
++                  {vendor.verificationStatus}
++                </Badge>
++              )}
++              {!vendor?.email && (
++                <p className="text-xs text-subtle">This vendor record isn&apos;t linked to your login email yet — it links automatically the next time you submit sources.</p>
++              )}
++            </CardContent>
++          </Card>
++
++          <Card>
++            <CardHeader>
++              <CardTitle className="text-sm">Your progress</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-3 pt-2">
++              {checklist.map((item) => (
++                <div key={item.label} className="flex items-center gap-2.5 text-sm">
++                  {item.done ? <CheckCircle2 className="h-4 w-4 shrink-0 text-verified" /> : <Circle className="h-4 w-4 shrink-0 text-subtle" />}
++                  <span className={item.done ? "text-foreground" : "text-muted"}>{item.label}</span>
++                </div>
++              ))}
++              <Link href="/vendor" className="mt-2 inline-block text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                View full dashboard
++              </Link>
++            </CardContent>
++          </Card>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/layout/portal-shell.tsx b/src/components/layout/portal-shell.tsx
+index 8775e45..60a6ae9 100644
+--- a/src/components/layout/portal-shell.tsx
++++ b/src/components/layout/portal-shell.tsx
+@@ -2,7 +2,8 @@
+ 
+ import { useState } from "react";
+ import Link from "next/link";
+-import { Menu, Sparkles } from "lucide-react";
++import { useRouter } from "next/navigation";
++import { LogOut, Menu, Sparkles } from "lucide-react";
+ import type { LucideIcon } from "lucide-react";
+ import { NavLink } from "@/components/layout/nav-link";
+ import { RoleSwitcher } from "@/components/layout/role-switcher";
+@@ -10,6 +11,9 @@ import { NotificationsMenu } from "@/components/layout/notifications-menu";
+ import { ThemeToggle } from "@/components/theme-toggle";
+ import { Avatar } from "@/components/ui/avatar";
+ import { Drawer } from "@/components/ui/drawer";
++import { getSupabaseClient } from "@/lib/supabase-client";
++import { clearBuyerSession } from "@/lib/buyer-session";
++import { clearStoredVendorId } from "@/lib/vendor-session";
+ 
+ export interface NavSection {
+   title?: string;
+@@ -44,6 +48,20 @@ export function PortalShell({
+   children: React.ReactNode;
+ }) {
+   const [mobileOpen, setMobileOpen] = useState(false);
++  const [signingOut, setSigningOut] = useState(false);
++  const router = useRouter();
++
++  async function handleSignOut() {
++    setSigningOut(true);
++    try {
++      await getSupabaseClient().auth.signOut();
++    } catch {
++      // best-effort — clear local session state regardless
++    }
++    clearBuyerSession();
++    clearStoredVendorId();
++    router.push("/login");
++  }
+ 
+   const navContent = (onNavigate?: () => void) => (
+     <div className="flex h-full flex-col">
+@@ -80,6 +98,15 @@ export function PortalShell({
+             <p className="truncate text-sm font-medium text-foreground">{userName}</p>
+             <p className="truncate text-xs text-muted">{userRole}</p>
+           </div>
++          <button
++            onClick={handleSignOut}
++            disabled={signingOut}
++            title="Sign out"
++            aria-label="Sign out"
++            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-surface-2 hover:text-escalated disabled:opacity-50"
++          >
++            <LogOut className="h-4 w-4" />
++          </button>
+         </div>
+       </div>
+     </div>
+diff --git a/src/lib/api/account.ts b/src/lib/api/account.ts
+new file mode 100644
+index 0000000..a6e9d6b
+--- /dev/null
++++ b/src/lib/api/account.ts
+@@ -0,0 +1,100 @@
++// Calls the 5 auth-gated edge functions (resolve-account-session,
++// link-buyer-account, link-vendor-account, update-buyer-profile,
++// update-vendor-profile) — unlike every other edge-function call in this
++// codebase (see buyer-lookup.ts, vendor-frontier.ts), these send the
++// signed-in user's own access token as the Authorization header, not the
++// anon key, because they're deployed with verify_jwt:true and need a real
++// user identity to resolve/link/edit against.
++import { getSupabaseClient } from "@/lib/supabase-client";
++
++const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
++
++async function callAuthedFunction<T>(slug: string, body: unknown): Promise<T> {
++  if (!SUPABASE_URL) throw new Error("Supabase is not configured.");
++  const supabase = getSupabaseClient();
++  const { data: sessionData } = await supabase.auth.getSession();
++  const token = sessionData.session?.access_token;
++  if (!token) throw new Error("Not signed in.");
++
++  const res = await fetch(`${SUPABASE_URL}/functions/v1/${slug}`, {
++    method: "POST",
++    cache: "no-store",
++    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
++    body: JSON.stringify(body),
++  });
++  const data = await res.json().catch(() => ({}) as Record<string, unknown>);
++  if (!res.ok) throw new Error(typeof data?.error === "string" ? data.error : `${slug} failed (${res.status}).`);
++  return data as T;
++}
++
++export interface ResolvedAccountSession {
++  email: string;
++  buyer: { id: string; companyName: string } | null;
++  vendor: { id: string; companyName: string } | null;
++  isAdmin: boolean;
++}
++
++export function resolveAccountSession(): Promise<ResolvedAccountSession> {
++  return callAuthedFunction<ResolvedAccountSession>("resolve-account-session", {});
++}
++
++export function linkBuyerAccount(buyerId: string): Promise<{ linked: boolean; alreadyLinked: boolean }> {
++  return callAuthedFunction("link-buyer-account", { buyerId });
++}
++
++export function linkVendorAccount(vendorId: string): Promise<{ linked: boolean; alreadyLinked: boolean }> {
++  return callAuthedFunction("link-vendor-account", { vendorId });
++}
++
++export interface UpdateBuyerProfileInput {
++  companyName?: string;
++  industry?: string;
++  companySize?: number;
++  contactName?: string;
++  contactRole?: string;
++}
++
++export interface BuyerProfile {
++  id: string;
++  companyName: string;
++  industry: string | null;
++  companySize: number | null;
++  contactName: string | null;
++  contactRole: string | null;
++  email: string | null;
++}
++
++export function updateBuyerProfile(input: UpdateBuyerProfileInput): Promise<BuyerProfile> {
++  return callAuthedFunction<BuyerProfile>("update-buyer-profile", input);
++}
++
++export interface UpdateVendorProfileInput {
++  companyName?: string;
++  industry?: string;
++  industries?: string[];
++  website?: string;
++  tagline?: string;
++  description?: string;
++  employeeRange?: string;
++  hq?: string;
++  foundedYear?: number;
++}
++
++export interface VendorProfile {
++  id: string;
++  companyName: string;
++  industry: string | null;
++  industries: string[];
++  website: string | null;
++  tagline: string | null;
++  description: string | null;
++  employeeRange: string | null;
++  hq: string | null;
++  foundedYear: number | null;
++  verificationStatus: string;
++  email: string | null;
++}
++
++export function updateVendorProfile(input: UpdateVendorProfileInput): Promise<VendorProfile> {
++  return callAuthedFunction<VendorProfile>("update-vendor-profile", input);
++}
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index 3f0a8ad..ae4e698 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -44,6 +44,7 @@ export interface BuyerRow {
+   companySize: number | null;
+   contactName: string | null;
+   contactRole: string | null;
++  email: string | null;
+   createdAt: string;
+ }
+ 
+@@ -54,14 +55,14 @@ export interface BuyerRow {
+ // no buyerId of its own).
+ export async function findBuyerCreatedAfter(companyName: string, afterIso: string): Promise<BuyerRow | null> {
+   const params = new URLSearchParams({
+-    select: "id,company_name,industry,company_size,contact_name,contact_role,created_at",
++    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
+     company_name: `eq.${companyName}`,
+     created_at: `gt.${afterIso}`,
+     order: "created_at.asc",
+     limit: "1",
+   });
+   const rows = await restGet<
+-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; created_at: string }[]
++    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
+   >(`buyers?${params}`);
+   const row = rows[0];
+   if (!row) return null;
+@@ -72,18 +73,19 @@ export async function findBuyerCreatedAfter(companyName: string, afterIso: strin
+     companySize: row.company_size,
+     contactName: row.contact_name,
+     contactRole: row.contact_role,
++    email: row.email,
+     createdAt: row.created_at,
+   };
+ }
+ 
+ export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
+   const params = new URLSearchParams({
+-    select: "id,company_name,industry,company_size,contact_name,contact_role,created_at",
++    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
+     id: `eq.${buyerId}`,
+     limit: "1",
+   });
+   const rows = await restGet<
+-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; created_at: string }[]
++    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
+   >(`buyers?${params}`);
+   const row = rows[0];
+   if (!row) return null;
+@@ -94,6 +96,7 @@ export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
+     companySize: row.company_size,
+     contactName: row.contact_name,
+     contactRole: row.contact_role,
++    email: row.email,
+     createdAt: row.created_at,
+   };
+ }
+diff --git a/src/lib/api/vendor-lookup.ts b/src/lib/api/vendor-lookup.ts
+index eb41c86..f1b1cb5 100644
+--- a/src/lib/api/vendor-lookup.ts
++++ b/src/lib/api/vendor-lookup.ts
+@@ -77,6 +77,7 @@ export interface VendorDetailRow {
+   hq: string | null;
+   foundedYear: number | null;
+   verificationStatus: string;
++  email: string | null;
+   createdAt: string;
+ }
+ 
+@@ -92,6 +93,7 @@ function mapVendorRow(row: {
+   hq: string | null;
+   founded_year: number | null;
+   verification_status: string;
++  email: string | null;
+   created_at: string;
+ }): VendorDetailRow {
+   return {
+@@ -106,12 +108,13 @@ function mapVendorRow(row: {
+     hq: row.hq,
+     foundedYear: row.founded_year,
+     verificationStatus: row.verification_status,
++    email: row.email,
+     createdAt: row.created_at,
+   };
+ }
+ 
+ const VENDOR_SELECT =
+-  "id,company_name,industry,industries,website,tagline,description,employee_range,hq,founded_year,verification_status,created_at";
++  "id,company_name,industry,industries,website,tagline,description,employee_range,hq,founded_year,verification_status,email,created_at";
+ 
+ export async function getVendorById(vendorId: string): Promise<VendorDetailRow | null> {
+   const params = new URLSearchParams({ select: VENDOR_SELECT, id: `eq.${vendorId}`, limit: "1" });
+diff --git a/src/lib/hooks/use-auth-session.ts b/src/lib/hooks/use-auth-session.ts
+new file mode 100644
+index 0000000..6007e46
+--- /dev/null
++++ b/src/lib/hooks/use-auth-session.ts
+@@ -0,0 +1,45 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import type { Session } from "@supabase/supabase-js";
++import { getSupabaseClient } from "@/lib/supabase-client";
++
++export interface AuthSessionState {
++  session: Session | null;
++  email: string | null;
++  loading: boolean;
++}
++
++// Reactive read of the current Supabase Auth session — mirrors the
++// use-buyer-session.ts / use-vendor-session pattern (subscribe once, react
++// to changes for the life of the component) instead of a one-shot read that
++// goes stale the moment a magic-link sign-in completes in another tab or the
++// /auth/callback page finishes next to a long-lived layout.
++export function useAuthSession(): AuthSessionState {
++  const [session, setSession] = useState<Session | null>(null);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    const supabase = getSupabaseClient();
++
++    supabase.auth.getSession().then(({ data }) => {
++      if (!cancelled) {
++        setSession(data.session);
++        setLoading(false);
++      }
++    });
++
++    const { data: subscription } = supabase.auth.onAuthStateChange((_event, newSession) => {
++      setSession(newSession);
++      setLoading(false);
++    });
++
++    return () => {
++      cancelled = true;
++      subscription.subscription.unsubscribe();
++    };
++  }, []);
++
++  return { session, email: session?.user?.email ?? null, loading };
++}
+diff --git a/src/lib/hooks/use-require-admin.ts b/src/lib/hooks/use-require-admin.ts
+new file mode 100644
+index 0000000..4bcb02c
+--- /dev/null
++++ b/src/lib/hooks/use-require-admin.ts
+@@ -0,0 +1,45 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { useRouter } from "next/navigation";
++import { useAuthSession } from "@/lib/hooks/use-auth-session";
++import { resolveAccountSession } from "@/lib/api/account";
++
++// Stronger than useRequireAuth: being logged in isn't enough for /admin —
++// the email also has to be on admin_allowlist (checked server-side by
++// resolve-account-session, never trusted client-side). A logged-in buyer or
++// vendor who navigates straight to an /admin URL is bounced to the
++// marketing home rather than shown admin data.
++export function useRequireAdmin(): { ready: boolean } {
++  const { session, loading } = useAuthSession();
++  const router = useRouter();
++  const [checked, setChecked] = useState(false);
++  const [isAdmin, setIsAdmin] = useState(false);
++
++  useEffect(() => {
++    if (loading) return;
++    if (!session) {
++      router.replace("/login");
++      return;
++    }
++    let cancelled = false;
++    resolveAccountSession()
++      .then((result) => {
++        if (cancelled) return;
++        setIsAdmin(result.isAdmin);
++        setChecked(true);
++        if (!result.isAdmin) router.replace("/");
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setChecked(true);
++          router.replace("/");
++        }
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [loading, session, router]);
++
++  return { ready: checked && isAdmin };
++}
+diff --git a/src/lib/hooks/use-require-auth.ts b/src/lib/hooks/use-require-auth.ts
+new file mode 100644
+index 0000000..f80638a
+--- /dev/null
++++ b/src/lib/hooks/use-require-auth.ts
+@@ -0,0 +1,22 @@
++"use client";
++
++import { useEffect } from "react";
++import { useRouter } from "next/navigation";
++import { useAuthSession } from "@/lib/hooks/use-auth-session";
++
++// Route guard shared by buyer/vendor/admin layouts — real login now gates
++// every portal (previously any of the three was reachable just by knowing
++// the URL). Redirects to /login the moment we're sure there's no session;
++// `ready` stays false while that determination is still in flight so the
++// caller can hold off rendering portal content for a beat instead of
++// flashing it before the redirect fires.
++export function useRequireAuth(): { ready: boolean } {
++  const { session, loading } = useAuthSession();
++  const router = useRouter();
++
++  useEffect(() => {
++    if (!loading && !session) router.replace("/login");
++  }, [loading, session, router]);
++
++  return { ready: !loading && !!session };
++}
+diff --git a/src/lib/supabase-client.ts b/src/lib/supabase-client.ts
+new file mode 100644
+index 0000000..7096158
+--- /dev/null
++++ b/src/lib/supabase-client.ts
+@@ -0,0 +1,24 @@
++// Single browser-side Supabase client for real login (magic link / OTP).
++// Every other file in this app talks to Supabase over plain REST fetch with
++// the anon key (see buyer-lookup.ts's restGet, etc.) because none of those
++// reads need a user session — this is the one exception: auth needs the
++// actual supabase-js client so it can manage the session (magic-link token
++// exchange, refresh, persistence) instead of us hand-rolling that.
++import { createClient, type SupabaseClient } from "@supabase/supabase-js";
++
++const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
++const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++
++let client: SupabaseClient | null = null;
++
++export function getSupabaseClient(): SupabaseClient {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
++    throw new Error("Supabase is not configured (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY missing).");
++  }
++  if (!client) {
++    client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
++      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
++    });
++  }
++  return client;
++}
+-- 
+2.43.0
+

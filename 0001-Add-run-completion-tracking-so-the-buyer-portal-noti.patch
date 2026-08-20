@@ -1,0 +1,514 @@
+From 02ea8a53233ac724df4341546a6af10f9e7435f3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 19 Aug 2026 23:46:28 +0000
+Subject: [PATCH] Add run-completion tracking so the buyer portal notifies when
+ the agent ends
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+buyer_workflow_runs (new table + save-buyer-workflow-run function) is a
+durable, server-side record of each triggered run and its status, created
+at trigger time and backfilled with buyer_id once the client resolves it.
+useAgentStatus now surfaces a distinct "completed" state once a run's
+status flips (driven by the scheduled Yoxa-sync task), rendered as a
+pill state change plus a dashboard banner linking to /buyer/solution —
+previously nothing distinguished a finished run from a still-working one.
+---
+ .../api/buyer-requirement-submission/route.ts |  18 +++
+ src/app/buyer/discover/page.tsx               |   8 +-
+ src/app/buyer/page.tsx                        |  21 +++-
+ src/components/shared/agent-status-pill.tsx   |  12 +-
+ src/lib/api/buyer-lookup.ts                   |  66 +++++++++++
+ src/lib/hooks/use-agent-status.ts             |  35 +++++-
+ .../save-buyer-workflow-run/index.ts          | 111 ++++++++++++++++++
+ .../migrations/0004_buyer_workflow_runs.sql   |  43 +++++++
+ 8 files changed, 303 insertions(+), 11 deletions(-)
+ create mode 100644 supabase-buyer/functions/save-buyer-workflow-run/index.ts
+ create mode 100644 supabase-buyer/migrations/0004_buyer_workflow_runs.sql
+
+diff --git a/src/app/api/buyer-requirement-submission/route.ts b/src/app/api/buyer-requirement-submission/route.ts
+index 3c353ce..21daf74 100644
+--- a/src/app/api/buyer-requirement-submission/route.ts
++++ b/src/app/api/buyer-requirement-submission/route.ts
+@@ -57,6 +57,24 @@ export async function POST(req: Request) {
+ 
+   try {
+     const result = await triggerBuyerRequirementSubmission(triggerText);
++
++    // Record the run immediately so it's discoverable server-side (by the
++    // Yoxa-sync scheduled task, or anything else) even before the client
++    // learns its own buyerId — see 0004_buyer_workflow_runs.sql. Best-effort:
++    // a failure here shouldn't fail the submission itself.
++    const functionsUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
++    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++    if (functionsUrl && anonKey && result.workflowRunId) {
++      fetch(`${functionsUrl}/functions/v1/save-buyer-workflow-run`, {
++        method: "POST",
++        headers: { "Content-Type": "application/json", apikey: anonKey, Authorization: `Bearer ${anonKey}` },
++        body: JSON.stringify({ workflowRunId: result.workflowRunId, buyerId: body.buyerId }),
++      }).catch(() => {
++        // transient — the discover page's own backfill call, or the sync
++        // task's next pass, gets another chance to create/update this row
++      });
++    }
++
+     return NextResponse.json(result, { status: 202 });
+   } catch (e) {
+     if (e instanceof YoxaBuyerTriggerError) {
+diff --git a/src/app/buyer/discover/page.tsx b/src/app/buyer/discover/page.tsx
+index 65603ad..826cc9d 100644
+--- a/src/app/buyer/discover/page.tsx
++++ b/src/app/buyer/discover/page.tsx
+@@ -20,7 +20,7 @@ import {
+   setStoredBuyerId,
+   setStoredCompanyName,
+ } from "@/lib/buyer-session";
+-import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
++import { getBuyerRequirements, getClientRealityProfile, linkBuyerWorkflowRun, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
+ import { POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn } from "@/lib/utils";
+@@ -131,6 +131,7 @@ export default function DiscoverPage() {
+       if (existingBuyerId) {
+         setBuyerId(existingBuyerId);
+         setStage("ready");
++        if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, existingBuyerId);
+         return;
+       }
+ 
+@@ -146,6 +147,7 @@ export default function DiscoverPage() {
+           setBuyerId(id);
+           clearPendingBuyerSubmission();
+           setStage("ready");
++          if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, id);
+         },
+         () => setStage("timed-out")
+       );
+@@ -170,6 +172,10 @@ export default function DiscoverPage() {
+         setBuyerId(id);
+         clearPendingBuyerSubmission();
+         setStage("ready");
++        // Page reload lost the runId local state (see handleSubmit) — the
++        // most recent stored run id is the one this submission created.
++        const [mostRecentRunId] = getStoredBuyerWorkflowRunIds();
++        if (mostRecentRunId) linkBuyerWorkflowRun(mostRecentRunId, id);
+       },
+       () => setStage("timed-out")
+     );
+diff --git a/src/app/buyer/page.tsx b/src/app/buyer/page.tsx
+index 1da60ae..635efca 100644
+--- a/src/app/buyer/page.tsx
++++ b/src/app/buyer/page.tsx
+@@ -2,7 +2,7 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, MessageSquareText, Sparkles, Store, TrendingUp } from "lucide-react";
++import { ArrowUpRight, MessageSquareText, PartyPopper, Sparkles, Store, TrendingUp } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
+ import { LoadingState } from "@/components/shared/loading-state";
+@@ -20,6 +20,7 @@ import {
+   type CapabilityFrontierRow,
+   type RoiProjectionRow,
+ } from "@/lib/api/buyer-lookup";
++import { useAgentStatus } from "@/lib/hooks/use-agent-status";
+ import { getStoredBuyerId, getStoredCompanyName, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
+ import { cn, formatCurrencyINR } from "@/lib/utils";
+ 
+@@ -33,6 +34,7 @@ export default function BuyerDashboardPage() {
+   const [frontierItems, setFrontierItems] = useState<CapabilityFrontierRow[]>([]);
+   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
+   const [loading, setLoading] = useState(true);
++  const agentStatus = useAgentStatus(buyerId);
+ 
+   useEffect(() => {
+     if (!buyerId) {
+@@ -89,6 +91,23 @@ export default function BuyerDashboardPage() {
+         }
+       />
+ 
++      {agentStatus.status === "completed" && (
++        <Card className="mb-6 border-brand-300 bg-gradient-to-br from-brand-50 to-accent-50 dark:border-brand-800 dark:from-brand-950/30 dark:to-accent-950/20 animate-slide-up">
++          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
++            <div className="flex items-center gap-3">
++              <PartyPopper className="h-5 w-5 shrink-0 text-brand-600 dark:text-brand-400" />
++              <div>
++                <p className="text-sm font-semibold text-foreground">Your agent has finished — your solution is ready</p>
++                <p className="text-xs text-muted">Open the solution workspace to review it and download your pitch deck.</p>
++              </div>
++            </div>
++            <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary", size: "sm" }))}>
++              View solution <ArrowUpRight className="h-3.5 w-3.5" />
++            </Link>
++          </CardContent>
++        </Card>
++      )}
++
+       {loading ? (
+         <>
+           <LoadingState variant="stats" count={4} />
+diff --git a/src/components/shared/agent-status-pill.tsx b/src/components/shared/agent-status-pill.tsx
+index 967c4bd..a1c5dfe 100644
+--- a/src/components/shared/agent-status-pill.tsx
++++ b/src/components/shared/agent-status-pill.tsx
+@@ -6,7 +6,7 @@
+ // pattern of each page silently polling in isolation with no shared signal.
+ import Link from "next/link";
+ import { motion, AnimatePresence } from "motion/react";
+-import { Bot, CheckCircle2, Sparkles } from "lucide-react";
++import { Bot, CheckCircle2, PartyPopper, Sparkles } from "lucide-react";
+ import { cn } from "@/lib/utils";
+ import { useAgentStatus } from "@/lib/hooks/use-agent-status";
+ 
+@@ -18,11 +18,13 @@ export function AgentStatusPill({ buyerId }: { buyerId: string | null | undefine
+   const toneClass =
+     status === "needs_input"
+       ? "border-modelled-border bg-modelled-bg text-modelled"
+-      : status === "working"
+-        ? "border-verified-border bg-verified-bg text-verified"
+-        : "border-border bg-surface-2 text-muted";
++      : status === "completed"
++        ? "border-brand-300 bg-brand-50 text-brand-700 dark:border-brand-800 dark:bg-brand-950/40 dark:text-brand-300"
++        : status === "working"
++          ? "border-verified-border bg-verified-bg text-verified"
++          : "border-border bg-surface-2 text-muted";
+ 
+-  const Icon = status === "needs_input" ? Sparkles : status === "working" ? CheckCircle2 : Bot;
++  const Icon = status === "needs_input" ? Sparkles : status === "completed" ? PartyPopper : status === "working" ? CheckCircle2 : Bot;
+ 
+   const content = (
+     <motion.div
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index 40bfa9f..479d9b0 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -493,6 +493,72 @@ export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolut
+   return { id: row.id, buyerId: row.buyer_id, title: row.title, pptxUrl: row.pptx_url, status: row.status, createdAt: row.created_at };
+ }
+ 
++// ---- buyer_workflow_runs (run-completion tracking) -------------------------
++// See supabase-buyer/migrations/0004_buyer_workflow_runs.sql — the durable,
++// server-side record of "does this run exist and has it finished", used by
++// useAgentStatus to show a distinct "your solution is ready" state instead
++// of forever showing "working", and by the scheduled Yoxa-sync task to know
++// which runs still need checking.
++
++export interface BuyerWorkflowRunRow {
++  id: string;
++  workflowRunId: string;
++  buyerId: string | null;
++  status: "running" | "completed" | "failed";
++  deckSyncedAt: string | null;
++  completedAt: string | null;
++  startedAt: string;
++}
++
++export async function getLatestBuyerWorkflowRun(buyerId: string): Promise<BuyerWorkflowRunRow | null> {
++  const params = new URLSearchParams({
++    select: "id,workflow_run_id,buyer_id,status,deck_synced_at,completed_at,started_at",
++    buyer_id: `eq.${buyerId}`,
++    order: "started_at.desc",
++    limit: "1",
++  });
++  const rows = await restGet<
++    {
++      id: string;
++      workflow_run_id: string;
++      buyer_id: string | null;
++      status: "running" | "completed" | "failed";
++      deck_synced_at: string | null;
++      completed_at: string | null;
++      started_at: string;
++    }[]
++  >(`buyer_workflow_runs?${params}`);
++  const row = rows[0];
++  if (!row) return null;
++  return {
++    id: row.id,
++    workflowRunId: row.workflow_run_id,
++    buyerId: row.buyer_id,
++    status: row.status,
++    deckSyncedAt: row.deck_synced_at,
++    completedAt: row.completed_at,
++    startedAt: row.started_at,
++  };
++}
++
++// Client-side backfill of buyer_id onto a run row created before buyerId was
++// known (see the buyer-requirement-submission route's own initial insert).
++// Best-effort, fire-and-forget by design at both call sites in
++// src/app/buyer/discover/page.tsx — a missed backfill just means the sync
++// task's next pass (or the next submission on this run) tries again.
++export async function linkBuyerWorkflowRun(workflowRunId: string, buyerId: string): Promise<void> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
++  try {
++    await fetch(`${SUPABASE_URL}/functions/v1/save-buyer-workflow-run`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
++      body: JSON.stringify({ workflowRunId, buyerId }),
++    });
++  } catch {
++    // best-effort — see callers
++  }
++}
++
+ // ---- buyer_workflow_approval_requests (HITL bridge) ------------------------
+ 
+ export type BuyerApprovalNodeKey =
+diff --git a/src/lib/hooks/use-agent-status.ts b/src/lib/hooks/use-agent-status.ts
+index b936709..b940567 100644
+--- a/src/lib/hooks/use-agent-status.ts
++++ b/src/lib/hooks/use-agent-status.ts
+@@ -11,10 +11,10 @@
+ // finds a pause anywhere in the buyer's journey, not just on the page
+ // you're currently looking at.
+ import { useCallback, useEffect, useRef, useState } from "react";
+-import { getPendingApproval, type BuyerApprovalNodeKey, type BuyerApprovalRequestRow } from "@/lib/api/buyer-lookup";
++import { getLatestBuyerWorkflowRun, getPendingApproval, type BuyerApprovalNodeKey, type BuyerApprovalRequestRow, type BuyerWorkflowRunRow } from "@/lib/api/buyer-lookup";
+ import { POLL_INTERVAL_MS } from "@/lib/buyer-poll";
+ 
+-export type AgentStatus = "idle" | "working" | "needs_input";
++export type AgentStatus = "idle" | "working" | "needs_input" | "completed";
+ 
+ // Where the buyer should go to answer a pause at each node — lets the
+ // status pill deep-link straight to the right page instead of making them
+@@ -42,20 +42,33 @@ const APPROVAL_NODE_LABEL: Record<BuyerApprovalNodeKey, string> = {
+ export interface AgentStatusResult {
+   status: AgentStatus;
+   approval: BuyerApprovalRequestRow | null;
++  run: BuyerWorkflowRunRow | null;
+   label: string;
+   href: string | null;
+ }
+ 
+ export function useAgentStatus(buyerId: string | null | undefined): AgentStatusResult {
+   const [approval, setApproval] = useState<BuyerApprovalRequestRow | null>(null);
++  // Latest run's completion status — this is what makes "the agent ended"
++  // actually visible anywhere, instead of the old behavior where a finished
++  // run and a still-working one both just showed "All caught up" /
++  // "working" forever, with nothing to distinguish them. See
++  // buyer_workflow_runs (0004 migration) for how this row gets populated:
++  // the trigger route creates it, the discover page backfills buyerId, and
++  // the scheduled Yoxa-sync task flips status to "completed".
++  const [run, setRun] = useState<BuyerWorkflowRunRow | null>(null);
+   const [checkedOnce, setCheckedOnce] = useState(false);
+   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+ 
+   const refresh = useCallback(async () => {
+     if (!buyerId) return;
+     try {
+-      const found = await getPendingApproval({ buyerId });
++      const [found, latestRun] = await Promise.all([
++        getPendingApproval({ buyerId }),
++        getLatestBuyerWorkflowRun(buyerId),
++      ]);
+       setApproval((prev) => (prev?.requestId === found?.requestId ? prev : found));
++      setRun((prev) => (prev?.id === latestRun?.id && prev?.status === latestRun?.status ? prev : latestRun));
+     } catch {
+       // transient read error — next tick tries again
+     } finally {
+@@ -72,18 +85,32 @@ export function useAgentStatus(buyerId: string | null | undefined): AgentStatusR
+     };
+   }, [buyerId, refresh]);
+ 
+-  if (!buyerId) return { status: "idle", approval: null, label: "Start a discovery request", href: "/buyer/discover" };
++  if (!buyerId) return { status: "idle", approval: null, run: null, label: "Start a discovery request", href: "/buyer/discover" };
+   if (approval) {
+     return {
+       status: "needs_input",
+       approval,
++      run,
+       label: APPROVAL_NODE_LABEL[approval.nodeKey] ?? "Respond to the agent",
+       href: APPROVAL_NODE_ROUTE[approval.nodeKey] ?? "/buyer",
+     };
+   }
++  // A run is only "done" once Yoxa itself reports completion (via the sync
++  // task) — no pending approval just means nothing is paused *right now*,
++  // which during a still-running workflow is the common case between steps.
++  if (run?.status === "completed") {
++    return {
++      status: "completed",
++      approval: null,
++      run,
++      label: "Your solution is ready",
++      href: "/buyer/solution",
++    };
++  }
+   return {
+     status: checkedOnce ? "working" : "idle",
+     approval: null,
++    run,
+     label: checkedOnce ? "All caught up" : "Checking…",
+     href: null,
+   };
+diff --git a/supabase-buyer/functions/save-buyer-workflow-run/index.ts b/supabase-buyer/functions/save-buyer-workflow-run/index.ts
+new file mode 100644
+index 0000000..100f3d1
+--- /dev/null
++++ b/supabase-buyer/functions/save-buyer-workflow-run/index.ts
+@@ -0,0 +1,111 @@
++// Upserts one row of buyer_workflow_runs by workflow_run_id. Two very
++// different callers hit this, both fine with the same lenient contract:
++//   1. src/app/api/buyer-requirement-submission/route.ts, right after a
++//      trigger succeeds — creates the row, buyerId often still unknown.
++//   2. src/app/buyer/discover/page.tsx, once it resolves its own buyerId
++//      (either immediately, for a returning buyer, or after polling for a
++//      new one) — backfills buyer_id onto the row created in (1).
++//   3. The scheduled Yoxa-sync task (see the "yoxa-buyer-run-sync"
++//      scheduled task) — updates status/completed_at/raw_status once it
++//      observes a run finish on Yoxa's dashboard, and deck_synced_at once
++//      it's pushed a generated deck into save-buyer-solution-deck.
++// verify_jwt: false, same as every other function in this project.
++import { createClient } from "jsr:@supabase/supabase-js@2";
++
++const corsHeaders = {
++  "Access-Control-Allow-Origin": "*",
++  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
++};
++
++Deno.serve(async (req) => {
++  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
++  if (req.method !== "POST") {
++    return new Response(JSON.stringify({ error: "Method not allowed." }), {
++      status: 405,
++      headers: { ...corsHeaders, "Content-Type": "application/json" },
++    });
++  }
++
++  const supabaseUrl = Deno.env.get("SUPABASE_URL");
++  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
++  if (!supabaseUrl || !serviceRoleKey) {
++    return new Response(JSON.stringify({ error: "Server storage is not configured." }), {
++      status: 503,
++      headers: { ...corsHeaders, "Content-Type": "application/json" },
++    });
++  }
++
++  let body: Record<string, unknown>;
++  try {
++    body = await req.json();
++  } catch {
++    return new Response(JSON.stringify({ error: "The request body was not valid JSON." }), {
++      status: 400,
++      headers: { ...corsHeaders, "Content-Type": "application/json" },
++    });
++  }
++
++  const workflowRunId = body.workflowRunId as string | undefined;
++  if (!workflowRunId) {
++    return new Response(JSON.stringify({ error: "workflowRunId is required." }), {
++      status: 400,
++      headers: { ...corsHeaders, "Content-Type": "application/json" },
++    });
++  }
++
++  const supabase = createClient(supabaseUrl, serviceRoleKey);
++
++  const buyerId = body.buyerId as string | undefined;
++  const status = body.status as string | undefined;
++  const markCompleted = status === "completed" || status === "failed";
++  const deckSynced = body.deckSynced === true;
++
++  // Read-modify-write rather than a single upsert: buyerId/status here are
++  // "set if provided, otherwise leave whatever's already on the row alone"
++  // — an upsert with nulls would clobber a buyerId the trigger route
++  // already set once the discover-page backfill call runs, or clobber a
++  // status the sync task already advanced to "completed" if a stale
++  // "running" call raced in after it.
++  const { data: existing } = await supabase
++    .from("buyer_workflow_runs")
++    .select("id, buyer_id, status, deck_synced_at")
++    .eq("workflow_run_id", workflowRunId)
++    .maybeSingle();
++
++  const patch: Record<string, unknown> = {
++    last_checked_at: new Date().toISOString(),
++  };
++  if (buyerId) patch.buyer_id = buyerId;
++  if (status) patch.status = status;
++  if (markCompleted) patch.completed_at = new Date().toISOString();
++  if (deckSynced) patch.deck_synced_at = new Date().toISOString();
++  if (body.rawStatus) patch.raw_status = body.rawStatus;
++
++  let result;
++  if (existing) {
++    result = await supabase
++      .from("buyer_workflow_runs")
++      .update(patch)
++      .eq("id", existing.id)
++      .select("id, workflow_run_id, buyer_id, status, deck_synced_at, completed_at")
++      .single();
++  } else {
++    result = await supabase
++      .from("buyer_workflow_runs")
++      .insert({ workflow_run_id: workflowRunId, ...patch })
++      .select("id, workflow_run_id, buyer_id, status, deck_synced_at, completed_at")
++      .single();
++  }
++
++  if (result.error) {
++    return new Response(JSON.stringify({ error: result.error.message }), {
++      status: 500,
++      headers: { ...corsHeaders, "Content-Type": "application/json" },
++    });
++  }
++
++  return new Response(JSON.stringify(result.data), {
++    status: 200,
++    headers: { ...corsHeaders, "Content-Type": "application/json" },
++  });
++});
+diff --git a/supabase-buyer/migrations/0004_buyer_workflow_runs.sql b/supabase-buyer/migrations/0004_buyer_workflow_runs.sql
+new file mode 100644
+index 0000000..aa986d0
+--- /dev/null
++++ b/supabase-buyer/migrations/0004_buyer_workflow_runs.sql
+@@ -0,0 +1,43 @@
++-- Tracks each triggered buyer workflow run's lifecycle so the frontend can
++-- surface "your agent finished" independent of any single downstream
++-- artifact (deck, approval, etc.) — nothing previously recorded run status
++-- anywhere server-side; workflow_run_id only ever lived in the browser's
++-- own localStorage (see src/lib/buyer-session.ts's RUN_IDS_KEY), which is
++-- fine for correlating a pause to a tab but useless for an out-of-band
++-- process (a scheduled sync) to discover "which runs exist and are they
++-- done yet". This table is that durable, server-side record.
++--
++-- Rows are created as soon as a trigger succeeds (buyer_id may still be
++-- null at that instant for a brand-new buyer — see the trigger route's own
++-- comment on why buyerId isn't known synchronously) and backfilled/updated
++-- from two places: the client, once it discovers its own buyerId, and the
++-- scheduled Yoxa-sync task, once it observes a run's status change on
++-- Yoxa's dashboard. Both go through the save-buyer-workflow-run function
++-- (service role) rather than a public write policy, mirroring every other
++-- write path in this schema.
++create table if not exists public.buyer_workflow_runs (
++  id uuid primary key default gen_random_uuid(),
++  workflow_run_id text not null unique,
++  buyer_id uuid references public.buyers(id) on delete set null,
++  status text not null default 'running' check (status in ('running', 'completed', 'failed')),
++  deck_synced_at timestamptz,
++  last_checked_at timestamptz,
++  started_at timestamptz not null default now(),
++  completed_at timestamptz,
++  raw_status jsonb not null default '{}'::jsonb
++);
++
++create index if not exists buyer_workflow_runs_buyer_id_idx
++  on public.buyer_workflow_runs (buyer_id, started_at desc);
++
++-- Lets the sync task cheaply ask "which runs still need checking" without a
++-- full table scan as history grows.
++create index if not exists buyer_workflow_runs_running_idx
++  on public.buyer_workflow_runs (status)
++  where status = 'running';
++
++alter table public.buyer_workflow_runs enable row level security;
++
++create policy "buyer_workflow_runs_public_read"
++  on public.buyer_workflow_runs for select
++  using (true);
+-- 
+2.43.0
+

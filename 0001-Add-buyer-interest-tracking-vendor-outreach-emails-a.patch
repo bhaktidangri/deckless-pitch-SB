@@ -1,0 +1,728 @@
+From e3b871500e056be3f28224586edc935e6cfb1e7d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 09:39:38 +0000
+Subject: [PATCH] Add buyer-interest tracking, vendor outreach emails, and
+ dashboard charts
+
+Vendor profile and dashboard now surface how many buyers have shown interest
+(vendor_recommendations + buyer_vendor_selections), let vendors email an
+interested buyer directly from that buyer's detail page (logged via a new
+vendor_outreach_events table + record-vendor-outreach edge function, with
+mailto: handoff since no transactional email provider is configured), show a
+"Contacted" badge on the buyers list, and chart interest-over-time next to a
+new outreach-sent stat. Buyers now also see a notification when a vendor
+reaches out.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZibWYPysw75xiFQpbHszf
+---
+ src/app/vendor/buyers/[id]/page.tsx        |  12 ++
+ src/app/vendor/buyers/page.tsx             |  15 ++-
+ src/app/vendor/page.tsx                    |  74 +++++++++---
+ src/app/vendor/profile/page.tsx            |  59 +++++++++-
+ src/components/shared/email-buyer-card.tsx | 129 +++++++++++++++++++++
+ src/lib/api/account.ts                     |  23 ++++
+ src/lib/api/buyer-lookup.ts                |  26 +++++
+ src/lib/api/notifications.ts               |  13 ++-
+ src/lib/api/vendor-lookup.ts               |  58 ++++++++-
+ 9 files changed, 380 insertions(+), 29 deletions(-)
+ create mode 100644 src/components/shared/email-buyer-card.tsx
+
+diff --git a/src/app/vendor/buyers/[id]/page.tsx b/src/app/vendor/buyers/[id]/page.tsx
+index 8d26bef..0f78350 100644
+--- a/src/app/vendor/buyers/[id]/page.tsx
++++ b/src/app/vendor/buyers/[id]/page.tsx
+@@ -12,6 +12,7 @@ import { GapCard } from "@/components/shared/gap-card";
+ import { MatchRow } from "@/components/shared/match-row";
+ import { FrontierCard } from "@/components/shared/frontier-card";
+ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { EmailBuyerCard } from "@/components/shared/email-buyer-card";
+ import {
+   getBuyerById,
+   getVendorById,
+@@ -67,6 +68,7 @@ function toFrontierItem(f: VendorFrontierItemRow, buyerName: string, vendorName:
+ }
+ 
+ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id: string }> }) {
++  const vendorId = getStoredVendorId();
+   const [buyer, setBuyer] = useState<LeadBuyerRow | null>(null);
+   const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
+   const [gaps, setGaps] = useState<VendorSideGapRow[]>([]);
+@@ -227,6 +229,16 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
+             </CardContent>
+           </Card>
+ 
++          {vendorId && (
++            <EmailBuyerCard
++              vendorId={vendorId}
++              buyerId={buyer.id}
++              buyerCompanyName={buyer.companyName}
++              buyerEmail={buyer.email}
++              vendorCompanyName={vendor?.companyName ?? "Us"}
++            />
++          )}
++
+           <Card>
+             <CardHeader className="flex-row items-center justify-between">
+               <CardTitle>Requirement fit</CardTitle>
+diff --git a/src/app/vendor/buyers/page.tsx b/src/app/vendor/buyers/page.tsx
+index 943046e..6d06c78 100644
+--- a/src/app/vendor/buyers/page.tsx
++++ b/src/app/vendor/buyers/page.tsx
+@@ -2,7 +2,7 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, FileSearch, Search } from "lucide-react";
++import { ArrowUpRight, FileSearch, Mail, Search } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+@@ -13,6 +13,7 @@ import {
+   getVendorRecommendationsForVendor,
+   getBuyerVendorSelectionsForVendor,
+   getBuyersByIds,
++  getVendorOutreachEvents,
+   type LeadBuyerRow,
+ } from "@/lib/api/vendor-lookup";
+ import { getFrontierItemsForVendor } from "@/lib/api/vendor-frontier";
+@@ -24,6 +25,7 @@ interface BuyerEngagement {
+   stage: string;
+   fitScore: number | null;
+   frontierOpen: number;
++  contacted: boolean;
+ }
+ 
+ export default function VendorBuyersPage() {
+@@ -42,21 +44,23 @@ export default function VendorBuyersPage() {
+     let cancelled = false;
+     async function load() {
+       try {
+-        const [recs, selections, frontier] = await Promise.all([
++        const [recs, selections, frontier, outreach] = await Promise.all([
+           getVendorRecommendationsForVendor(id!),
+           getBuyerVendorSelectionsForVendor(id!),
+           getFrontierItemsForVendor(id!),
++          getVendorOutreachEvents(id!).catch(() => []),
+         ]);
+         const buyerIds = Array.from(new Set([...recs.map((r) => r.buyerId), ...selections.map((s) => s.buyerId)]));
+         const buyers = await getBuyersByIds(buyerIds);
+         if (cancelled) return;
+ 
++        const contactedBuyerIds = new Set(outreach.map((o) => o.buyerId));
+         const list: BuyerEngagement[] = buyers.map((buyer) => {
+           const rec = recs.find((r) => r.buyerId === buyer.id);
+           const selection = selections.find((s) => s.buyerId === buyer.id);
+           const openFrontier = frontier.filter((f) => f.buyerId === buyer.id && (f.status === "open" || f.status === "vendor_review")).length;
+           const stage = selection?.isActive ? "Solution Workspace" : selection ? "Vendor Selection" : "Discovery";
+-          return { buyer, stage, fitScore: rec?.fitScore ?? null, frontierOpen: openFrontier };
++          return { buyer, stage, fitScore: rec?.fitScore ?? null, frontierOpen: openFrontier, contacted: contactedBuyerIds.has(buyer.id) };
+         });
+         list.sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
+         setEngagements(list);
+@@ -113,6 +117,11 @@ export default function VendorBuyersPage() {
+                   </div>
+                   <div className="flex flex-wrap items-center gap-3 sm:gap-6">
+                     <Badge variant="modelled">{e.stage}</Badge>
++                    {e.contacted && (
++                      <span className="flex items-center gap-1 text-xs font-medium text-verified">
++                        <Mail className="h-3.5 w-3.5" /> Contacted
++                      </span>
++                    )}
+                     {e.frontierOpen > 0 && (
+                       <span className="flex items-center gap-1 text-xs font-medium text-escalated">
+                         <FileSearch className="h-3.5 w-3.5" /> {e.frontierOpen} open
+diff --git a/src/app/vendor/page.tsx b/src/app/vendor/page.tsx
+index a66d000..4466cf2 100644
+--- a/src/app/vendor/page.tsx
++++ b/src/app/vendor/page.tsx
+@@ -2,7 +2,8 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, CircleAlert, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
++import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
++import { ArrowUpRight, CircleAlert, FileSearch, Mail, Sparkles, TrendingUp, Users } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
+ import { AuditTimeline } from "@/components/shared/audit-timeline";
+@@ -14,8 +15,11 @@ import {
+   getVendorRecommendationsForVendor,
+   getBuyersByIds,
+   getVendorById,
++  getVendorInterestSeries,
++  getVendorOutreachEvents,
+   type LeadBuyerRow,
+   type VendorDetailRow,
++  type VendorInterestWeek,
+ } from "@/lib/api/vendor-lookup";
+ import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
+ import { getAuditEvents } from "@/lib/api/admin-lookup";
+@@ -36,6 +40,8 @@ export default function VendorDashboardPage() {
+   const [openFrontier, setOpenFrontier] = useState<VendorFrontierItemRow[]>([]);
+   const [buyersById, setBuyersById] = useState<Record<string, LeadBuyerRow>>({});
+   const [events, setEvents] = useState<AuditEvent[]>([]);
++  const [interestSeries, setInterestSeries] = useState<VendorInterestWeek[]>([]);
++  const [outreachCount, setOutreachCount] = useState(0);
+   const [loading, setLoading] = useState(true);
+ 
+   useEffect(() => {
+@@ -48,11 +54,13 @@ export default function VendorDashboardPage() {
+     let cancelled = false;
+     async function load() {
+       try {
+-        const [v, recs, frontier, auditEvents] = await Promise.all([
++        const [v, recs, frontier, auditEvents, interest, outreach] = await Promise.all([
+           getVendorById(id!),
+           getVendorRecommendationsForVendor(id!),
+           getFrontierItemsForVendor(id!),
+           getAuditEvents(5),
++          getVendorInterestSeries(id!, 6).catch(() => []),
++          getVendorOutreachEvents(id!).catch(() => []),
+         ]);
+         const buyerIds = Array.from(new Set(recs.map((r) => r.buyerId)));
+         const buyers = await getBuyersByIds(buyerIds);
+@@ -61,6 +69,8 @@ export default function VendorDashboardPage() {
+         setBuyersById(byId);
+         setVendor(v);
+         setEvents(auditEvents);
++        setInterestSeries(interest);
++        setOutreachCount(outreach.length);
+         setEngagements(
+           recs
+             .filter((r) => byId[r.buyerId])
+@@ -120,31 +130,39 @@ export default function VendorDashboardPage() {
+         }
+       />
+ 
+-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
++      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+         <StatCard label="Active buyers" value={String(engagements.length)} icon={Users} index={0} />
+         <StatCard label="Solutions generated" value={String(engagements.length)} icon={Sparkles} tone="accent" index={1} />
+         <StatCard label="Open frontier items" value={String(openFrontier.length)} icon={FileSearch} tone="escalated" index={2} />
+         <StatCard label="Avg. requirement fit" value={avgFit != null ? `${avgFit}%` : "—"} icon={TrendingUp} tone="verified" index={3} />
++        <StatCard label="Outreach sent" value={String(outreachCount)} icon={Mail} tone="brand" index={4} />
+       </div>
+ 
+       <div className="mt-6 grid gap-6 lg:grid-cols-3">
+         <Card className="lg:col-span-2">
+-          <CardHeader className="flex-row items-center justify-between">
+-            <CardTitle>Active buyer engagements</CardTitle>
+-            <Link href="/vendor/buyers" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
+-              View all
+-            </Link>
++          <CardHeader>
++            <CardTitle>Buyer interest over time</CardTitle>
+           </CardHeader>
+-          <CardContent className="pt-4">
+-            {engagements.length === 0 ? (
+-              <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
+-            ) : (
+-              <div className="divide-y divide-border">
+-                {engagements.slice(0, 6).map((e) => (
+-                  <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
+-                ))}
+-              </div>
+-            )}
++          <CardContent className="pt-2">
++            <div className="h-56 w-full">
++              <ResponsiveContainer width="100%" height="100%">
++                <BarChart data={interestSeries} margin={{ top: 10, right: 8, left: -20, bottom: 0 }}>
++                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
++                  <XAxis dataKey="week" tick={{ fill: "var(--muted)", fontSize: 12 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
++                  <YAxis tick={{ fill: "var(--muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={32} allowDecimals={false} />
++                  <Tooltip
++                    contentStyle={{
++                      background: "var(--surface)",
++                      border: "1px solid var(--border)",
++                      borderRadius: 10,
++                      fontSize: 12,
++                      color: "var(--foreground)",
++                    }}
++                  />
++                  <Bar dataKey="buyers" fill="var(--brand-500)" radius={[4, 4, 0, 0]} name="New buyers interested" />
++                </BarChart>
++              </ResponsiveContainer>
++            </div>
+           </CardContent>
+         </Card>
+ 
+@@ -158,6 +176,26 @@ export default function VendorDashboardPage() {
+         </Card>
+       </div>
+ 
++      <Card className="mt-6">
++        <CardHeader className="flex-row items-center justify-between">
++          <CardTitle>Active buyer engagements</CardTitle>
++          <Link href="/vendor/buyers" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++            View all
++          </Link>
++        </CardHeader>
++        <CardContent className="pt-4">
++          {engagements.length === 0 ? (
++            <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
++          ) : (
++            <div className="divide-y divide-border">
++              {engagements.slice(0, 6).map((e) => (
++                <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
++              ))}
++            </div>
++          )}
++        </CardContent>
++      </Card>
++
+       <Card className="mt-6">
+         <CardHeader className="flex-row items-center justify-between">
+           <CardTitle className="flex items-center gap-2">
+diff --git a/src/app/vendor/profile/page.tsx b/src/app/vendor/profile/page.tsx
+index df77200..95c29ff 100644
+--- a/src/app/vendor/profile/page.tsx
++++ b/src/app/vendor/profile/page.tsx
+@@ -2,15 +2,24 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { CheckCircle2, Circle, Mail, Save } from "lucide-react";
++import { CheckCircle2, Circle, Mail, Save, Users, ArrowUpRight } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { Input, Label, Select, Textarea } from "@/components/ui/input";
+ import { Button, buttonVariants } from "@/components/ui/button";
+ import { Badge } from "@/components/ui/badge";
++import { Avatar } from "@/components/ui/avatar";
+ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { useAuthSession } from "@/lib/hooks/use-auth-session";
+-import { getVendorById, getVendorRecommendationsForVendor, countDraftCapabilities, type VendorDetailRow } from "@/lib/api/vendor-lookup";
++import {
++  getVendorById,
++  getVendorRecommendationsForVendor,
++  getBuyerVendorSelectionsForVendor,
++  getBuyersByIds,
++  countDraftCapabilities,
++  type VendorDetailRow,
++  type LeadBuyerRow,
++} from "@/lib/api/vendor-lookup";
+ import { updateVendorProfile } from "@/lib/api/account";
+ import { getStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
+ import { cn } from "@/lib/utils";
+@@ -37,6 +46,7 @@ export default function VendorProfilePage() {
+ 
+   const [capabilityCount, setCapabilityCount] = useState(0);
+   const [buyerCount, setBuyerCount] = useState(0);
++  const [interested, setInterested] = useState<{ buyer: LeadBuyerRow; fitScore: number | null }[]>([]);
+ 
+   useEffect(() => {
+     if (!vendorId) {
+@@ -46,9 +56,10 @@ export default function VendorProfilePage() {
+     let cancelled = false;
+     async function load() {
+       try {
+-        const [v, recs, capCount] = await Promise.all([
++        const [v, recs, selections, capCount] = await Promise.all([
+           getVendorById(vendorId!),
+           getVendorRecommendationsForVendor(vendorId!),
++          getBuyerVendorSelectionsForVendor(vendorId!),
+           countDraftCapabilities(vendorId!).catch(() => 0),
+         ]);
+         if (cancelled) return;
+@@ -62,7 +73,18 @@ export default function VendorProfilePage() {
+           setHq(v.hq ?? "");
+           setEmployeeRange(v.employeeRange ?? "");
+         }
+-        setBuyerCount(recs.length);
++        // "Shown interest" = every buyer who either got a fit-scored
++        // recommendation for this vendor or actively selected it — the same
++        // two signals /vendor/buyers already treats as "exploring your
++        // solution", just rolled up to a headline count here.
++        const buyerIds = Array.from(new Set([...recs.map((r) => r.buyerId), ...selections.map((s) => s.buyerId)]));
++        const buyers = buyerIds.length > 0 ? await getBuyersByIds(buyerIds) : [];
++        if (cancelled) return;
++        const list = buyers
++          .map((buyer) => ({ buyer, fitScore: recs.find((r) => r.buyerId === buyer.id)?.fitScore ?? null }))
++          .sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
++        setInterested(list);
++        setBuyerCount(buyerIds.length);
+         setCapabilityCount(capCount);
+       } finally {
+         if (!cancelled) setLoading(false);
+@@ -229,6 +251,35 @@ export default function VendorProfilePage() {
+               </Link>
+             </CardContent>
+           </Card>
++
++          <Card>
++            <CardHeader className="flex-row items-center justify-between">
++              <CardTitle className="flex items-center gap-2 text-sm">
++                <Users className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Buyer interest
++              </CardTitle>
++              <span className="text-lg font-bold text-foreground">{interested.length}</span>
++            </CardHeader>
++            <CardContent className="space-y-1 pt-2">
++              {interested.length === 0 ? (
++                <p className="py-2 text-sm text-muted">No buyers are exploring your solution yet.</p>
++              ) : (
++                interested.slice(0, 5).map(({ buyer, fitScore }) => (
++                  <Link
++                    key={buyer.id}
++                    href={`/vendor/buyers/${buyer.id}`}
++                    className="-mx-1 flex items-center gap-2.5 rounded-lg px-1 py-2 text-sm transition-colors hover:bg-surface-2"
++                  >
++                    <Avatar name={buyer.companyName} size="sm" />
++                    <span className="min-w-0 flex-1 truncate text-foreground">{buyer.companyName}</span>
++                    {fitScore != null && <span className="shrink-0 text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>}
++                  </Link>
++                ))
++              )}
++              <Link href="/vendor/buyers" className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
++                Reach out to buyers <ArrowUpRight className="h-3 w-3" />
++              </Link>
++            </CardContent>
++          </Card>
+         </div>
+       </div>
+     </div>
+diff --git a/src/components/shared/email-buyer-card.tsx b/src/components/shared/email-buyer-card.tsx
+new file mode 100644
+index 0000000..d778cb1
+--- /dev/null
++++ b/src/components/shared/email-buyer-card.tsx
+@@ -0,0 +1,129 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { Clock, Mail, Send } from "lucide-react";
++import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
++import { Input, Label, Textarea } from "@/components/ui/input";
++import { Button } from "@/components/ui/button";
++import { recordVendorOutreach } from "@/lib/api/account";
++import { getVendorOutreachEvents, type VendorOutreachEventRow } from "@/lib/api/vendor-lookup";
++import { formatRelativeTime } from "@/lib/utils";
++
++interface EmailBuyerCardProps {
++  vendorId: string;
++  buyerId: string;
++  buyerCompanyName: string;
++  buyerEmail: string | null;
++  vendorCompanyName: string;
++}
++
++// Logs the outreach through record-vendor-outreach (real backend tracking —
++// feeds the vendor dashboard's outreach stat and this buyer's history below)
++// then, if the buyer's login email is on file, opens the vendor's own email
++// client via mailto: to actually send it. There's no transactional email
++// provider wired into this app, so "send" here means "hand off to your own
++// inbox" rather than a backend relay — the logging is what's real and
++// durable, not a simulated delivery receipt.
++export function EmailBuyerCard({ vendorId, buyerId, buyerCompanyName, buyerEmail, vendorCompanyName }: EmailBuyerCardProps) {
++  const [subject, setSubject] = useState(`${vendorCompanyName} <> ${buyerCompanyName}`);
++  const [message, setMessage] = useState(
++    `Hi ${buyerCompanyName} team,\n\nWe noticed you're exploring solutions like ours and wanted to reach out directly. Happy to walk through fit whenever works for you.\n\n— ${vendorCompanyName}`
++  );
++  const [sending, setSending] = useState(false);
++  const [sent, setSent] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [history, setHistory] = useState<VendorOutreachEventRow[]>([]);
++  const [historyLoading, setHistoryLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    getVendorOutreachEvents(vendorId)
++      .then((events) => {
++        if (!cancelled) setHistory(events.filter((e) => e.buyerId === buyerId));
++      })
++      .catch(() => {})
++      .finally(() => {
++        if (!cancelled) setHistoryLoading(false);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [vendorId, buyerId]);
++
++  async function handleSend(e: React.FormEvent) {
++    e.preventDefault();
++    setSending(true);
++    setError(null);
++    setSent(false);
++    try {
++      const trimmedSubject = subject.trim();
++      const trimmedMessage = message.trim();
++      const result = await recordVendorOutreach({ buyerId, subject: trimmedSubject, message: trimmedMessage });
++      setHistory((prev) => [
++        { id: result.id, buyerId, channel: "email", subject: trimmedSubject, message: trimmedMessage, createdAt: result.createdAt },
++        ...prev,
++      ]);
++      setSent(true);
++      if (result.buyerEmail) {
++        window.location.href = `mailto:${result.buyerEmail}?subject=${encodeURIComponent(trimmedSubject)}&body=${encodeURIComponent(trimmedMessage)}`;
++      }
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not log this outreach.");
++    } finally {
++      setSending(false);
++    }
++  }
++
++  return (
++    <Card>
++      <CardHeader>
++        <CardTitle className="flex items-center gap-2">
++          <Mail className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Email this buyer
++        </CardTitle>
++        <CardDescription>
++          {buyerEmail
++            ? `Opens your email client addressed to ${buyerEmail} — also logged below for tracking.`
++            : "This buyer hasn't linked a login email yet, so this only logs your outreach for now."}
++        </CardDescription>
++      </CardHeader>
++      <CardContent>
++        <form onSubmit={handleSend} className="space-y-3">
++          <div>
++            <Label htmlFor="outreach-subject">Subject</Label>
++            <Input id="outreach-subject" value={subject} onChange={(e) => setSubject(e.target.value)} required />
++          </div>
++          <div>
++            <Label htmlFor="outreach-message">Message</Label>
++            <Textarea id="outreach-message" rows={5} value={message} onChange={(e) => setMessage(e.target.value)} required />
++          </div>
++
++          {error && <p className="text-sm text-escalated">{error}</p>}
++
++          <div className="flex items-center gap-3">
++            <Button type="submit" loading={sending} disabled={sending}>
++              <Send className="h-4 w-4" /> {buyerEmail ? "Open email" : "Log outreach"}
++            </Button>
++            {sent && <span className="text-sm text-verified">Logged.</span>}
++          </div>
++        </form>
++
++        {!historyLoading && history.length > 0 && (
++          <div className="mt-5 border-t border-border pt-4">
++            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-subtle">Past outreach</p>
++            <div className="space-y-2">
++              {history.slice(0, 5).map((h) => (
++                <div key={h.id} className="flex items-start gap-2 text-sm">
++                  <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-subtle" />
++                  <div className="min-w-0">
++                    <p className="truncate text-foreground">{h.subject ?? "(no subject)"}</p>
++                    <p className="text-xs text-subtle">{formatRelativeTime(h.createdAt)}</p>
++                  </div>
++                </div>
++              ))}
++            </div>
++          </div>
++        )}
++      </CardContent>
++    </Card>
++  );
++}
+diff --git a/src/lib/api/account.ts b/src/lib/api/account.ts
+index a6e9d6b..bdcedef 100644
+--- a/src/lib/api/account.ts
++++ b/src/lib/api/account.ts
+@@ -98,3 +98,26 @@ export interface VendorProfile {
+ export function updateVendorProfile(input: UpdateVendorProfileInput): Promise<VendorProfile> {
+   return callAuthedFunction<VendorProfile>("update-vendor-profile", input);
+ }
++
++export interface RecordVendorOutreachInput {
++  buyerId: string;
++  subject: string;
++  message: string;
++}
++
++export interface RecordedVendorOutreach {
++  logged: boolean;
++  id: string;
++  createdAt: string;
++  buyerEmail: string | null;
++  buyerContactName: string | null;
++  vendorCompanyName: string;
++}
++
++// Logs the outreach for the vendor's own tracking dashboard and returns the
++// buyer's contact email so the caller can open a mailto: link — this app has
++// no transactional email provider wired up, so actual sending happens
++// through the vendor's own email client, not a backend relay.
++export function recordVendorOutreach(input: RecordVendorOutreachInput): Promise<RecordedVendorOutreach> {
++  return callAuthedFunction<RecordedVendorOutreach>("record-vendor-outreach", input);
++}
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index ae4e698..b392731 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -470,6 +470,32 @@ export async function getMeetingRequests(buyerId: string): Promise<MeetingReques
+   }));
+ }
+ 
++// ---- vendor_outreach_events (buyer-side: "a vendor emailed me") -----------
++// Same table vendor-lookup.ts's getVendorOutreachEvents reads scoped to a
++// vendor, filtered by buyer_id instead — feeds the buyer notification feed
++// so a buyer actually sees when a vendor reaches out, not just the vendor's
++// own outbox.
++
++export interface VendorOutreachEventForBuyerRow {
++  id: string;
++  vendorId: string;
++  subject: string | null;
++  createdAt: string;
++}
++
++export async function getVendorOutreachEventsForBuyer(buyerId: string): Promise<VendorOutreachEventForBuyerRow[]> {
++  const params = new URLSearchParams({
++    select: "id,vendor_id,subject,created_at",
++    buyer_id: `eq.${buyerId}`,
++    order: "created_at.desc",
++    limit: "10",
++  });
++  const rows = await restGet<{ id: string; vendor_id: string; subject: string | null; created_at: string }[]>(
++    `vendor_outreach_events?${params}`
++  );
++  return rows.map((r) => ({ id: r.id, vendorId: r.vendor_id, subject: r.subject, createdAt: r.created_at }));
++}
++
+ // ---- buyer_solution_decks ---------------------------------------------------
+ 
+ export interface BuyerSolutionDeckRow {
+diff --git a/src/lib/api/notifications.ts b/src/lib/api/notifications.ts
+index fb0ea1d..45d6811 100644
+--- a/src/lib/api/notifications.ts
++++ b/src/lib/api/notifications.ts
+@@ -3,9 +3,9 @@
+ // into one flat feed for NotificationsMenu — replacing the previous static,
+ // hardcoded 3-item fake array that was shown identically to every role.
+ 
+-import { getCapabilityFrontierItems, getMeetingRequests, getBuyerWorkflowRunHistory } from "@/lib/api/buyer-lookup";
++import { getCapabilityFrontierItems, getMeetingRequests, getBuyerWorkflowRunHistory, getVendorOutreachEventsForBuyer } from "@/lib/api/buyer-lookup";
+ import { getFrontierItemsForVendor, getMeetingRequestsForVendor } from "@/lib/api/vendor-frontier";
+-import { getVendorRecommendationsForVendor, getBuyersByIds } from "@/lib/api/vendor-lookup";
++import { getVendorRecommendationsForVendor, getBuyersByIds, getAllVendors } from "@/lib/api/vendor-lookup";
+ import { getAuditEvents, getRecentOrganizations } from "@/lib/api/admin-lookup";
+ 
+ export interface NotificationItem {
+@@ -21,13 +21,20 @@ function sortAndCap(items: NotificationItem[], limit: number): NotificationItem[
+ }
+ 
+ export async function getBuyerNotifications(buyerId: string): Promise<NotificationItem[]> {
+-  const [frontier, meetings, runs] = await Promise.all([
++  const [frontier, meetings, runs, outreach] = await Promise.all([
+     getCapabilityFrontierItems(buyerId).catch(() => []),
+     getMeetingRequests(buyerId).catch(() => []),
+     getBuyerWorkflowRunHistory(buyerId, 5).catch(() => []),
++    getVendorOutreachEventsForBuyer(buyerId).catch(() => []),
+   ]);
+ 
++  const vendors = outreach.length > 0 ? await getAllVendors().catch(() => []) : [];
++  const vendorNameOf = (id: string) => vendors.find((v) => v.id === id)?.companyName ?? "A vendor";
++
+   const items: NotificationItem[] = [];
++  for (const o of outreach) {
++    items.push({ id: `outreach-${o.id}`, tone: "brand", title: "A vendor reached out", detail: `${vendorNameOf(o.vendorId)}: ${o.subject ?? "New message"}`, time: o.createdAt });
++  }
+   for (const f of frontier) {
+     if (f.status === "vendor_review" || f.status === "vendor_answered" || f.status === "resolved") {
+       items.push({
+diff --git a/src/lib/api/vendor-lookup.ts b/src/lib/api/vendor-lookup.ts
+index f1b1cb5..881ca84 100644
+--- a/src/lib/api/vendor-lookup.ts
++++ b/src/lib/api/vendor-lookup.ts
+@@ -138,6 +138,7 @@ export interface LeadBuyerRow {
+   companySize: number | null;
+   contactName: string | null;
+   contactRole: string | null;
++  email: string | null;
+   createdAt: string;
+ }
+ 
+@@ -148,6 +149,7 @@ function mapBuyerRow(row: {
+   company_size: number | null;
+   contact_name: string | null;
+   contact_role: string | null;
++  email: string | null;
+   created_at: string;
+ }): LeadBuyerRow {
+   return {
+@@ -157,11 +159,12 @@ function mapBuyerRow(row: {
+     companySize: row.company_size,
+     contactName: row.contact_name,
+     contactRole: row.contact_role,
++    email: row.email,
+     createdAt: row.created_at,
+   };
+ }
+ 
+-const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,created_at";
++const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,email,created_at";
+ 
+ // Batch lookup by id — used to resolve buyer names/industries for whichever
+ // set of buyer_ids a vendor_recommendations/buyer_vendor_selections read
+@@ -213,6 +216,32 @@ export async function getVendorRecommendationsForVendor(vendorId: string): Promi
+   return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, fitScore: r.fit_score, keyMatch: r.key_match, reason: r.reason, confidence: r.confidence }));
+ }
+ 
++// ---- interest-over-time (vendor dashboard trend chart) --------------------
++// Buckets vendor_recommendations.created_at by week, the same client-side
++// bucketing admin-lookup.ts's getPlatformActivitySeries already does for the
++// platform-wide chart — this is the vendor-scoped equivalent, showing how
++// many buyers started exploring this vendor's solution each week.
++
++export interface VendorInterestWeek {
++  week: string;
++  buyers: number;
++}
++
++export async function getVendorInterestSeries(vendorId: string, weeks = 6): Promise<VendorInterestWeek[]> {
++  const params = new URLSearchParams({ select: "created_at", vendor_id: `eq.${vendorId}`, order: "created_at.desc", limit: "500" });
++  const rows = await restGet<{ created_at: string }[]>(`vendor_recommendations?${params}`);
++  const timestamps = rows.map((r) => r.created_at);
++  const now = timestamps.length > 0 ? new Date(Math.max(...timestamps.map((t) => new Date(t).getTime()))) : new Date();
++  const buckets = new Array(weeks).fill(0);
++  const weekMs = 7 * 24 * 60 * 60 * 1000;
++  for (const t of timestamps) {
++    const diff = now.getTime() - new Date(t).getTime();
++    const idx = weeks - 1 - Math.floor(diff / weekMs);
++    if (idx >= 0 && idx < weeks) buckets[idx] += 1;
++  }
++  return Array.from({ length: weeks }, (_, i) => ({ week: i === weeks - 1 ? "This wk" : `${weeks - 1 - i}w ago`, buyers: buckets[i] }));
++}
++
+ // ---- buyer_vendor_selections (vendor-side: who actively picked us) --------
+ 
+ export interface BuyerVendorSelectionForVendorRow {
+@@ -351,6 +380,33 @@ export async function getRealityProfileForBuyer(buyerId: string): Promise<Vendor
+ // already read these tables filtered by vendor_id only; these two add the
+ // buyer_id filter for the vendor's per-buyer detail page.
+ 
++// ---- vendor_outreach_events (vendor-side: "who have we reached out to") --
++// Backs the "Email this buyer" flow's history panel and the vendor
++// dashboard's outreach stat/trend — logged by the record-vendor-outreach
++// edge function, read here the same public-anon-key way as every other
++// vendor-scoped table in this file.
++
++export interface VendorOutreachEventRow {
++  id: string;
++  buyerId: string;
++  channel: string;
++  subject: string | null;
++  message: string | null;
++  createdAt: string;
++}
++
++export async function getVendorOutreachEvents(vendorId: string): Promise<VendorOutreachEventRow[]> {
++  const params = new URLSearchParams({
++    select: "id,buyer_id,channel,subject,message,created_at",
++    vendor_id: `eq.${vendorId}`,
++    order: "created_at.desc",
++  });
++  const rows = await restGet<
++    { id: string; buyer_id: string; channel: string; subject: string | null; message: string | null; created_at: string }[]
++  >(`vendor_outreach_events?${params}`);
++  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, channel: r.channel, subject: r.subject, message: r.message, createdAt: r.created_at }));
++}
++
+ export async function getFrontierCountForVendor(vendorId: string): Promise<number> {
+   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
+   const params = new URLSearchParams({
+-- 
+2.43.0
+

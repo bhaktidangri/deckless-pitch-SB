@@ -1,0 +1,117 @@
+openapi: 3.1.0
+info:
+  title: Save Buyer Solution Deck
+  version: "1.0.0"
+servers:
+  - url: https://rrtmvsfpzurafzycjboz.supabase.co
+paths:
+  /functions/v1/save-buyer-solution-deck:
+    post:
+      operationId: saveBuyerSolutionDeck
+      summary: Persist a buyer-facing solution pitch deck (.pptx) delivery.
+      description: >-
+        Stores one generated solution pitch deck for a buyer. Accepts either a
+        fileUrl (fetched and re-uploaded to storage) or fileBase64 (decoded
+        and uploaded directly) — provide exactly one. On upload success the
+        deck is stored and status is "ready"; if no file could be captured,
+        the record is still saved with status "failed" and pptxUrl null, for
+        diagnosability rather than silently dropping the delivery.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - buyerId
+              properties:
+                buyerId:
+                  type: string
+                  description: The buyer this deck belongs to.
+                vendorId:
+                  type: [string, "null"]
+                  description: The vendor this deck was generated for, if applicable.
+                solutionModelId:
+                  type: [string, "null"]
+                  description: The solution model this deck was generated from, if applicable.
+                workflowRunId:
+                  type: [string, "null"]
+                  description: The Yoxa workflow run that generated this deck.
+                title:
+                  type: string
+                  description: Deck title. Defaults to "Solution Pitch Deck" if omitted.
+                fileUrl:
+                  type: string
+                  description: A URL the deck file can be fetched from. Provide this or fileBase64, not both.
+                fileBase64:
+                  type: string
+                  description: "The deck file, base64-encoded (a data: URL prefix is also accepted). Provide this or fileUrl, not both."
+                fileName:
+                  type: string
+                  description: Desired file name for the stored deck. Defaults to "solution-pitch-deck.pptx".
+                rawPayload:
+                  description: Full original payload to store for forensics. Defaults to the whole request body if omitted.
+      responses:
+        "200":
+          description: Deck record saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - id
+                  - buyerId
+                  - pptxUrl
+                  - status
+                properties:
+                  id:
+                    type: string
+                    description: Identifier of the saved deck record.
+                  buyerId:
+                    type: string
+                  pptxUrl:
+                    type: [string, "null"]
+                    description: Public URL of the stored deck file, or null if the file could not be captured.
+                  status:
+                    type: string
+                    enum: [ready, failed]
+        "400":
+          description: The request was missing buyerId or was not valid JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+        "405":
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+        "500":
+          description: The deck record could not be saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: Server storage is not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string

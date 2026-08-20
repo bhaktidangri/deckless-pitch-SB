@@ -1,0 +1,3415 @@
+From 1b6d1a1cb5f7efb7a2861112bb5c02196871347a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 08:21:46 +0000
+Subject: [PATCH] Fix real data visibility across vendor/admin portals and
+ buyer catalog browsing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause: every RLS policy on buyer/vendor cross-role tables required
+is_org_member()/is_platform_admin(), both gated on auth.uid() — but this
+app has no Supabase Auth session anywhere (identity is tracked client-side
+via localStorage), so every anon-key REST read was silently returning zero
+rows. Added read-only public SELECT policies (buyers, buyer_requirements,
+vendor_recommendations, buyer_vendor_selections, capability_frontier,
+solution_matches, gap_items, meeting_requests, solution_models,
+roi_projections, solution_scenarios, conversations, messages,
+organizations, audit_events) — writes remain gated by the existing
+org-membership policies and edge functions.
+
+On top of that fix: real vendor-side reads (buyer lists, buyer detail,
+matches/gaps/requirements), a new admin-lookup module, and rebuilt
+vendor/admin dashboards, vendor buyer list + detail pages, and all three
+admin management/audit pages off live Supabase data instead of
+dummy-data.ts. Also: buyer role-switcher label was hardcoded with no
+override (vendor already had one) — added buyerSubLabel; notifications
+menu was a static fake 3-item list shown to every role — replaced with
+real role-scoped notifications (frontier/meetings/runs for buyers,
+frontier/meetings/recommendations for vendors, audit/org events for
+admin); buyer vendor catalog only showed recommendations — added an "All
+vendors" tab so buyers can browse the full published catalog; vendor nav's
+Capability Frontier badge now reflects the real open count instead of a
+dummy-data count. Removed dummy-data.ts and two now-dead components
+(chat-panel, presentation-deck) once nothing imported them.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BZibWYPysw75xiFQpbHszf
+---
+ src/app/admin/audit/page.tsx                 |  29 +-
+ src/app/admin/buyers/page.tsx                | 133 ++--
+ src/app/admin/page.tsx                       | 100 ++-
+ src/app/admin/vendors/page.tsx               | 110 ++--
+ src/app/buyer/layout.tsx                     |   2 +
+ src/app/buyer/vendors/page.tsx               | 150 +++--
+ src/app/vendor/buyers/[id]/page.tsx          | 241 ++++++--
+ src/app/vendor/buyers/page.tsx               | 154 +++--
+ src/app/vendor/layout.tsx                    |  43 +-
+ src/app/vendor/page.tsx                      | 158 ++++-
+ src/components/layout/notifications-menu.tsx | 109 ++--
+ src/components/layout/portal-shell.tsx       |  12 +-
+ src/components/layout/role-switcher.tsx      |  10 +-
+ src/components/shared/chat-panel.tsx         | 221 -------
+ src/components/shared/presentation-deck.tsx  |  90 ---
+ src/lib/api/admin-lookup.ts                  | 205 +++++++
+ src/lib/api/notifications.ts                 | 103 ++++
+ src/lib/api/vendor-lookup.ts                 | 309 ++++++++++
+ src/lib/dummy-data.ts                        | 609 -------------------
+ 19 files changed, 1536 insertions(+), 1252 deletions(-)
+ delete mode 100644 src/components/shared/chat-panel.tsx
+ delete mode 100644 src/components/shared/presentation-deck.tsx
+ create mode 100644 src/lib/api/admin-lookup.ts
+ create mode 100644 src/lib/api/notifications.ts
+ delete mode 100644 src/lib/dummy-data.ts
+
+diff --git a/src/app/admin/audit/page.tsx b/src/app/admin/audit/page.tsx
+index a4565bd..e41e179 100644
+--- a/src/app/admin/audit/page.tsx
++++ b/src/app/admin/audit/page.tsx
+@@ -1,17 +1,36 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent } from "@/components/ui/card";
+ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+ import { AuditTimeline } from "@/components/shared/audit-timeline";
+-import { auditEvents } from "@/lib/dummy-data";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { getAuditEvents } from "@/lib/api/admin-lookup";
++import type { AuditEvent } from "@/lib/types";
+ 
++// These are the real agent names the Yoxa workflow writes into audit_events
++// (see supabase-buyer/README.md's workflow-agent roster) — kept as tab
++// labels even while the table is still empty, since they're the actual
++// system's categories, not fabricated data.
+ const agents = ["all", "Vendor Intelligence Agent", "Buyer Discovery Agent", "Solution Matching Agent", "Solution Model Agent", "Grounding & Escalation Agent"];
+ 
+ export default function AdminAuditPage() {
+   const [tab, setTab] = useState("all");
+-  const filtered = tab === "all" ? auditEvents : auditEvents.filter((e) => e.agentName === tab);
++  const [events, setEvents] = useState<AuditEvent[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    getAuditEvents(200)
++      .then((e) => !cancelled && setEvents(e))
++      .finally(() => !cancelled && setLoading(false));
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const filtered = tab === "all" ? events : events.filter((e) => e.agentName === tab);
+ 
+   return (
+     <div>
+@@ -32,7 +51,9 @@ export default function AdminAuditPage() {
+         <TabsContent value={tab}>
+           <Card>
+             <CardContent className="pt-6">
+-              {filtered.length > 0 ? (
++              {loading ? (
++                <AgentWaitingState variant="card" title="Loading audit trail" />
++              ) : filtered.length > 0 ? (
+                 <AuditTimeline events={filtered} />
+               ) : (
+                 <p className="py-10 text-center text-sm text-muted">No events for this agent yet.</p>
+diff --git a/src/app/admin/buyers/page.tsx b/src/app/admin/buyers/page.tsx
+index 9deeb17..dbc0dc7 100644
+--- a/src/app/admin/buyers/page.tsx
++++ b/src/app/admin/buyers/page.tsx
+@@ -1,26 +1,67 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import { MoreHorizontal, Search } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card } from "@/components/ui/card";
+ import { Input } from "@/components/ui/input";
+ import { Badge } from "@/components/ui/badge";
+ import { Avatar } from "@/components/ui/avatar";
+-import { engagements } from "@/lib/dummy-data";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import {
++  getAllBuyers,
++  getAllVendorRecommendations,
++  getAllBuyerVendorSelections,
++  type LeadBuyerRow,
++} from "@/lib/api/admin-lookup";
+ import { formatRelativeTime } from "@/lib/utils";
+ 
++interface BuyerRow {
++  buyer: LeadBuyerRow;
++  stage: "Discovery" | "Vendor Selection" | "Solution Workspace";
++  fitScore: number | null;
++}
++
+ const stageTone: Record<string, "verified" | "modelled" | "brand" | "default"> = {
+   Discovery: "default",
+   "Vendor Selection": "brand",
+   "Solution Workspace": "modelled",
+-  "Solution Review": "modelled",
+-  "Closed - Won": "verified",
+ };
+ 
+ export default function AdminBuyersPage() {
+   const [query, setQuery] = useState("");
+-  const filtered = engagements.filter((e) => e.buyerName.toLowerCase().includes(query.toLowerCase()));
++  const [rows, setRows] = useState<BuyerRow[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    async function load() {
++      try {
++        const [buyers, recs, selections] = await Promise.all([getAllBuyers(), getAllVendorRecommendations(), getAllBuyerVendorSelections()]);
++        if (cancelled) return;
++        setRows(
++          buyers.map((buyer) => {
++            const bestFit = recs.filter((r) => r.buyerId === buyer.id).sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0))[0];
++            const buyerSelections = selections.filter((s) => s.buyerId === buyer.id);
++            const stage: BuyerRow["stage"] = buyerSelections.some((s) => s.isActive)
++              ? "Solution Workspace"
++              : buyerSelections.length > 0
++                ? "Vendor Selection"
++                : "Discovery";
++            return { buyer, stage, fitScore: bestFit?.fitScore ?? null };
++          })
++        );
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const filtered = rows.filter((r) => r.buyer.companyName.toLowerCase().includes(query.toLowerCase()));
+ 
+   return (
+     <div>
+@@ -31,45 +72,51 @@ export default function AdminBuyersPage() {
+         <Input placeholder="Search buyers..." className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} />
+       </div>
+ 
+-      <Card className="overflow-hidden">
+-        <div className="overflow-x-auto">
+-          <table className="w-full text-sm">
+-            <thead>
+-              <tr className="border-b border-border bg-surface-2 text-left text-xs font-medium uppercase tracking-wide text-subtle">
+-                <th className="px-5 py-3">Buyer</th>
+-                <th className="px-5 py-3">Industry</th>
+-                <th className="px-5 py-3">Stage</th>
+-                <th className="px-5 py-3">Fit score</th>
+-                <th className="px-5 py-3">Last active</th>
+-                <th className="px-5 py-3" />
+-              </tr>
+-            </thead>
+-            <tbody>
+-              {filtered.map((e) => (
+-                <tr key={e.id} className="border-b border-border last:border-0 hover:bg-surface-2">
+-                  <td className="px-5 py-3.5">
+-                    <div className="flex items-center gap-2.5">
+-                      <Avatar name={e.buyerName} size="sm" color="accent" />
+-                      <p className="font-medium text-foreground">{e.buyerName}</p>
+-                    </div>
+-                  </td>
+-                  <td className="px-5 py-3.5 text-muted">{e.industry}</td>
+-                  <td className="px-5 py-3.5">
+-                    <Badge variant={stageTone[e.stage] ?? "default"} size="sm">{e.stage}</Badge>
+-                  </td>
+-                  <td className="px-5 py-3.5 font-medium text-brand-600 dark:text-brand-400">{e.fitScore}%</td>
+-                  <td className="px-5 py-3.5 text-muted">{formatRelativeTime(e.lastActive)}</td>
+-                  <td className="px-5 py-3.5 text-right">
+-                    <button className="rounded-md p-1.5 text-subtle hover:bg-surface-hover hover:text-foreground">
+-                      <MoreHorizontal className="h-4 w-4" />
+-                    </button>
+-                  </td>
++      {loading ? (
++        <AgentWaitingState variant="card" title="Loading buyers" />
++      ) : filtered.length === 0 ? (
++        <Card className="p-6 text-center text-sm text-muted">{rows.length === 0 ? "No buyers registered yet." : `No buyer matches "${query}".`}</Card>
++      ) : (
++        <Card className="overflow-hidden">
++          <div className="overflow-x-auto">
++            <table className="w-full text-sm">
++              <thead>
++                <tr className="border-b border-border bg-surface-2 text-left text-xs font-medium uppercase tracking-wide text-subtle">
++                  <th className="px-5 py-3">Buyer</th>
++                  <th className="px-5 py-3">Industry</th>
++                  <th className="px-5 py-3">Stage</th>
++                  <th className="px-5 py-3">Best fit</th>
++                  <th className="px-5 py-3">Joined</th>
++                  <th className="px-5 py-3" />
+                 </tr>
+-              ))}
+-            </tbody>
+-          </table>
+-        </div>
+-      </Card>
++              </thead>
++              <tbody>
++                {filtered.map((r) => (
++                  <tr key={r.buyer.id} className="border-b border-border last:border-0 hover:bg-surface-2">
++                    <td className="px-5 py-3.5">
++                      <div className="flex items-center gap-2.5">
++                        <Avatar name={r.buyer.companyName} size="sm" color="accent" />
++                        <p className="font-medium text-foreground">{r.buyer.companyName}</p>
++                      </div>
++                    </td>
++                    <td className="px-5 py-3.5 text-muted">{r.buyer.industry ?? "—"}</td>
++                    <td className="px-5 py-3.5">
++                      <Badge variant={stageTone[r.stage]} size="sm">{r.stage}</Badge>
++                    </td>
++                    <td className="px-5 py-3.5 font-medium text-brand-600 dark:text-brand-400">{r.fitScore != null ? `${r.fitScore}%` : "—"}</td>
++                    <td className="px-5 py-3.5 text-muted">{formatRelativeTime(r.buyer.createdAt)}</td>
++                    <td className="px-5 py-3.5 text-right">
++                      <button className="rounded-md p-1.5 text-subtle hover:bg-surface-hover hover:text-foreground">
++                        <MoreHorizontal className="h-4 w-4" />
++                      </button>
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        </Card>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/app/admin/page.tsx b/src/app/admin/page.tsx
+index 1552fd8..8306198 100644
+--- a/src/app/admin/page.tsx
++++ b/src/app/admin/page.tsx
+@@ -1,5 +1,6 @@
+ "use client";
+ 
++import { useEffect, useState } from "react";
+ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+ import { Building2, FileCheck2, ShieldCheck, Sparkles, Users } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+@@ -8,11 +9,60 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { Avatar } from "@/components/ui/avatar";
+ import { AuditTimeline } from "@/components/shared/audit-timeline";
+-import { auditEvents, dashboardStats, platformActivity, recentOrganizations } from "@/lib/dummy-data";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import {
++  getPlatformStats,
++  getPlatformActivitySeries,
++  getRecentOrganizations,
++  getAuditEvents,
++  type PlatformStats,
++  type PlatformActivityWeek,
++  type OrganizationRow,
++} from "@/lib/api/admin-lookup";
+ import { formatRelativeTime } from "@/lib/utils";
++import type { AuditEvent } from "@/lib/types";
+ 
+ export default function AdminDashboardPage() {
+-  const stats = dashboardStats.admin;
++  const [stats, setStats] = useState<PlatformStats | null>(null);
++  const [activity, setActivity] = useState<PlatformActivityWeek[]>([]);
++  const [orgs, setOrgs] = useState<OrganizationRow[]>([]);
++  const [events, setEvents] = useState<AuditEvent[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    async function load() {
++      try {
++        const [s, a, o, e] = await Promise.all([
++          getPlatformStats(),
++          getPlatformActivitySeries(6),
++          getRecentOrganizations(6),
++          getAuditEvents(10),
++        ]);
++        if (cancelled) return;
++        setStats(s);
++        setActivity(a);
++        setOrgs(o);
++        setEvents(e);
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    const interval = setInterval(load, 20000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, []);
++
++  if (loading || !stats) {
++    return (
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading platform overview" description="Pulling live organization, vendor, and buyer counts." />
++      </div>
++    );
++  }
+ 
+   return (
+     <div>
+@@ -23,11 +73,17 @@ export default function AdminDashboardPage() {
+       />
+ 
+       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+-        <StatCard label="Organizations" value={String(stats.totalOrganizations)} icon={Building2} />
+-        <StatCard label="Active vendors" value={String(stats.activeVendors)} icon={ShieldCheck} tone="brand" />
+-        <StatCard label="Active buyers" value={String(stats.activeBuyers)} icon={Users} tone="accent" />
+-        <StatCard label="Solution models" value={String(stats.totalSolutionModels)} icon={Sparkles} tone="modelled" />
+-        <StatCard label="Grounded answer rate" value={`${stats.groundedAnswerRate}%`} icon={FileCheck2} tone="verified" />
++        <StatCard label="Organizations" value={String(stats.totalOrganizations)} icon={Building2} index={0} />
++        <StatCard label="Active vendors" value={String(stats.activeVendors)} icon={ShieldCheck} tone="brand" index={1} />
++        <StatCard label="Active buyers" value={String(stats.activeBuyers)} icon={Users} tone="accent" index={2} />
++        <StatCard label="Solution models" value={String(stats.totalSolutionModels)} icon={Sparkles} tone="modelled" index={3} />
++        <StatCard
++          label="Grounded answer rate"
++          value={stats.groundedAnswerRate != null ? `${stats.groundedAnswerRate}%` : "—"}
++          icon={FileCheck2}
++          tone="verified"
++          index={4}
++        />
+       </div>
+ 
+       <div className="mt-6 grid gap-6 lg:grid-cols-3">
+@@ -38,7 +94,7 @@ export default function AdminDashboardPage() {
+           <CardContent className="pt-2">
+             <div className="h-64 w-full">
+               <ResponsiveContainer width="100%" height="100%">
+-                <BarChart data={platformActivity} margin={{ top: 10, right: 8, left: -20, bottom: 0 }}>
++                <BarChart data={activity} margin={{ top: 10, right: 8, left: -20, bottom: 0 }}>
+                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                   <XAxis dataKey="week" tick={{ fill: "var(--muted)", fontSize: 12 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
+                   <YAxis tick={{ fill: "var(--muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={32} />
+@@ -52,13 +108,13 @@ export default function AdminDashboardPage() {
+                     }}
+                   />
+                   <Bar dataKey="solutions" fill="var(--brand-500)" radius={[4, 4, 0, 0]} name="Solution models" />
+-                  <Bar dataKey="questions" fill="var(--accent-400)" radius={[4, 4, 0, 0]} name="Questions resolved" />
++                  <Bar dataKey="questions" fill="var(--accent-400)" radius={[4, 4, 0, 0]} name="Frontier questions" />
+                 </BarChart>
+               </ResponsiveContainer>
+             </div>
+             <div className="mt-2 flex items-center justify-center gap-5 text-xs text-muted">
+               <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-brand-500" /> Solution models generated</span>
+-              <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-accent-400" /> Questions resolved</span>
++              <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-accent-400" /> Frontier questions raised</span>
+             </div>
+           </CardContent>
+         </Card>
+@@ -68,16 +124,20 @@ export default function AdminDashboardPage() {
+             <CardTitle>Recent organizations</CardTitle>
+           </CardHeader>
+           <CardContent className="space-y-1 pt-2">
+-            {recentOrganizations.map((org) => (
+-              <div key={org.id} className="flex items-center gap-3 py-2">
+-                <Avatar name={org.name} size="sm" color={org.type === "vendor" ? "brand" : "accent"} />
+-                <div className="min-w-0 flex-1">
+-                  <p className="truncate text-sm font-medium text-foreground">{org.name}</p>
+-                  <p className="text-xs text-muted capitalize">{org.type} &middot; {formatRelativeTime(org.joinedAt)}</p>
++            {orgs.length === 0 ? (
++              <p className="py-8 text-center text-sm text-muted">No organizations yet.</p>
++            ) : (
++              orgs.map((org) => (
++                <div key={org.id} className="flex items-center gap-3 py-2">
++                  <Avatar name={org.name} size="sm" color={org.type === "vendor" ? "brand" : "accent"} />
++                  <div className="min-w-0 flex-1">
++                    <p className="truncate text-sm font-medium text-foreground">{org.name}</p>
++                    <p className="text-xs text-muted capitalize">{org.type} &middot; {formatRelativeTime(org.createdAt)}</p>
++                  </div>
++                  <Badge variant="modelled" size="sm" className="capitalize">{org.type}</Badge>
+                 </div>
+-                <Badge variant={org.status === "verified" ? "verified" : "modelled"} size="sm">{org.status}</Badge>
+-              </div>
+-            ))}
++              ))
++            )}
+           </CardContent>
+         </Card>
+       </div>
+@@ -87,7 +147,7 @@ export default function AdminDashboardPage() {
+           <CardTitle>Platform-wide agent activity</CardTitle>
+         </CardHeader>
+         <CardContent className="pt-4">
+-          <AuditTimeline events={auditEvents} />
++          {events.length > 0 ? <AuditTimeline events={events} /> : <p className="py-8 text-center text-sm text-muted">No agent activity recorded yet.</p>}
+         </CardContent>
+       </Card>
+     </div>
+diff --git a/src/app/admin/vendors/page.tsx b/src/app/admin/vendors/page.tsx
+index af27c49..a8265cb 100644
+--- a/src/app/admin/vendors/page.tsx
++++ b/src/app/admin/vendors/page.tsx
+@@ -1,17 +1,31 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import { MoreHorizontal, Search } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card } from "@/components/ui/card";
+ import { Input } from "@/components/ui/input";
+ import { Badge } from "@/components/ui/badge";
+ import { Avatar } from "@/components/ui/avatar";
+-import { vendors } from "@/lib/dummy-data";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { getAllVendors, type VendorDetailRow } from "@/lib/api/admin-lookup";
+ 
+ export default function AdminVendorsPage() {
+   const [query, setQuery] = useState("");
+-  const filtered = vendors.filter((v) => v.name.toLowerCase().includes(query.toLowerCase()));
++  const [vendors, setVendors] = useState<VendorDetailRow[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    let cancelled = false;
++    getAllVendors()
++      .then((v) => !cancelled && setVendors(v))
++      .finally(() => !cancelled && setLoading(false));
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const filtered = vendors.filter((v) => v.companyName.toLowerCase().includes(query.toLowerCase()));
+ 
+   return (
+     <div>
+@@ -22,50 +36,54 @@ export default function AdminVendorsPage() {
+         <Input placeholder="Search vendors..." className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} />
+       </div>
+ 
+-      <Card className="overflow-hidden">
+-        <div className="overflow-x-auto">
+-          <table className="w-full text-sm">
+-            <thead>
+-              <tr className="border-b border-border bg-surface-2 text-left text-xs font-medium uppercase tracking-wide text-subtle">
+-                <th className="px-5 py-3">Vendor</th>
+-                <th className="px-5 py-3">Industry</th>
+-                <th className="px-5 py-3">Employees</th>
+-                <th className="px-5 py-3">HQ</th>
+-                <th className="px-5 py-3">Status</th>
+-                <th className="px-5 py-3" />
+-              </tr>
+-            </thead>
+-            <tbody>
+-              {filtered.map((v) => (
+-                <tr key={v.id} className="border-b border-border last:border-0 hover:bg-surface-2">
+-                  <td className="px-5 py-3.5">
+-                    <div className="flex items-center gap-2.5">
+-                      <Avatar name={v.name} size="sm" color="brand" />
+-                      <div>
+-                        <p className="font-medium text-foreground">{v.name}</p>
+-                        <p className="text-xs text-subtle">{v.website}</p>
+-                      </div>
+-                    </div>
+-                  </td>
+-                  <td className="px-5 py-3.5 text-muted">{v.industry}</td>
+-                  <td className="px-5 py-3.5 text-muted">{v.employeeRange}</td>
+-                  <td className="px-5 py-3.5 text-muted">{v.hq}</td>
+-                  <td className="px-5 py-3.5">
+-                    <Badge variant={v.verificationStatus === "verified" ? "verified" : "modelled"} size="sm" className="capitalize">
+-                      {v.verificationStatus}
+-                    </Badge>
+-                  </td>
+-                  <td className="px-5 py-3.5 text-right">
+-                    <button className="rounded-md p-1.5 text-subtle hover:bg-surface-hover hover:text-foreground">
+-                      <MoreHorizontal className="h-4 w-4" />
+-                    </button>
+-                  </td>
++      {loading ? (
++        <AgentWaitingState variant="card" title="Loading vendors" />
++      ) : filtered.length === 0 ? (
++        <Card className="p-6 text-center text-sm text-muted">{vendors.length === 0 ? "No vendors registered yet." : `No vendor matches "${query}".`}</Card>
++      ) : (
++        <Card className="overflow-hidden">
++          <div className="overflow-x-auto">
++            <table className="w-full text-sm">
++              <thead>
++                <tr className="border-b border-border bg-surface-2 text-left text-xs font-medium uppercase tracking-wide text-subtle">
++                  <th className="px-5 py-3">Vendor</th>
++                  <th className="px-5 py-3">Industry</th>
++                  <th className="px-5 py-3">HQ</th>
++                  <th className="px-5 py-3">Status</th>
++                  <th className="px-5 py-3" />
+                 </tr>
+-              ))}
+-            </tbody>
+-          </table>
+-        </div>
+-      </Card>
++              </thead>
++              <tbody>
++                {filtered.map((v) => (
++                  <tr key={v.id} className="border-b border-border last:border-0 hover:bg-surface-2">
++                    <td className="px-5 py-3.5">
++                      <div className="flex items-center gap-2.5">
++                        <Avatar name={v.companyName} size="sm" color="brand" />
++                        <div>
++                          <p className="font-medium text-foreground">{v.companyName}</p>
++                          {v.website && <p className="text-xs text-subtle">{v.website}</p>}
++                        </div>
++                      </div>
++                    </td>
++                    <td className="px-5 py-3.5 text-muted">{v.industry ?? "—"}</td>
++                    <td className="px-5 py-3.5 text-muted">{v.hq ?? "—"}</td>
++                    <td className="px-5 py-3.5">
++                      <Badge variant={v.verificationStatus === "verified" ? "verified" : "modelled"} size="sm" className="capitalize">
++                        {v.verificationStatus}
++                      </Badge>
++                    </td>
++                    <td className="px-5 py-3.5 text-right">
++                      <button className="rounded-md p-1.5 text-subtle hover:bg-surface-hover hover:text-foreground">
++                        <MoreHorizontal className="h-4 w-4" />
++                      </button>
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        </Card>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/app/buyer/layout.tsx b/src/app/buyer/layout.tsx
+index fdb14b1..6280ee6 100644
+--- a/src/app/buyer/layout.tsx
++++ b/src/app/buyer/layout.tsx
+@@ -57,6 +57,8 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
+       sections={sections}
+       userName={companyName ?? "Not started yet"}
+       userRole="Buyer"
++      buyerSubLabel={companyName ?? undefined}
++      buyerId={buyerId}
+       headerSlot={
+         <>
+           <GlobalCapabilitySearch />
+diff --git a/src/app/buyer/vendors/page.tsx b/src/app/buyer/vendors/page.tsx
+index 7f8449d..f975ca1 100644
+--- a/src/app/buyer/vendors/page.tsx
++++ b/src/app/buyer/vendors/page.tsx
+@@ -8,10 +8,12 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
+ import { buttonVariants } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { Badge } from "@/components/ui/badge";
++import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+ import { LoadingState } from "@/components/shared/loading-state";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
+ import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
+ import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { Globe, ArrowUpRight } from "lucide-react";
+ import {
+   getActiveVendorSelection,
+   getVendorRecommendations,
+@@ -55,6 +57,7 @@ export default function BuyerVendorsPage() {
+   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
+   const [loading, setLoading] = useState(true);
+   const [query, setQuery] = useState("");
++  const [view, setView] = useState<"recommended" | "all">("recommended");
+ 
+   const selection = usePendingApproval("confirm_vendor_selection", {
+     buyerId,
+@@ -117,6 +120,16 @@ export default function BuyerVendorsPage() {
+     });
+   }, [query, recommendations, vendorsById]);
+ 
++  const allVendors = useMemo(() => Object.values(vendorsById), [vendorsById]);
++  const filteredAllVendors = useMemo(() => {
++    const q = query.trim().toLowerCase();
++    if (!q) return allVendors;
++    return allVendors.filter((vendor) => {
++      const fields = [vendor.companyName, vendor.industry, vendor.tagline, vendor.description, ...vendor.industries].filter(Boolean).join(" ").toLowerCase();
++      return fields.includes(q) || capabilityHaystack(vendor).includes(q);
++    });
++  }, [query, allVendors]);
++
+   if (!buyerId) {
+     return (
+       <div>
+@@ -177,57 +190,126 @@ export default function BuyerVendorsPage() {
+         )
+       )}
+ 
+-      {!loading && recommendations.length > 0 && (
+-        <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+-          <div className="relative max-w-sm flex-1">
+-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+-            <Input
+-              value={query}
+-              onChange={(e) => setQuery(e.target.value)}
+-              placeholder="Search by capability, industry, or vendor…"
+-              className="pl-9 pr-9"
+-              aria-label="Search vendors by capability"
+-            />
+-            {query && (
+-              <button
+-                type="button"
+-                onClick={() => setQuery("")}
+-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
+-                aria-label="Clear search"
+-              >
+-                <X className="h-4 w-4" />
+-              </button>
+-            )}
++      {!loading && (recommendations.length > 0 || allVendors.length > 0) && (
++        <>
++          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
++            <Tabs value={view} onValueChange={(v) => setView(v as "recommended" | "all")}>
++              <TabsList>
++                <TabsTrigger value="recommended">Recommended for you ({recommendations.length})</TabsTrigger>
++                <TabsTrigger value="all">All vendors ({allVendors.length})</TabsTrigger>
++              </TabsList>
++            </Tabs>
++            <div className="relative max-w-sm flex-1 sm:max-w-xs">
++              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
++              <Input
++                value={query}
++                onChange={(e) => setQuery(e.target.value)}
++                placeholder="Search by capability, industry, or vendor…"
++                className="pl-9 pr-9"
++                aria-label="Search vendors by capability"
++              />
++              {query && (
++                <button
++                  type="button"
++                  onClick={() => setQuery("")}
++                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-subtle hover:text-foreground"
++                  aria-label="Clear search"
++                >
++                  <X className="h-4 w-4" />
++                </button>
++              )}
++            </div>
+           </div>
+-          {query && (
+-            <p className="text-xs text-muted">
+-              {filteredRecommendations.length} of {recommendations.length} vendor{recommendations.length === 1 ? "" : "s"} match
+-            </p>
+-          )}
+-        </div>
++        </>
+       )}
+ 
+       {loading ? (
+         <LoadingState variant="cards" count={3} />
+-      ) : recommendations.length === 0 ? (
+-        <Card className="p-6 text-center text-sm text-muted">No vendor recommendations yet — check back shortly.</Card>
+-      ) : filteredRecommendations.length === 0 ? (
++      ) : view === "recommended" ? (
++        recommendations.length === 0 ? (
++          <Card className="p-6 text-center text-sm text-muted">
++            No vendor recommendations yet — check back shortly, or browse the full catalog in the &ldquo;All vendors&rdquo; tab above.
++          </Card>
++        ) : filteredRecommendations.length === 0 ? (
++          <Card className="p-6 text-center text-sm text-muted">
++            No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
++          </Card>
++        ) : (
++          <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
++            {filteredRecommendations.map((r) => {
++              const vendor = vendorsById[r.vendorId];
++              const matched = matchingCapabilityName(vendor, query);
++              return (
++                <div key={r.id} className="flex flex-col gap-2">
++                  {matched && (
++                    <Badge variant="brand" size="sm" className="w-fit">
++                      Matches: {matched}
++                    </Badge>
++                  )}
++                  <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
++                </div>
++              );
++            })}
++          </div>
++        )
++      ) : allVendors.length === 0 ? (
++        <Card className="p-6 text-center text-sm text-muted">No vendors have published their Solution DNA yet.</Card>
++      ) : filteredAllVendors.length === 0 ? (
+         <Card className="p-6 text-center text-sm text-muted">
+           No vendor matches &ldquo;{query}&rdquo; — try a broader capability, industry, or vendor name.
+         </Card>
+       ) : (
+         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+-          {filteredRecommendations.map((r) => {
+-            const vendor = vendorsById[r.vendorId];
++          {filteredAllVendors.map((vendor) => {
+             const matched = matchingCapabilityName(vendor, query);
++            const rec = recommendations.find((r) => r.vendorId === vendor.vendorId);
+             return (
+-              <div key={r.id} className="flex flex-col gap-2">
++              <div key={vendor.vendorId} className="flex flex-col gap-2">
+                 {matched && (
+                   <Badge variant="brand" size="sm" className="w-fit">
+                     Matches: {matched}
+                   </Badge>
+                 )}
+-                <VendorRecommendationCard recommendation={r} vendor={vendor} href={`/buyer/vendors/${r.vendorId}`} />
++                <Card className="group flex flex-col overflow-hidden transition-all hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
++                  <div className="flex items-start justify-between gap-3 p-5 pb-4">
++                    <div className="flex items-center gap-3">
++                      <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-accent-500 text-sm font-bold text-white">
++                        {vendor.companyName.slice(0, 2).toUpperCase()}
++                      </div>
++                      <div>
++                        <h3 className="text-sm font-semibold text-foreground">{vendor.companyName}</h3>
++                        <p className="flex items-center gap-1 text-xs text-muted">
++                          {vendor.industry && <Globe className="h-3 w-3" />} {vendor.industry ?? "—"}
++                        </p>
++                      </div>
++                    </div>
++                    {rec?.fitScore != null && (
++                      <div className="flex flex-col items-end shrink-0">
++                        <span className="text-lg font-bold text-brand-600 dark:text-brand-400">{rec.fitScore}%</span>
++                        <span className="text-[10px] uppercase tracking-wide text-subtle">fit</span>
++                      </div>
++                    )}
++                  </div>
++                  {vendor.description && (
++                    <div className="px-5">
++                      <p className="text-sm text-muted line-clamp-2">{vendor.description}</p>
++                    </div>
++                  )}
++                  {vendor.industries.length > 0 && (
++                    <div className="mt-4 flex flex-wrap gap-1.5 px-5">
++                      {vendor.industries.slice(0, 3).map((ind) => (
++                        <Badge key={ind} variant="outline" size="sm">
++                          {ind}
++                        </Badge>
++                      ))}
++                    </div>
++                  )}
++                  <div className="mt-auto flex gap-2 border-t border-border p-3">
++                    <Link href={`/buyer/vendors/${vendor.vendorId}`} className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "flex-1")}>
++                      View profile <ArrowUpRight className="h-3.5 w-3.5" />
++                    </Link>
++                  </div>
++                </Card>
+               </div>
+             );
+           })}
+diff --git a/src/app/vendor/buyers/[id]/page.tsx b/src/app/vendor/buyers/[id]/page.tsx
+index 9b805f0..8d26bef 100644
+--- a/src/app/vendor/buyers/[id]/page.tsx
++++ b/src/app/vendor/buyers/[id]/page.tsx
+@@ -1,6 +1,8 @@
++"use client";
++
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { notFound } from "next/navigation";
+-import { ArrowLeft, Building2, CalendarClock, FileSearch, Mail, TrendingUp, User } from "lucide-react";
++import { ArrowLeft, Building2, CalendarClock, FileSearch, TrendingUp, User } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+@@ -9,24 +11,133 @@ import { Avatar } from "@/components/ui/avatar";
+ import { GapCard } from "@/components/shared/gap-card";
+ import { MatchRow } from "@/components/shared/match-row";
+ import { FrontierCard } from "@/components/shared/frontier-card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import {
+-  buyer,
+-  capabilityFrontierItems,
+-  clientRealityProfile,
+-  engagements,
+-  gapItems,
+-  requirements,
+-  solutionMatches,
+-} from "@/lib/dummy-data";
++  getBuyerById,
++  getVendorById,
++  getMatchesAndGapsForBuyer,
++  getRequirementsForBuyer,
++  getRealityProfileForBuyer,
++  getVendorRecommendationsForVendor,
++  type LeadBuyerRow,
++  type VendorDetailRow,
++  type VendorSideGapRow,
++  type VendorSideMatchRow,
++  type VendorSideRequirementRow,
++  type VendorSideRealityProfileRow,
++} from "@/lib/api/vendor-lookup";
++import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
++import { getStoredVendorId } from "@/lib/vendor-session";
+ import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
++import type { CapabilityFrontierItem, GapItem, SolutionMatch } from "@/lib/types";
++
++function toGapItem(g: VendorSideGapRow): GapItem {
++  return { id: g.id, current: g.currentState ?? "—", desired: g.desiredState ?? "—", gap: g.gap ?? "—", severity: g.severity };
++}
++
++function toSolutionMatch(m: VendorSideMatchRow): SolutionMatch {
++  return {
++    id: m.id,
++    requirementText: m.requirementText ?? "—",
++    capabilityId: "",
++    capabilityName: m.capabilityName ?? "—",
++    matchStatus: m.matchStatus,
++    confidence: m.confidence ?? 0,
++    reasoning: m.reasoning ?? "",
++  };
++}
++
++function toFrontierItem(f: VendorFrontierItemRow, buyerName: string, vendorName: string): CapabilityFrontierItem {
++  return {
++    id: f.id,
++    buyerId: f.buyerId,
++    buyerName,
++    vendorId: "",
++    vendorName,
++    question: f.question,
++    requirement: f.requirement ?? "",
++    context: f.context ?? "",
++    evidenceChecked: f.evidenceChecked,
++    reasonUnresolved: f.reasonUnresolved ?? "",
++    status: f.status,
++    recommendedExpert: f.recommendedExpert ?? "Specialist",
++    createdAt: f.createdAt,
++    vendorResponse: f.vendorResponse ?? undefined,
++  };
++}
+ 
+-export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/buyers/[id]">) {
+-  const { id } = await props.params;
+-  const engagement = engagements.find((e) => e.id === id);
+-  if (!engagement) notFound();
++export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id: string }> }) {
++  const [buyer, setBuyer] = useState<LeadBuyerRow | null>(null);
++  const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
++  const [gaps, setGaps] = useState<VendorSideGapRow[]>([]);
++  const [matches, setMatches] = useState<VendorSideMatchRow[]>([]);
++  const [requirements, setRequirements] = useState<VendorSideRequirementRow[]>([]);
++  const [profile, setProfile] = useState<VendorSideRealityProfileRow | null>(null);
++  const [frontierItems, setFrontierItems] = useState<VendorFrontierItemRow[]>([]);
++  const [fitScore, setFitScore] = useState<number | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [notFound, setNotFound] = useState(false);
+ 
+-  const isMeridian = id === buyer.id;
+-  const frontierItems = isMeridian ? capabilityFrontierItems : capabilityFrontierItems.slice(0, engagement.frontierOpen);
++  useEffect(() => {
++    const vId = getStoredVendorId();
++    let cancelled = false;
++    params.then(async ({ id }) => {
++      if (cancelled) return;
++      if (!vId) {
++        setLoading(false);
++        return;
++      }
++      try {
++        const [b, v, matchesAndGaps, reqs, realityProfile, frontier, recs] = await Promise.all([
++          getBuyerById(id),
++          getVendorById(vId),
++          getMatchesAndGapsForBuyer(id, vId),
++          getRequirementsForBuyer(id),
++          getRealityProfileForBuyer(id),
++          getFrontierItemsForVendor(vId),
++          getVendorRecommendationsForVendor(vId),
++        ]);
++        if (cancelled) return;
++        if (!b) {
++          setNotFound(true);
++          return;
++        }
++        setBuyer(b);
++        setVendor(v);
++        setGaps(matchesAndGaps.gaps);
++        setMatches(matchesAndGaps.matches);
++        setRequirements(reqs);
++        setProfile(realityProfile);
++        setFrontierItems(frontier.filter((f) => f.buyerId === id));
++        setFitScore(recs.find((r) => r.buyerId === id)?.fitScore ?? null);
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    });
++    return () => {
++      cancelled = true;
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  if (loading) {
++    return (
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading buyer" description="Pulling their requirements, gaps, and open questions." />
++      </div>
++    );
++  }
++
++  if (notFound || !buyer) {
++    return (
++      <Card className="max-w-md p-6 text-center">
++        <p className="text-sm text-escalated">Buyer not found.</p>
++        <Link href="/vendor/buyers" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++          Back to buyers
++        </Link>
++      </Card>
++    );
++  }
+ 
+   return (
+     <div>
+@@ -35,9 +146,9 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+       </Link>
+ 
+       <PageHeader
+-        eyebrow={engagement.stage}
+-        title={engagement.buyerName}
+-        description={`${engagement.industry} · ${formatNumber(buyer.companySize)} users · Engaged since ${new Date(buyer.createdAt).toLocaleDateString()}`}
++        eyebrow={buyer.industry ?? "Engagement"}
++        title={buyer.companyName}
++        description={`${buyer.industry ?? "Industry unknown"}${buyer.companySize ? ` · ${formatNumber(buyer.companySize)} users` : ""} · Engaged since ${new Date(buyer.createdAt).toLocaleDateString()}`}
+         actions={
+           <Link href="/vendor/meetings" className={cn(buttonVariants({ variant: "primary" }))}>
+             <CalendarClock className="h-4 w-4" /> Prepare handoff
+@@ -47,26 +158,28 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+ 
+       <div className="grid gap-6 lg:grid-cols-3">
+         <div className="space-y-6 lg:col-span-2">
+-          <Card>
+-            <CardHeader>
+-              <CardTitle>Client Reality Profile</CardTitle>
+-            </CardHeader>
+-            <CardContent className="grid gap-4 pt-2 sm:grid-cols-2">
+-              <ProfileBlock title="Current technology" items={clientRealityProfile.currentTechnology} />
+-              <ProfileBlock title="Pain points" items={clientRealityProfile.painPoints} tone="escalated" />
+-              <ProfileBlock title="Goals" items={clientRealityProfile.goals} tone="verified" />
+-              <ProfileBlock title="Constraints" items={clientRealityProfile.constraints} tone="modelled" />
+-            </CardContent>
+-          </Card>
++          {profile ? (
++            <Card>
++              <CardHeader>
++                <CardTitle>Client Reality Profile</CardTitle>
++              </CardHeader>
++              <CardContent className="grid gap-4 pt-2 sm:grid-cols-2">
++                <ProfileBlock title="Current technology" items={profile.currentTechnology} />
++                <ProfileBlock title="Pain points" items={profile.painPoints} tone="escalated" />
++                <ProfileBlock title="Goals" items={profile.goals} tone="verified" />
++                <ProfileBlock title="Constraints" items={profile.constraints} tone="modelled" />
++              </CardContent>
++            </Card>
++          ) : (
++            <Card className="p-6 text-center text-sm text-muted">No client reality profile captured yet for this buyer.</Card>
++          )}
+ 
+           <Card>
+             <CardHeader>
+               <CardTitle>Business gaps</CardTitle>
+             </CardHeader>
+             <CardContent className="space-y-3 pt-2">
+-              {gapItems.map((gap) => (
+-                <GapCard key={gap.id} gap={gap} />
+-              ))}
++              {gaps.length > 0 ? gaps.map((gap) => <GapCard key={gap.id} gap={toGapItem(gap)} />) : <p className="text-sm text-muted">No gaps identified yet.</p>}
+             </CardContent>
+           </Card>
+ 
+@@ -75,9 +188,7 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+               <CardTitle>Solution matches</CardTitle>
+             </CardHeader>
+             <CardContent className="space-y-3 pt-2">
+-              {solutionMatches.map((m) => (
+-                <MatchRow key={m.id} match={m} />
+-              ))}
++              {matches.length > 0 ? matches.map((m) => <MatchRow key={m.id} match={toSolutionMatch(m)} />) : <p className="text-sm text-muted">No solution matches yet.</p>}
+             </CardContent>
+           </Card>
+ 
+@@ -89,7 +200,7 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+               </CardHeader>
+               <CardContent className="space-y-3 pt-2">
+                 {frontierItems.map((item) => (
+-                  <FrontierCard key={item.id} item={item} />
++                  <FrontierCard key={item.id} item={toFrontierItem(item, buyer.companyName, vendor?.companyName ?? "You")} />
+                 ))}
+               </CardContent>
+             </Card>
+@@ -103,16 +214,15 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+             </CardHeader>
+             <CardContent className="pt-2">
+               <div className="flex items-center gap-3">
+-                <Avatar name={buyer.contactName} size="lg" />
++                <Avatar name={buyer.contactName ?? buyer.companyName} size="lg" />
+                 <div>
+-                  <p className="text-sm font-semibold text-foreground">{buyer.contactName}</p>
+-                  <p className="text-xs text-muted">{buyer.contactRole}</p>
++                  <p className="text-sm font-semibold text-foreground">{buyer.contactName ?? "Contact not on file"}</p>
++                  {buyer.contactRole && <p className="text-xs text-muted">{buyer.contactRole}</p>}
+                 </div>
+               </div>
+               <div className="mt-4 space-y-2 text-sm text-muted">
+-                <p className="flex items-center gap-2"><Building2 className="h-3.5 w-3.5" /> {engagement.buyerName}</p>
+-                <p className="flex items-center gap-2"><Mail className="h-3.5 w-3.5" /> priya.sharma@meridianretail.com</p>
+-                <p className="flex items-center gap-2"><User className="h-3.5 w-3.5" /> {formatNumber(buyer.companySize)} employees</p>
++                <p className="flex items-center gap-2"><Building2 className="h-3.5 w-3.5" /> {buyer.companyName}</p>
++                {buyer.companySize && <p className="flex items-center gap-2"><User className="h-3.5 w-3.5" /> {formatNumber(buyer.companySize)} employees</p>}
+               </div>
+             </CardContent>
+           </Card>
+@@ -120,29 +230,37 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+           <Card>
+             <CardHeader className="flex-row items-center justify-between">
+               <CardTitle>Requirement fit</CardTitle>
+-              <span className="flex items-center gap-1 text-sm font-bold text-brand-600 dark:text-brand-400">
+-                <TrendingUp className="h-4 w-4" /> {engagement.fitScore}%
+-              </span>
++              {fitScore != null && (
++                <span className="flex items-center gap-1 text-sm font-bold text-brand-600 dark:text-brand-400">
++                  <TrendingUp className="h-4 w-4" /> {fitScore}%
++                </span>
++              )}
+             </CardHeader>
+             <CardContent className="pt-2">
+-              <div className="space-y-2">
+-                {requirements.map((r) => (
+-                  <div key={r.id} className="flex items-start justify-between gap-2 text-sm">
+-                    <span className="text-foreground">{r.text}</span>
+-                    <Badge variant="outline" size="sm" className="shrink-0 capitalize">{r.priority}</Badge>
+-                  </div>
+-                ))}
+-              </div>
++              {requirements.length > 0 ? (
++                <div className="space-y-2">
++                  {requirements.map((r) => (
++                    <div key={r.id} className="flex items-start justify-between gap-2 text-sm">
++                      <span className="text-foreground">{r.text}</span>
++                      <Badge variant="outline" size="sm" className="shrink-0 capitalize">{r.priority}</Badge>
++                    </div>
++                  ))}
++                </div>
++              ) : (
++                <p className="text-sm text-muted">No requirements captured yet.</p>
++              )}
+             </CardContent>
+           </Card>
+ 
+-          <Card className="border-brand-200 bg-brand-50/50 dark:border-brand-900 dark:bg-brand-950/20">
+-            <CardContent className="pt-5">
+-              <p className="text-sm font-semibold text-foreground">Current infrastructure cost</p>
+-              <p className="mt-1 text-2xl font-bold text-brand-700 dark:text-brand-300">{formatCurrencyINR(clientRealityProfile.currentCostAnnual)}</p>
+-              <p className="mt-1 text-xs text-muted">per year, before optimization</p>
+-            </CardContent>
+-          </Card>
++          {profile?.currentCostAnnual != null && (
++            <Card className="border-brand-200 bg-brand-50/50 dark:border-brand-900 dark:bg-brand-950/20">
++              <CardContent className="pt-5">
++                <p className="text-sm font-semibold text-foreground">Current infrastructure cost</p>
++                <p className="mt-1 text-2xl font-bold text-brand-700 dark:text-brand-300">{formatCurrencyINR(profile.currentCostAnnual)}</p>
++                <p className="mt-1 text-xs text-muted">per year, before optimization</p>
++              </CardContent>
++            </Card>
++          )}
+         </div>
+       </div>
+     </div>
+@@ -150,6 +268,7 @@ export default async function VendorBuyerDetailPage(props: PageProps<"/vendor/bu
+ }
+ 
+ function ProfileBlock({ title, items, tone }: { title: string; items: string[]; tone?: "escalated" | "verified" | "modelled" }) {
++  if (items.length === 0) return null;
+   const dot = tone === "escalated" ? "bg-escalated" : tone === "verified" ? "bg-verified" : tone === "modelled" ? "bg-modelled" : "bg-subtle";
+   return (
+     <div>
+diff --git a/src/app/vendor/buyers/page.tsx b/src/app/vendor/buyers/page.tsx
+index cd2701c..943046e 100644
+--- a/src/app/vendor/buyers/page.tsx
++++ b/src/app/vendor/buyers/page.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+ import { ArrowUpRight, FileSearch, Search } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+@@ -8,65 +8,131 @@ import { Card, CardContent } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { Input } from "@/components/ui/input";
+ import { Avatar } from "@/components/ui/avatar";
+-import { engagements as allEngagements } from "@/lib/dummy-data";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import {
++  getVendorRecommendationsForVendor,
++  getBuyerVendorSelectionsForVendor,
++  getBuyersByIds,
++  type LeadBuyerRow,
++} from "@/lib/api/vendor-lookup";
++import { getFrontierItemsForVendor } from "@/lib/api/vendor-frontier";
++import { getStoredVendorId } from "@/lib/vendor-session";
+ import { formatRelativeTime } from "@/lib/utils";
+ 
+-const stageTone: Record<string, "verified" | "modelled" | "brand" | "default"> = {
+-  Discovery: "default",
+-  "Vendor Selection": "brand",
+-  "Solution Workspace": "modelled",
+-  "Solution Review": "modelled",
+-  "Closed - Won": "verified",
+-};
++interface BuyerEngagement {
++  buyer: LeadBuyerRow;
++  stage: string;
++  fitScore: number | null;
++  frontierOpen: number;
++}
+ 
+ export default function VendorBuyersPage() {
+   const [query, setQuery] = useState("");
+-  const filtered = allEngagements.filter((e) => e.buyerName.toLowerCase().includes(query.toLowerCase()));
++  const [engagements, setEngagements] = useState<BuyerEngagement[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [vendorId, setVendorId] = useState<string | null>(null);
++
++  useEffect(() => {
++    const id = getStoredVendorId();
++    setVendorId(id);
++    if (!id) {
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    async function load() {
++      try {
++        const [recs, selections, frontier] = await Promise.all([
++          getVendorRecommendationsForVendor(id!),
++          getBuyerVendorSelectionsForVendor(id!),
++          getFrontierItemsForVendor(id!),
++        ]);
++        const buyerIds = Array.from(new Set([...recs.map((r) => r.buyerId), ...selections.map((s) => s.buyerId)]));
++        const buyers = await getBuyersByIds(buyerIds);
++        if (cancelled) return;
++
++        const list: BuyerEngagement[] = buyers.map((buyer) => {
++          const rec = recs.find((r) => r.buyerId === buyer.id);
++          const selection = selections.find((s) => s.buyerId === buyer.id);
++          const openFrontier = frontier.filter((f) => f.buyerId === buyer.id && (f.status === "open" || f.status === "vendor_review")).length;
++          const stage = selection?.isActive ? "Solution Workspace" : selection ? "Vendor Selection" : "Discovery";
++          return { buyer, stage, fitScore: rec?.fitScore ?? null, frontierOpen: openFrontier };
++        });
++        list.sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
++        setEngagements(list);
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    const interval = setInterval(load, 15000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, []);
++
++  const filtered = engagements.filter((e) => e.buyer.companyName.toLowerCase().includes(query.toLowerCase()));
++
++  if (!vendorId) {
++    return (
++      <div>
++        <PageHeader eyebrow="Engagement" title="Buyers" description="Register your solution first." />
++        <Card className="max-w-md p-6 text-center text-sm text-muted">No vendor session found in this browser yet.</Card>
++      </div>
++    );
++  }
+ 
+   return (
+     <div>
+-      <PageHeader
+-        eyebrow="Engagement"
+-        title="Buyers"
+-        description="Every buyer currently exploring CloudNova's personalized solution, ranked by requirement fit."
+-      />
++      <PageHeader eyebrow="Engagement" title="Buyers" description="Every buyer currently exploring your solution, ranked by requirement fit." />
+ 
+       <div className="mb-5 relative max-w-sm">
+         <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+         <Input placeholder="Search buyers..." className="pl-9" value={query} onChange={(e) => setQuery(e.target.value)} />
+       </div>
+ 
+-      <div className="grid gap-3">
+-        {filtered.map((e) => (
+-          <Link key={e.id} href={`/vendor/buyers/${e.id}`}>
+-            <Card className="group transition-all hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
+-              <CardContent className="flex flex-col gap-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+-                <div className="flex items-center gap-3">
+-                  <Avatar name={e.buyerName} size="md" />
+-                  <div>
+-                    <p className="text-sm font-semibold text-foreground">{e.buyerName}</p>
+-                    <p className="text-xs text-muted">{e.industry}</p>
++      {loading ? (
++        <AgentWaitingState variant="card" title="Loading buyers" description="Pulling real-time recommendations and selections." />
++      ) : filtered.length === 0 ? (
++        <Card className="p-6 text-center text-sm text-muted">
++          {engagements.length === 0 ? "No buyers are exploring your solution yet." : `No buyer matches "${query}".`}
++        </Card>
++      ) : (
++        <div className="grid gap-3">
++          {filtered.map((e) => (
++            <Link key={e.buyer.id} href={`/vendor/buyers/${e.buyer.id}`}>
++              <Card className="group transition-all hover:-translate-y-0.5 hover:border-border-strong hover:shadow-md">
++                <CardContent className="flex flex-col gap-4 py-4 sm:flex-row sm:items-center sm:justify-between">
++                  <div className="flex items-center gap-3">
++                    <Avatar name={e.buyer.companyName} size="md" />
++                    <div>
++                      <p className="text-sm font-semibold text-foreground">{e.buyer.companyName}</p>
++                      <p className="text-xs text-muted">{e.buyer.industry ?? "Industry unknown"}</p>
++                    </div>
+                   </div>
+-                </div>
+-                <div className="flex flex-wrap items-center gap-3 sm:gap-6">
+-                  <Badge variant={stageTone[e.stage] ?? "default"}>{e.stage}</Badge>
+-                  {e.frontierOpen > 0 && (
+-                    <span className="flex items-center gap-1 text-xs font-medium text-escalated">
+-                      <FileSearch className="h-3.5 w-3.5" /> {e.frontierOpen} open
+-                    </span>
+-                  )}
+-                  <div className="text-right">
+-                    <p className="text-sm font-bold text-brand-600 dark:text-brand-400">{e.fitScore}%</p>
+-                    <p className="text-[10px] uppercase tracking-wide text-subtle">fit</p>
++                  <div className="flex flex-wrap items-center gap-3 sm:gap-6">
++                    <Badge variant="modelled">{e.stage}</Badge>
++                    {e.frontierOpen > 0 && (
++                      <span className="flex items-center gap-1 text-xs font-medium text-escalated">
++                        <FileSearch className="h-3.5 w-3.5" /> {e.frontierOpen} open
++                      </span>
++                    )}
++                    {e.fitScore != null && (
++                      <div className="text-right">
++                        <p className="text-sm font-bold text-brand-600 dark:text-brand-400">{e.fitScore}%</p>
++                        <p className="text-[10px] uppercase tracking-wide text-subtle">fit</p>
++                      </div>
++                    )}
++                    <span className="hidden text-xs text-subtle md:block">{formatRelativeTime(e.buyer.createdAt)}</span>
++                    <ArrowUpRight className="h-4 w-4 text-subtle transition-colors group-hover:text-brand-500" />
+                   </div>
+-                  <span className="hidden text-xs text-subtle md:block">{formatRelativeTime(e.lastActive)}</span>
+-                  <ArrowUpRight className="h-4 w-4 text-subtle transition-colors group-hover:text-brand-500" />
+-                </div>
+-              </CardContent>
+-            </Card>
+-          </Link>
+-        ))}
+-      </div>
++                </CardContent>
++              </Card>
++            </Link>
++          ))}
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/app/vendor/layout.tsx b/src/app/vendor/layout.tsx
+index 86cebd2..8744f01 100644
+--- a/src/app/vendor/layout.tsx
++++ b/src/app/vendor/layout.tsx
+@@ -10,10 +10,8 @@ import {
+   CalendarClock,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+-import { capabilityFrontierItems } from "@/lib/dummy-data";
+-import { getStoredVendorName } from "@/lib/vendor-session";
+-
+-const openFrontier = capabilityFrontierItems.filter((f) => f.status === "open" || f.status === "vendor_review").length;
++import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
++import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -30,7 +28,7 @@ const sections: NavSection[] = [
+     title: "Engagement",
+     items: [
+       { href: "/vendor/buyers", label: "Buyers", icon: Users },
+-      { href: "/vendor/capability-frontier", label: "Capability Frontier", icon: FileSearch, badge: openFrontier },
++      { href: "/vendor/capability-frontier", label: "Capability Frontier", icon: FileSearch },
+       { href: "/vendor/meetings", label: "Meetings", icon: CalendarClock },
+     ],
+   },
+@@ -42,15 +40,46 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
+   // (src/lib/vendor-session.ts), instead of the static "CloudNova" demo
+   // placeholder, so the shell doesn't look like it ignored a real submission.
+   const [vendorName, setVendorName] = useState<string | null>(null);
+-  useEffect(() => setVendorName(getStoredVendorName()), []);
++  const [vendorId, setVendorId] = useState<string | null>(null);
++  const [openFrontier, setOpenFrontier] = useState<number | undefined>(undefined);
++
++  useEffect(() => {
++    const id = getStoredVendorId();
++    setVendorName(getStoredVendorName());
++    setVendorId(id);
++    if (!id) return;
++    let cancelled = false;
++    async function poll() {
++      try {
++        const count = await getFrontierCountForVendor(id!);
++        if (!cancelled) setOpenFrontier(count);
++      } catch {
++        // best-effort — badge just stays hidden
++      }
++    }
++    poll();
++    const interval = setInterval(poll, 15000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, []);
++
++  const scopedSections = sections.map((section) => ({
++    ...section,
++    items: section.items.map((item) =>
++      item.href === "/vendor/capability-frontier" ? { ...item, badge: openFrontier || undefined } : item
++    ),
++  }));
+ 
+   return (
+     <PortalShell
+       role="vendor"
+-      sections={sections}
++      sections={scopedSections}
+       userName={vendorName ? `${vendorName} Admin` : "Not registered yet"}
+       userRole="Vendor Admin"
+       vendorSubLabel={vendorName ?? "No vendor registered"}
++      vendorId={vendorId}
+     >
+       {children}
+     </PortalShell>
+diff --git a/src/app/vendor/page.tsx b/src/app/vendor/page.tsx
+index 91e2f23..a66d000 100644
+--- a/src/app/vendor/page.tsx
++++ b/src/app/vendor/page.tsx
+@@ -1,24 +1,116 @@
+ "use client";
+ 
++import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, CircleAlert, Clock, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
++import { ArrowUpRight, CircleAlert, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
+ import { AuditTimeline } from "@/components/shared/audit-timeline";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { buttonVariants } from "@/components/ui/button";
+-import { auditEvents, capabilityFrontierItems, dashboardStats, otherBuyerEngagements, primaryVendor } from "@/lib/dummy-data";
++import {
++  getVendorRecommendationsForVendor,
++  getBuyersByIds,
++  getVendorById,
++  type LeadBuyerRow,
++  type VendorDetailRow,
++} from "@/lib/api/vendor-lookup";
++import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
++import { getAuditEvents } from "@/lib/api/admin-lookup";
++import { getStoredVendorId } from "@/lib/vendor-session";
+ import { cn, formatRelativeTime } from "@/lib/utils";
++import type { AuditEvent } from "@/lib/types";
++
++interface EngagementSummary {
++  buyer: LeadBuyerRow;
++  fitScore: number | null;
++  frontierOpen: number;
++}
+ 
+ export default function VendorDashboardPage() {
+-  const stats = dashboardStats.vendor;
+-  const openFrontier = capabilityFrontierItems.filter((f) => f.status === "open");
++  const [vendorId, setVendorId] = useState<string | null>(null);
++  const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
++  const [engagements, setEngagements] = useState<EngagementSummary[]>([]);
++  const [openFrontier, setOpenFrontier] = useState<VendorFrontierItemRow[]>([]);
++  const [buyersById, setBuyersById] = useState<Record<string, LeadBuyerRow>>({});
++  const [events, setEvents] = useState<AuditEvent[]>([]);
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    const id = getStoredVendorId();
++    setVendorId(id);
++    if (!id) {
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    async function load() {
++      try {
++        const [v, recs, frontier, auditEvents] = await Promise.all([
++          getVendorById(id!),
++          getVendorRecommendationsForVendor(id!),
++          getFrontierItemsForVendor(id!),
++          getAuditEvents(5),
++        ]);
++        const buyerIds = Array.from(new Set(recs.map((r) => r.buyerId)));
++        const buyers = await getBuyersByIds(buyerIds);
++        if (cancelled) return;
++        const byId = Object.fromEntries(buyers.map((b) => [b.id, b]));
++        setBuyersById(byId);
++        setVendor(v);
++        setEvents(auditEvents);
++        setEngagements(
++          recs
++            .filter((r) => byId[r.buyerId])
++            .map((r) => ({
++              buyer: byId[r.buyerId],
++              fitScore: r.fitScore,
++              frontierOpen: frontier.filter((f) => f.buyerId === r.buyerId && (f.status === "open" || f.status === "vendor_review")).length,
++            }))
++        );
++        setOpenFrontier(frontier.filter((f) => f.status === "open"));
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    const interval = setInterval(load, 15000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, []);
++
++  if (!vendorId) {
++    return (
++      <div>
++        <PageHeader eyebrow="Vendor" title="Vendor Dashboard" description="Register your solution first." />
++        <Card className="max-w-md p-6 text-center">
++          <p className="text-sm text-muted">No vendor session found in this browser yet.</p>
++          <Link href="/vendor/onboarding" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
++            Submit sources
++          </Link>
++        </Card>
++      </div>
++    );
++  }
++
++  if (loading) {
++    return (
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading your dashboard" description="Pulling live buyer engagement and evidence data." />
++      </div>
++    );
++  }
++
++  const avgFit = engagements.length > 0 ? Math.round(engagements.reduce((sum, e) => sum + (e.fitScore ?? 0), 0) / engagements.length) : null;
+ 
+   return (
+     <div>
+       <PageHeader
+-        eyebrow={primaryVendor.name}
++        eyebrow={vendor?.companyName ?? "Vendor"}
+         title="Vendor Dashboard"
+         description="Track buyer engagement, Solution DNA health, and unresolved requirements at a glance."
+         actions={
+@@ -28,12 +120,11 @@ export default function VendorDashboardPage() {
+         }
+       />
+ 
+-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+-        <StatCard label="Active buyers" value={String(stats.activeBuyers)} icon={Users} trend="+3 this week" />
+-        <StatCard label="Solutions generated" value={String(stats.solutionsGenerated)} icon={Sparkles} tone="accent" />
+-        <StatCard label="Open frontier items" value={String(stats.openFrontierItems)} icon={FileSearch} tone="escalated" />
+-        <StatCard label="Avg. requirement fit" value={`${stats.avgFitScore}%`} icon={TrendingUp} tone="verified" />
+-        <StatCard label="Presales hours saved" value={String(stats.presalesHoursSaved)} icon={Clock} tone="modelled" />
++      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
++        <StatCard label="Active buyers" value={String(engagements.length)} icon={Users} index={0} />
++        <StatCard label="Solutions generated" value={String(engagements.length)} icon={Sparkles} tone="accent" index={1} />
++        <StatCard label="Open frontier items" value={String(openFrontier.length)} icon={FileSearch} tone="escalated" index={2} />
++        <StatCard label="Avg. requirement fit" value={avgFit != null ? `${avgFit}%` : "—"} icon={TrendingUp} tone="verified" index={3} />
+       </div>
+ 
+       <div className="mt-6 grid gap-6 lg:grid-cols-3">
+@@ -45,12 +136,15 @@ export default function VendorDashboardPage() {
+             </Link>
+           </CardHeader>
+           <CardContent className="pt-4">
+-            <div className="divide-y divide-border">
+-              <EngagementRow name="Meridian Retail Group" industry="Retail" stage="Solution Workspace" fitScore={92} frontierOpen={2} lastActive="2026-08-16T07:40:00Z" />
+-              {otherBuyerEngagements.map((e) => (
+-                <EngagementRow key={e.id} name={e.buyerName} industry={e.industry} stage={e.stage} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.lastActive} />
+-              ))}
+-            </div>
++            {engagements.length === 0 ? (
++              <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
++            ) : (
++              <div className="divide-y divide-border">
++                {engagements.slice(0, 6).map((e) => (
++                  <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
++                ))}
++              </div>
++            )}
+           </CardContent>
+         </Card>
+ 
+@@ -59,7 +153,7 @@ export default function VendorDashboardPage() {
+             <CardTitle>Agent activity</CardTitle>
+           </CardHeader>
+           <CardContent className="pt-4">
+-            <AuditTimeline events={auditEvents.slice(0, 5)} />
++            {events.length > 0 ? <AuditTimeline events={events} /> : <p className="py-8 text-center text-sm text-muted">No agent activity recorded yet.</p>}
+           </CardContent>
+         </Card>
+       </div>
+@@ -74,27 +168,31 @@ export default function VendorDashboardPage() {
+           </Link>
+         </CardHeader>
+         <CardContent className="grid gap-3 pt-4 sm:grid-cols-2">
+-          {openFrontier.map((item) => (
+-            <div key={item.id} className="rounded-xl border border-border bg-surface-2 p-4">
+-              <div className="flex items-start justify-between gap-2">
+-                <p className="text-sm font-medium text-foreground">{item.question}</p>
+-                <Badge variant="escalated" size="sm">Open</Badge>
++          {openFrontier.length === 0 ? (
++            <p className="col-span-2 py-4 text-center text-sm text-muted">No open questions right now.</p>
++          ) : (
++            openFrontier.map((item) => (
++              <div key={item.id} className="rounded-xl border border-border bg-surface-2 p-4">
++                <div className="flex items-start justify-between gap-2">
++                  <p className="text-sm font-medium text-foreground">{item.question}</p>
++                  <Badge variant="escalated" size="sm">Open</Badge>
++                </div>
++                <p className="mt-1.5 text-xs text-muted">{buyersById[item.buyerId]?.companyName ?? "A buyer"} &middot; {formatRelativeTime(item.createdAt)}</p>
+               </div>
+-              <p className="mt-1.5 text-xs text-muted">{item.buyerName} &middot; {formatRelativeTime(item.createdAt)}</p>
+-            </div>
+-          ))}
++            ))
++          )}
+         </CardContent>
+       </Card>
+     </div>
+   );
+ }
+ 
+-function EngagementRow({ name, industry, stage, fitScore, frontierOpen, lastActive }: { name: string; industry: string; stage: string; fitScore: number; frontierOpen: number; lastActive: string }) {
++function EngagementRow({ id, name, industry, fitScore, frontierOpen, lastActive }: { id: string; name: string; industry: string | null; fitScore: number | null; frontierOpen: number; lastActive: string }) {
+   return (
+-    <Link href="/vendor/buyers/b-meridian" className="flex items-center justify-between gap-3 py-3.5 transition-colors hover:bg-surface-2 -mx-1 px-1 rounded-lg">
++    <Link href={`/vendor/buyers/${id}`} className="flex items-center justify-between gap-3 py-3.5 transition-colors hover:bg-surface-2 -mx-1 px-1 rounded-lg">
+       <div className="min-w-0">
+         <p className="truncate text-sm font-medium text-foreground">{name}</p>
+-        <p className="text-xs text-muted">{industry} &middot; {stage}</p>
++        <p className="text-xs text-muted">{industry ?? "Industry unknown"}</p>
+       </div>
+       <div className="flex shrink-0 items-center gap-3">
+         {frontierOpen > 0 && (
+@@ -102,7 +200,7 @@ function EngagementRow({ name, industry, stage, fitScore, frontierOpen, lastActi
+             <FileSearch className="h-3.5 w-3.5" /> {frontierOpen}
+           </span>
+         )}
+-        <span className="text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>
++        {fitScore != null && <span className="text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>}
+         <span className="hidden text-xs text-subtle sm:block">{formatRelativeTime(lastActive)}</span>
+       </div>
+     </Link>
+diff --git a/src/components/layout/notifications-menu.tsx b/src/components/layout/notifications-menu.tsx
+index af34d34..9e0f942 100644
+--- a/src/components/layout/notifications-menu.tsx
++++ b/src/components/layout/notifications-menu.tsx
+@@ -1,42 +1,37 @@
+ "use client";
+ 
+ import { useEffect, useRef, useState } from "react";
+-import { Bell, CircleAlert, MessageSquare, RefreshCw } from "lucide-react";
++import { Bell, CircleAlert, MessageSquare, RefreshCw, Sparkles } from "lucide-react";
+ import { motion, AnimatePresence } from "motion/react";
+-import { cn } from "@/lib/utils";
+-
+-const notifications = [
+-  {
+-    icon: CircleAlert,
+-    tone: "escalated",
+-    title: "New Capability Frontier item",
+-    detail: "Meridian Retail Group needs confirmation on zero-downtime migration.",
+-    time: "12m ago",
+-  },
+-  {
+-    icon: MessageSquare,
+-    tone: "brand",
+-    title: "Buyer message",
+-    detail: "Priya Sharma asked about PCI-DSS compliance.",
+-    time: "1h ago",
+-  },
+-  {
+-    icon: RefreshCw,
+-    tone: "verified",
+-    title: "Solution model updated",
+-    detail: "Kestrel Logistics solution recalculated after requirement change.",
+-    time: "3h ago",
+-  },
+-];
++import { cn, formatRelativeTime } from "@/lib/utils";
++import { getBuyerNotifications, getVendorNotifications, getAdminNotifications, type NotificationItem } from "@/lib/api/notifications";
+ 
+ const toneClass: Record<string, string> = {
+   escalated: "bg-escalated-bg text-escalated",
+   brand: "bg-brand-50 text-brand-600 dark:bg-brand-950/40 dark:text-brand-300",
+   verified: "bg-verified-bg text-verified",
++  modelled: "bg-modelled-bg text-modelled",
++};
++
++const toneIcon: Record<string, typeof CircleAlert> = {
++  escalated: CircleAlert,
++  brand: MessageSquare,
++  verified: RefreshCw,
++  modelled: Sparkles,
+ };
+ 
+-export function NotificationsMenu() {
++export function NotificationsMenu({
++  role,
++  buyerId,
++  vendorId,
++}: {
++  role: "vendor" | "buyer" | "admin";
++  buyerId?: string | null;
++  vendorId?: string | null;
++}) {
+   const [open, setOpen] = useState(false);
++  const [items, setItems] = useState<NotificationItem[]>([]);
++  const [loading, setLoading] = useState(true);
+   const ref = useRef<HTMLDivElement>(null);
+ 
+   useEffect(() => {
+@@ -47,6 +42,29 @@ export function NotificationsMenu() {
+     return () => document.removeEventListener("mousedown", onClick);
+   }, []);
+ 
++  useEffect(() => {
++    let cancelled = false;
++    async function load() {
++      try {
++        let result: NotificationItem[] = [];
++        if (role === "buyer" && buyerId) result = await getBuyerNotifications(buyerId);
++        else if (role === "vendor" && vendorId) result = await getVendorNotifications(vendorId);
++        else if (role === "admin") result = await getAdminNotifications();
++        if (!cancelled) setItems(result);
++      } catch {
++        // best-effort — menu just shows empty state
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    }
++    load();
++    const interval = setInterval(load, 20000);
++    return () => {
++      cancelled = true;
++      clearInterval(interval);
++    };
++  }, [role, buyerId, vendorId]);
++
+   return (
+     <div className="relative" ref={ref}>
+       <button
+@@ -54,7 +72,7 @@ export function NotificationsMenu() {
+         className="relative flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-surface text-muted transition-colors hover:bg-surface-2 hover:text-foreground"
+       >
+         <Bell className="h-4 w-4" />
+-        <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-escalated ring-2 ring-surface" />
++        {items.length > 0 && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-escalated ring-2 ring-surface" />}
+       </button>
+       <AnimatePresence>
+         {open && (
+@@ -69,18 +87,29 @@ export function NotificationsMenu() {
+               <p className="text-sm font-semibold text-foreground">Notifications</p>
+             </div>
+             <div className="max-h-80 overflow-y-auto">
+-              {notifications.map((n, i) => (
+-                <div key={i} className="flex gap-3 border-b border-border px-4 py-3 last:border-0 hover:bg-surface-2">
+-                  <div className={cn("flex h-8 w-8 shrink-0 items-center justify-center rounded-full", toneClass[n.tone])}>
+-                    <n.icon className="h-4 w-4" />
+-                  </div>
+-                  <div className="min-w-0">
+-                    <p className="text-sm font-medium text-foreground">{n.title}</p>
+-                    <p className="mt-0.5 text-xs text-muted">{n.detail}</p>
+-                    <p className="mt-1 text-[11px] text-subtle">{n.time}</p>
+-                  </div>
+-                </div>
+-              ))}
++              {loading ? (
++                <p className="px-4 py-6 text-center text-xs text-subtle">Loading…</p>
++              ) : items.length === 0 ? (
++                <p className="px-4 py-6 text-center text-xs text-subtle">
++                  {buyerId || vendorId || role === "admin" ? "Nothing new right now." : "Nothing to show yet."}
++                </p>
++              ) : (
++                items.map((n) => {
++                  const Icon = toneIcon[n.tone] ?? Bell;
++                  return (
++                    <div key={n.id} className="flex gap-3 border-b border-border px-4 py-3 last:border-0 hover:bg-surface-2">
++                      <div className={cn("flex h-8 w-8 shrink-0 items-center justify-center rounded-full", toneClass[n.tone])}>
++                        <Icon className="h-4 w-4" />
++                      </div>
++                      <div className="min-w-0">
++                        <p className="text-sm font-medium text-foreground">{n.title}</p>
++                        <p className="mt-0.5 truncate text-xs text-muted">{n.detail}</p>
++                        <p className="mt-1 text-[11px] text-subtle">{formatRelativeTime(n.time)}</p>
++                      </div>
++                    </div>
++                  );
++                })
++              )}
+             </div>
+           </motion.div>
+         )}
+diff --git a/src/components/layout/portal-shell.tsx b/src/components/layout/portal-shell.tsx
+index 6cdd370..8775e45 100644
+--- a/src/components/layout/portal-shell.tsx
++++ b/src/components/layout/portal-shell.tsx
+@@ -22,6 +22,9 @@ export function PortalShell({
+   userName,
+   userRole,
+   vendorSubLabel,
++  buyerSubLabel,
++  buyerId,
++  vendorId,
+   headerSlot,
+   children,
+ }: {
+@@ -31,6 +34,11 @@ export function PortalShell({
+   userRole: string;
+   /** Real registered vendor name, once known — overrides the role switcher's "CloudNova" demo placeholder. */
+   vendorSubLabel?: string;
++  /** Real signed-in buyer's company name, once known — overrides the role switcher's "Meridian Retail Group" demo placeholder. */
++  buyerSubLabel?: string;
++  /** Real buyer/vendor id, once known — lets NotificationsMenu fetch role-scoped real notifications instead of a static fake list. */
++  buyerId?: string | null;
++  vendorId?: string | null;
+   /** Optional extra content rendered in the sticky header, left of notifications — e.g. a cross-page status indicator. */
+   headerSlot?: React.ReactNode;
+   children: React.ReactNode;
+@@ -47,7 +55,7 @@ export function PortalShell({
+       </div>
+ 
+       <div className="px-3">
+-        <RoleSwitcher current={role} vendorSubLabel={vendorSubLabel} />
++        <RoleSwitcher current={role} vendorSubLabel={vendorSubLabel} buyerSubLabel={buyerSubLabel} />
+       </div>
+ 
+       <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-5">
+@@ -100,7 +108,7 @@ export function PortalShell({
+           </Link>
+           <div className="ml-auto flex items-center gap-2 sm:gap-3">
+             {headerSlot}
+-            <NotificationsMenu />
++            <NotificationsMenu role={role} buyerId={buyerId} vendorId={vendorId} />
+             <ThemeToggle />
+           </div>
+         </header>
+diff --git a/src/components/layout/role-switcher.tsx b/src/components/layout/role-switcher.tsx
+index 93263a4..c99bbbf 100644
+--- a/src/components/layout/role-switcher.tsx
++++ b/src/components/layout/role-switcher.tsx
+@@ -15,15 +15,23 @@ const roles = [
+ export function RoleSwitcher({
+   current,
+   vendorSubLabel,
++  buyerSubLabel,
+ }: {
+   current: "vendor" | "buyer" | "admin";
+   /** Overrides the vendor row's demo "CloudNova" sub-label with the real registered vendor, once known. */
+   vendorSubLabel?: string;
++  /** Overrides the buyer row's demo "Meridian Retail Group" sub-label with the real signed-in buyer, once known. */
++  buyerSubLabel?: string;
+ }) {
+   const [open, setOpen] = useState(false);
+   const ref = useRef<HTMLDivElement>(null);
+   const active = roles.find((r) => r.key === current)!;
+-  const activeSub = current === "vendor" && vendorSubLabel ? vendorSubLabel : active.sub;
++  const activeSub =
++    current === "vendor" && vendorSubLabel
++      ? vendorSubLabel
++      : current === "buyer" && buyerSubLabel
++        ? buyerSubLabel
++        : active.sub;
+ 
+   useEffect(() => {
+     function onClick(e: MouseEvent) {
+diff --git a/src/components/shared/chat-panel.tsx b/src/components/shared/chat-panel.tsx
+deleted file mode 100644
+index 8efc259..0000000
+--- a/src/components/shared/chat-panel.tsx
++++ /dev/null
+@@ -1,221 +0,0 @@
+-"use client";
+-
+-import { useEffect, useRef, useState } from "react";
+-import { motion, AnimatePresence } from "motion/react";
+-import { ArrowUp, FileText, Sparkles } from "lucide-react";
+-import { Avatar } from "@/components/ui/avatar";
+-import { ResponseStatusBadge } from "@/components/shared/status-badge";
+-import type { ConversationMessage } from "@/lib/types";
+-import { cn } from "@/lib/utils";
+-
+-const cannedReplies: { keywords: string[]; message: Omit<ConversationMessage, "id" | "createdAt" | "role"> }[] = [
+-  {
+-    keywords: ["price", "pricing", "cost", "much"],
+-    message: {
+-      content:
+-        "Based on your current usage and CloudNova's published pricing tiers, your estimated monthly platform cost after migration is ₹2.1L-₹2.4L, before the optimization savings are applied.",
+-      responseStatus: "modelled",
+-      assumptions: ["Based on Growth tier pricing for 500-1,000 users", "Excludes one-time migration services fee"],
+-      evidence: [{ sourceLabel: "CloudNova_Pricing_Sheet_Q3.pdf", sourceType: "pdf", snippet: "Growth tier pricing scales with active compute hours and storage volume." }],
+-    },
+-  },
+-  {
+-    keywords: ["security", "compliance", "pci", "hipaa"],
+-    message: {
+-      content:
+-        "CloudNova's Security Platform includes SOC2 Type II and ISO 27001 aligned controls, with dedicated BFSI and healthcare compliance runbooks verified in their documentation. PCI-DSS-specific retail controls are not yet explicitly confirmed — I've flagged this to the vendor.",
+-      responseStatus: "escalated",
+-      evidence: [{ sourceLabel: "cloudnova.io", sourceType: "website", snippet: "CloudNova Security Platform includes SOC2 Type II and ISO 27001 aligned controls out of the box." }],
+-    },
+-  },
+-  {
+-    keywords: ["timeline", "long", "when", "weeks", "months"],
+-    message: {
+-      content:
+-        "Your requested 6-month timeline aligns with CloudNova's phased migration methodology for an organization your size — typically 4-6 months from kickoff to full cutover, based on similar prior engagements.",
+-      responseStatus: "modelled",
+-      assumptions: ["Assumes no major scope changes mid-migration", "Assumes buyer team availability for weekly checkpoints"],
+-    },
+-  },
+-];
+-
+-const fallbackReply: Omit<ConversationMessage, "id" | "createdAt" | "role"> = {
+-  content:
+-    "That's a great question, and it's specific enough that I don't have verified information to answer confidently. I've created a Capability Frontier item so a CloudNova specialist can confirm it directly.",
+-  responseStatus: "escalated",
+-};
+-
+-export function ChatPanel({ initialMessages }: { initialMessages: ConversationMessage[] }) {
+-  const [messages, setMessages] = useState(initialMessages);
+-  const [input, setInput] = useState("");
+-  const [thinking, setThinking] = useState(false);
+-  const scrollRef = useRef<HTMLDivElement>(null);
+-  const idCounter = useRef(0);
+-  const nextId = (prefix: string) => `${prefix}-${++idCounter.current}`;
+-
+-  useEffect(() => {
+-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+-  }, [messages, thinking]);
+-
+-  function send(text?: string) {
+-    const content = (text ?? input).trim();
+-    if (!content) return;
+-    const userMsg: ConversationMessage = {
+-      id: nextId("local"),
+-      role: "user",
+-      content,
+-      createdAt: new Date().toISOString(),
+-    };
+-    setMessages((m) => [...m, userMsg]);
+-    setInput("");
+-    setThinking(true);
+-
+-    const lower = content.toLowerCase();
+-    const matched = cannedReplies.find((c) => c.keywords.some((k) => lower.includes(k)));
+-    const replyContent = matched?.message ?? fallbackReply;
+-
+-    setTimeout(() => {
+-      setThinking(false);
+-      setMessages((m) => [
+-        ...m,
+-        {
+-          id: nextId("local-reply"),
+-          role: "assistant",
+-          createdAt: new Date().toISOString(),
+-          ...replyContent,
+-        },
+-      ]);
+-    }, 1100);
+-  }
+-
+-  return (
+-    <div className="flex h-full flex-col">
+-      <div ref={scrollRef} className="flex-1 space-y-5 overflow-y-auto p-5">
+-        {messages.map((msg) => (
+-          <ChatBubble key={msg.id} message={msg} />
+-        ))}
+-        <AnimatePresence>
+-          {thinking && (
+-            <motion.div
+-              initial={{ opacity: 0, y: 6 }}
+-              animate={{ opacity: 1, y: 0 }}
+-              exit={{ opacity: 0 }}
+-              className="flex items-center gap-3"
+-            >
+-              <Avatar name="CloudNova AI" color="brand" size="sm" />
+-              <div className="flex items-center gap-1.5 rounded-2xl rounded-tl-sm border border-border bg-surface-2 px-4 py-3">
+-                {[0, 1, 2].map((i) => (
+-                  <motion.span
+-                    key={i}
+-                    className="h-1.5 w-1.5 rounded-full bg-subtle"
+-                    animate={{ opacity: [0.3, 1, 0.3] }}
+-                    transition={{ duration: 1, repeat: Infinity, delay: i * 0.15 }}
+-                  />
+-                ))}
+-              </div>
+-            </motion.div>
+-          )}
+-        </AnimatePresence>
+-      </div>
+-
+-      <div className="border-t border-border p-4">
+-        <div className="mb-2.5 flex flex-wrap gap-1.5">
+-          {["What can we realistically save?", "Is this PCI-DSS compliant?", "How long will migration take?"].map((s) => (
+-            <button
+-              key={s}
+-              onClick={() => send(s)}
+-              className="rounded-full border border-border bg-surface-2 px-3 py-1.5 text-xs text-muted transition-colors hover:border-brand-300 hover:text-brand-600 dark:hover:text-brand-400"
+-            >
+-              {s}
+-            </button>
+-          ))}
+-        </div>
+-        <form
+-          onSubmit={(e) => {
+-            e.preventDefault();
+-            send();
+-          }}
+-          className="flex items-end gap-2"
+-        >
+-          <textarea
+-            value={input}
+-            onChange={(e) => setInput(e.target.value)}
+-            onKeyDown={(e) => {
+-              if (e.key === "Enter" && !e.shiftKey) {
+-                e.preventDefault();
+-                send();
+-              }
+-            }}
+-            placeholder="Ask about pricing, migration, compliance, ROI..."
+-            rows={1}
+-            className="max-h-32 flex-1 resize-none rounded-xl border border-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-subtle focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20"
+-          />
+-          <button
+-            type="submit"
+-            disabled={!input.trim()}
+-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-brand-600 text-white transition-transform hover:bg-brand-700 disabled:opacity-40 disabled:hover:bg-brand-600 active:scale-95"
+-          >
+-            <ArrowUp className="h-4 w-4" />
+-          </button>
+-        </form>
+-      </div>
+-    </div>
+-  );
+-}
+-
+-function ChatBubble({ message }: { message: ConversationMessage }) {
+-  const isUser = message.role === "user";
+-  return (
+-    <motion.div
+-      initial={{ opacity: 0, y: 8 }}
+-      animate={{ opacity: 1, y: 0 }}
+-      transition={{ duration: 0.25 }}
+-      className={cn("flex gap-3", isUser && "flex-row-reverse")}
+-    >
+-      <Avatar name={isUser ? "You" : "CloudNova AI"} color={isUser ? "accent" : "brand"} size="sm" className="mt-0.5" />
+-      <div className={cn("max-w-[80%] space-y-2", isUser && "items-end")}>
+-        <div
+-          className={cn(
+-            "rounded-2xl px-4 py-3 text-sm leading-relaxed",
+-            isUser
+-              ? "rounded-tr-sm bg-brand-600 text-white"
+-              : "rounded-tl-sm border border-border bg-surface-2 text-foreground"
+-          )}
+-        >
+-          {message.content}
+-        </div>
+-        {!isUser && message.responseStatus && (
+-          <div className="flex flex-wrap items-center gap-2">
+-            <ResponseStatusBadge status={message.responseStatus} />
+-          </div>
+-        )}
+-        {!isUser && message.assumptions && message.assumptions.length > 0 && (
+-          <div className="rounded-lg border border-modelled-border bg-modelled-bg px-3 py-2">
+-            <p className="flex items-center gap-1.5 text-[11px] font-medium text-modelled">
+-              <Sparkles className="h-3 w-3" /> Assumptions used
+-            </p>
+-            <ul className="mt-1 space-y-0.5">
+-              {message.assumptions.map((a, i) => (
+-                <li key={i} className="text-xs text-foreground/80">
+-                  &bull; {a}
+-                </li>
+-              ))}
+-            </ul>
+-          </div>
+-        )}
+-        {!isUser && message.evidence && message.evidence.length > 0 && (
+-          <div className="space-y-1">
+-            {message.evidence.map((ev, i) => (
+-              <div key={i} className="flex items-start gap-1.5 rounded-lg bg-surface-2 px-2.5 py-1.5 text-[11px] text-muted">
+-                <FileText className="mt-0.5 h-3 w-3 shrink-0" />
+-                <span>
+-                  <span className="font-medium text-foreground">{ev.sourceLabel}</span> — &ldquo;{ev.snippet}&rdquo;
+-                </span>
+-              </div>
+-            ))}
+-          </div>
+-        )}
+-      </div>
+-    </motion.div>
+-  );
+-}
+diff --git a/src/components/shared/presentation-deck.tsx b/src/components/shared/presentation-deck.tsx
+deleted file mode 100644
+index c95c3d5..0000000
+--- a/src/components/shared/presentation-deck.tsx
++++ /dev/null
+@@ -1,90 +0,0 @@
+-"use client";
+-
+-import { useState } from "react";
+-import { AnimatePresence, motion } from "motion/react";
+-import { ChevronLeft, ChevronRight } from "lucide-react";
+-import { cn } from "@/lib/utils";
+-
+-export interface Slide {
+-  label: string;
+-  title: string;
+-  content: React.ReactNode;
+-}
+-
+-export function PresentationDeck({ slides }: { slides: Slide[] }) {
+-  const [index, setIndex] = useState(0);
+-  const [direction, setDirection] = useState(1);
+-
+-  function go(newIndex: number) {
+-    if (newIndex < 0 || newIndex >= slides.length) return;
+-    setDirection(newIndex > index ? 1 : -1);
+-    setIndex(newIndex);
+-  }
+-
+-  const slide = slides[index];
+-
+-  return (
+-    <div className="flex flex-col">
+-      <div className="mb-4 flex items-center gap-1.5 overflow-x-auto pb-1">
+-        {slides.map((s, i) => (
+-          <button
+-            key={s.label}
+-            onClick={() => go(i)}
+-            className={cn(
+-              "shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition-colors",
+-              i === index ? "bg-brand-600 text-white" : "bg-surface-2 text-muted hover:text-foreground"
+-            )}
+-          >
+-            {i + 1}. {s.label}
+-          </button>
+-        ))}
+-      </div>
+-
+-      <div className="relative min-h-[420px] overflow-hidden rounded-2xl border border-border bg-surface">
+-        <AnimatePresence mode="wait" custom={direction}>
+-          <motion.div
+-            key={index}
+-            custom={direction}
+-            initial={{ opacity: 0, x: direction * 40 }}
+-            animate={{ opacity: 1, x: 0 }}
+-            exit={{ opacity: 0, x: direction * -40 }}
+-            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+-            className="p-6 sm:p-10"
+-          >
+-            <p className="text-xs font-semibold uppercase tracking-wider text-brand-600 dark:text-brand-400">
+-              {String(index + 1).padStart(2, "0")} / {String(slides.length).padStart(2, "0")}
+-            </p>
+-            <h2 className="text-balance mt-2 text-2xl font-bold tracking-tight text-foreground sm:text-3xl">{slide.title}</h2>
+-            <div className="mt-6">{slide.content}</div>
+-          </motion.div>
+-        </AnimatePresence>
+-      </div>
+-
+-      <div className="mt-4 flex items-center justify-between">
+-        <button
+-          onClick={() => go(index - 1)}
+-          disabled={index === 0}
+-          className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3.5 py-2 text-sm font-medium text-foreground transition-colors hover:bg-surface-2 disabled:opacity-40"
+-        >
+-          <ChevronLeft className="h-4 w-4" /> Previous
+-        </button>
+-        <div className="flex gap-1.5">
+-          {slides.map((_, i) => (
+-            <button
+-              key={i}
+-              onClick={() => go(i)}
+-              className={cn("h-1.5 rounded-full transition-all", i === index ? "w-6 bg-brand-600" : "w-1.5 bg-surface-2")}
+-            />
+-          ))}
+-        </div>
+-        <button
+-          onClick={() => go(index + 1)}
+-          disabled={index === slides.length - 1}
+-          className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3.5 py-2 text-sm font-medium text-foreground transition-colors hover:bg-surface-2 disabled:opacity-40"
+-        >
+-          Next <ChevronRight className="h-4 w-4" />
+-        </button>
+-      </div>
+-    </div>
+-  );
+-}
+diff --git a/src/lib/api/admin-lookup.ts b/src/lib/api/admin-lookup.ts
+new file mode 100644
+index 0000000..11d800e
+--- /dev/null
++++ b/src/lib/api/admin-lookup.ts
+@@ -0,0 +1,205 @@
++// Read-only PostgREST access for the admin/platform portal. Same anon-key
++// pattern as buyer-lookup.ts / vendor-lookup.ts — see the RLS migration
++// "add_public_read_policies_for_frontend_tables" for why this now actually
++// returns rows instead of silently coming back empty (this app has no
++// Supabase Auth session anywhere, so every "is_org_member(...) OR
++// is_platform_admin()" policy previously blocked every anon-key read).
++//
++// getAllVendors / getAllBuyers already live in vendor-lookup.ts (the admin
++// vendor/buyer tables are literally "every row", the same shape a vendor's
++// own profile read already needs) — re-exported here so admin pages only
++// need to import from one place.
++
++export { getAllVendors, getAllBuyers, type VendorDetailRow, type LeadBuyerRow } from "./vendor-lookup";
++
++const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
++const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++
++async function restGet<T>(path: string): Promise<T> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    cache: "no-store",
++    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
++  });
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
++  return res.json() as Promise<T>;
++}
++
++async function restCount(path: string): Promise<number> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
++    cache: "no-store",
++    headers: {
++      apikey: SUPABASE_ANON_KEY,
++      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
++      Prefer: "count=exact",
++      Range: "0-0",
++    },
++  });
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}) for ${path}.`);
++  const range = res.headers.get("content-range");
++  const total = range?.split("/")[1];
++  return total ? parseInt(total, 10) : 0;
++}
++
++// ---- organizations ----------------------------------------------------
++
++export interface OrganizationRow {
++  id: string;
++  name: string;
++  type: "vendor" | "buyer";
++  createdAt: string;
++}
++
++export async function getRecentOrganizations(limit = 8): Promise<OrganizationRow[]> {
++  const params = new URLSearchParams({ select: "id,name,type,created_at", order: "created_at.desc", limit: String(limit) });
++  const rows = await restGet<{ id: string; name: string; type: "vendor" | "buyer"; created_at: string }[]>(`organizations?${params}`);
++  return rows.map((r) => ({ id: r.id, name: r.name, type: r.type, createdAt: r.created_at }));
++}
++
++// ---- platform-wide stats -------------------------------------------------
++
++export interface PlatformStats {
++  totalOrganizations: number;
++  activeVendors: number;
++  activeBuyers: number;
++  totalSolutionModels: number;
++  groundedAnswerRate: number | null;
++}
++
++export async function getPlatformStats(): Promise<PlatformStats> {
++  const [totalOrganizations, activeVendors, activeBuyers, totalSolutionModels, totalMessages, verifiedMessages] = await Promise.all([
++    restCount("organizations?select=id"),
++    restCount("vendors?select=id"),
++    restCount("buyers?select=id"),
++    restCount("solution_models?select=id"),
++    restCount("messages?select=id&role=eq.assistant"),
++    restCount("messages?select=id&role=eq.assistant&response_status=eq.verified"),
++  ]);
++  return {
++    totalOrganizations,
++    activeVendors,
++    activeBuyers,
++    totalSolutionModels,
++    groundedAnswerRate: totalMessages > 0 ? Math.round((verifiedMessages / totalMessages) * 100) : null,
++  };
++}
++
++// ---- platform activity (solution models + frontier questions per week) ---
++// The closest real analogs to dummy-data's "solutions generated" /
++// "questions resolved" weekly series — bucketed client-side from raw
++// created_at timestamps since there's no pre-aggregated table for this.
++
++export interface PlatformActivityWeek {
++  week: string;
++  solutions: number;
++  questions: number;
++}
++
++function bucketByWeek(timestamps: string[], weeks: number): number[] {
++  const now = timestamps.length > 0 ? new Date(Math.max(...timestamps.map((t) => new Date(t).getTime()))) : new Date();
++  const buckets = new Array(weeks).fill(0);
++  const weekMs = 7 * 24 * 60 * 60 * 1000;
++  const endOfLastBucket = now.getTime();
++  for (const t of timestamps) {
++    const diff = endOfLastBucket - new Date(t).getTime();
++    const idx = weeks - 1 - Math.floor(diff / weekMs);
++    if (idx >= 0 && idx < weeks) buckets[idx] += 1;
++  }
++  return buckets;
++}
++
++export async function getPlatformActivitySeries(weeks = 6): Promise<PlatformActivityWeek[]> {
++  const [solutionModels, frontierItems] = await Promise.all([
++    restGet<{ created_at: string }[]>(`solution_models?select=created_at&order=created_at.desc&limit=500`),
++    restGet<{ created_at: string }[]>(`capability_frontier?select=created_at&order=created_at.desc&limit=500`),
++  ]);
++  const solutionBuckets = bucketByWeek(solutionModels.map((r) => r.created_at), weeks);
++  const questionBuckets = bucketByWeek(frontierItems.map((r) => r.created_at), weeks);
++  return Array.from({ length: weeks }, (_, i) => ({
++    week: i === weeks - 1 ? "This wk" : `${weeks - 1 - i}w ago`,
++    solutions: solutionBuckets[i],
++    questions: questionBuckets[i],
++  }));
++}
++
++// ---- cross-portal engagement (every recommendation / selection) ----------
++// Unfiltered reads of the same two tables vendor-lookup.ts reads scoped to
++// one vendor — the admin buyers table needs "this buyer's best fit + stage
++// across ALL vendors", which needs the full table, not a vendor_id slice.
++
++export interface AdminVendorRecommendationRow {
++  id: string;
++  buyerId: string;
++  vendorId: string;
++  fitScore: number | null;
++}
++
++export async function getAllVendorRecommendations(): Promise<AdminVendorRecommendationRow[]> {
++  const params = new URLSearchParams({ select: "id,buyer_id,vendor_id,fit_score", order: "fit_score.desc" });
++  const rows = await restGet<{ id: string; buyer_id: string; vendor_id: string; fit_score: number | null }[]>(`vendor_recommendations?${params}`);
++  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, vendorId: r.vendor_id, fitScore: r.fit_score }));
++}
++
++export interface AdminBuyerVendorSelectionRow {
++  id: string;
++  buyerId: string;
++  vendorId: string;
++  isActive: boolean;
++}
++
++export async function getAllBuyerVendorSelections(): Promise<AdminBuyerVendorSelectionRow[]> {
++  const params = new URLSearchParams({ select: "id,buyer_id,vendor_id,is_active" });
++  const rows = await restGet<{ id: string; buyer_id: string; vendor_id: string; is_active: boolean }[]>(`buyer_vendor_selections?${params}`);
++  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, vendorId: r.vendor_id, isActive: r.is_active }));
++}
++
++export interface AdminFrontierCountRow {
++  buyerId: string;
++  openCount: number;
++}
++
++export async function getOpenFrontierCountsByBuyer(): Promise<Record<string, number>> {
++  const params = new URLSearchParams({ select: "buyer_id", status: "in.(open,vendor_review)" });
++  const rows = await restGet<{ buyer_id: string }[]>(`capability_frontier?${params}`);
++  const counts: Record<string, number> = {};
++  for (const r of rows) counts[r.buyer_id] = (counts[r.buyer_id] ?? 0) + 1;
++  return counts;
++}
++
++// ---- audit_events ----------------------------------------------------------
++// Shaped directly as lib/types.ts's AuditEvent so it drops straight into the
++// existing <AuditTimeline> component with no extra mapping at the call site.
++
++import type { AuditEvent } from "@/lib/types";
++
++export async function getAuditEvents(limit = 50, organizationId?: string): Promise<AuditEvent[]> {
++  const params = new URLSearchParams({
++    select: "id,agent_name,action,entity_type,entity_name,confidence,human_verified,created_at",
++    order: "created_at.desc",
++    limit: String(limit),
++  });
++  if (organizationId) params.set("organization_id", `eq.${organizationId}`);
++  const rows = await restGet<
++    {
++      id: string;
++      agent_name: string;
++      action: string;
++      entity_type: string | null;
++      entity_name: string | null;
++      confidence: AuditEvent["confidence"] | null;
++      human_verified: boolean | null;
++      created_at: string;
++    }[]
++  >(`audit_events?${params}`);
++  return rows.map((r) => ({
++    id: r.id,
++    agentName: r.agent_name,
++    action: r.action,
++    entityType: r.entity_type ?? "—",
++    entityName: r.entity_name ?? "—",
++    confidence: r.confidence ?? "modelled",
++    humanVerified: r.human_verified ?? false,
++    timestamp: r.created_at,
++  }));
++}
+diff --git a/src/lib/api/notifications.ts b/src/lib/api/notifications.ts
+new file mode 100644
+index 0000000..fb0ea1d
+--- /dev/null
++++ b/src/lib/api/notifications.ts
+@@ -0,0 +1,103 @@
++// Normalizes several already-real, role-scoped reads (capability frontier,
++// meeting requests, workflow-run completions, recommendations, audit events)
++// into one flat feed for NotificationsMenu — replacing the previous static,
++// hardcoded 3-item fake array that was shown identically to every role.
++
++import { getCapabilityFrontierItems, getMeetingRequests, getBuyerWorkflowRunHistory } from "@/lib/api/buyer-lookup";
++import { getFrontierItemsForVendor, getMeetingRequestsForVendor } from "@/lib/api/vendor-frontier";
++import { getVendorRecommendationsForVendor, getBuyersByIds } from "@/lib/api/vendor-lookup";
++import { getAuditEvents, getRecentOrganizations } from "@/lib/api/admin-lookup";
++
++export interface NotificationItem {
++  id: string;
++  tone: "escalated" | "brand" | "verified" | "modelled";
++  title: string;
++  detail: string;
++  time: string; // ISO timestamp, formatted at render time
++}
++
++function sortAndCap(items: NotificationItem[], limit: number): NotificationItem[] {
++  return items.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()).slice(0, limit);
++}
++
++export async function getBuyerNotifications(buyerId: string): Promise<NotificationItem[]> {
++  const [frontier, meetings, runs] = await Promise.all([
++    getCapabilityFrontierItems(buyerId).catch(() => []),
++    getMeetingRequests(buyerId).catch(() => []),
++    getBuyerWorkflowRunHistory(buyerId, 5).catch(() => []),
++  ]);
++
++  const items: NotificationItem[] = [];
++  for (const f of frontier) {
++    if (f.status === "vendor_review" || f.status === "vendor_answered" || f.status === "resolved") {
++      items.push({
++        id: `frontier-${f.id}`,
++        tone: f.status === "resolved" ? "verified" : "brand",
++        title: f.status === "resolved" ? "Question resolved" : "Vendor responded",
++        detail: f.question,
++        time: f.createdAt,
++      });
++    } else {
++      items.push({ id: `frontier-${f.id}`, tone: "escalated", title: "Open question", detail: f.question, time: f.createdAt });
++    }
++  }
++  for (const m of meetings) {
++    if (m.status === "scheduled") {
++      items.push({ id: `meeting-${m.id}`, tone: "verified", title: "Meeting confirmed", detail: m.expert ? `With ${m.expert}` : "Discussion scheduled", time: m.proposedDate ?? new Date().toISOString() });
++    }
++  }
++  for (const r of runs) {
++    if (r.status === "completed") {
++      items.push({ id: `run-${r.id}`, tone: "verified", title: "Your solution is ready", detail: "A new run finished — check your solution workspace.", time: r.completedAt ?? r.startedAt });
++    } else if (r.status === "failed") {
++      items.push({ id: `run-${r.id}`, tone: "escalated", title: "A run failed", detail: "Something went wrong generating your solution.", time: r.startedAt });
++    }
++  }
++  return sortAndCap(items, 8);
++}
++
++export async function getVendorNotifications(vendorId: string): Promise<NotificationItem[]> {
++  const [frontier, meetings, recs] = await Promise.all([
++    getFrontierItemsForVendor(vendorId).catch(() => []),
++    getMeetingRequestsForVendor(vendorId).catch(() => []),
++    getVendorRecommendationsForVendor(vendorId).catch(() => []),
++  ]);
++
++  const buyerIds = Array.from(new Set([...frontier.map((f) => f.buyerId), ...meetings.map((m) => m.buyerId), ...recs.map((r) => r.buyerId)]));
++  const buyers = buyerIds.length > 0 ? await getBuyersByIds(buyerIds).catch(() => []) : [];
++  const nameOf = (id: string) => buyers.find((b) => b.id === id)?.companyName ?? "A buyer";
++
++  const items: NotificationItem[] = [];
++  for (const f of frontier) {
++    if (f.status === "open") {
++      items.push({ id: `frontier-${f.id}`, tone: "escalated", title: "New capability question", detail: `${nameOf(f.buyerId)}: ${f.question}`, time: f.createdAt });
++    }
++  }
++  for (const m of meetings) {
++    if (m.status === "requested") {
++      items.push({ id: `meeting-${m.id}`, tone: "brand", title: "Meeting requested", detail: `${nameOf(m.buyerId)} wants a live discussion`, time: m.createdAt });
++    }
++  }
++  for (const r of recs) {
++    items.push({ id: `rec-${r.id}`, tone: "modelled", title: "Buyer exploring your solution", detail: `${nameOf(r.buyerId)} — ${r.fitScore ?? 0}% fit`, time: new Date().toISOString() });
++  }
++  return sortAndCap(items, 8);
++}
++
++export async function getAdminNotifications(): Promise<NotificationItem[]> {
++  const [events, orgs] = await Promise.all([getAuditEvents(6).catch(() => []), getRecentOrganizations(4).catch(() => [])]);
++  const items: NotificationItem[] = [];
++  for (const e of events) {
++    items.push({
++      id: `audit-${e.id}`,
++      tone: e.confidence === "escalated" ? "escalated" : e.confidence === "verified" ? "verified" : "modelled",
++      title: e.action,
++      detail: `${e.agentName} · ${e.entityName}`,
++      time: e.timestamp,
++    });
++  }
++  for (const o of orgs) {
++    items.push({ id: `org-${o.id}`, tone: "brand", title: `New ${o.type} organization`, detail: o.name, time: o.createdAt });
++  }
++  return sortAndCap(items, 8);
++}
+diff --git a/src/lib/api/vendor-lookup.ts b/src/lib/api/vendor-lookup.ts
+index a95742e..eb41c86 100644
+--- a/src/lib/api/vendor-lookup.ts
++++ b/src/lib/api/vendor-lookup.ts
+@@ -59,3 +59,312 @@ export async function countDraftCapabilities(vendorId: string): Promise<number>
+   const total = range?.split("/")[1];
+   return total ? parseInt(total, 10) : 0;
+ }
++
++// ---- vendor detail --------------------------------------------------------
++// Full row for a vendor's own dashboard/profile, and for admin's vendor
++// detail views — everything solution DNA doesn't already cover (industry,
++// hq, founded year, verification status).
++
++export interface VendorDetailRow {
++  id: string;
++  companyName: string;
++  industry: string | null;
++  industries: string[];
++  website: string | null;
++  tagline: string | null;
++  description: string | null;
++  employeeRange: string | null;
++  hq: string | null;
++  foundedYear: number | null;
++  verificationStatus: string;
++  createdAt: string;
++}
++
++function mapVendorRow(row: {
++  id: string;
++  company_name: string;
++  industry: string | null;
++  industries: string[] | null;
++  website: string | null;
++  tagline: string | null;
++  description: string | null;
++  employee_range: string | null;
++  hq: string | null;
++  founded_year: number | null;
++  verification_status: string;
++  created_at: string;
++}): VendorDetailRow {
++  return {
++    id: row.id,
++    companyName: row.company_name,
++    industry: row.industry,
++    industries: row.industries ?? [],
++    website: row.website,
++    tagline: row.tagline,
++    description: row.description,
++    employeeRange: row.employee_range,
++    hq: row.hq,
++    foundedYear: row.founded_year,
++    verificationStatus: row.verification_status,
++    createdAt: row.created_at,
++  };
++}
++
++const VENDOR_SELECT =
++  "id,company_name,industry,industries,website,tagline,description,employee_range,hq,founded_year,verification_status,created_at";
++
++export async function getVendorById(vendorId: string): Promise<VendorDetailRow | null> {
++  const params = new URLSearchParams({ select: VENDOR_SELECT, id: `eq.${vendorId}`, limit: "1" });
++  const rows = await restGet<Parameters<typeof mapVendorRow>[0][]>(`vendors?${params}`);
++  const row = rows[0];
++  return row ? mapVendorRow(row) : null;
++}
++
++export async function getAllVendors(): Promise<VendorDetailRow[]> {
++  const params = new URLSearchParams({ select: VENDOR_SELECT, order: "created_at.desc" });
++  const rows = await restGet<Parameters<typeof mapVendorRow>[0][]>(`vendors?${params}`);
++  return rows.map(mapVendorRow);
++}
++
++// ---- buyers (vendor/admin-facing reads) -----------------------------------
++
++export interface LeadBuyerRow {
++  id: string;
++  companyName: string;
++  industry: string | null;
++  companySize: number | null;
++  contactName: string | null;
++  contactRole: string | null;
++  createdAt: string;
++}
++
++function mapBuyerRow(row: {
++  id: string;
++  company_name: string;
++  industry: string | null;
++  company_size: number | null;
++  contact_name: string | null;
++  contact_role: string | null;
++  created_at: string;
++}): LeadBuyerRow {
++  return {
++    id: row.id,
++    companyName: row.company_name,
++    industry: row.industry,
++    companySize: row.company_size,
++    contactName: row.contact_name,
++    contactRole: row.contact_role,
++    createdAt: row.created_at,
++  };
++}
++
++const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,created_at";
++
++// Batch lookup by id — used to resolve buyer names/industries for whichever
++// set of buyer_ids a vendor_recommendations/buyer_vendor_selections read
++// returns, without an N+1 request per row.
++export async function getBuyersByIds(ids: string[]): Promise<LeadBuyerRow[]> {
++  const unique = Array.from(new Set(ids)).filter(Boolean);
++  if (unique.length === 0) return [];
++  const params = new URLSearchParams({ select: BUYER_SELECT, id: `in.(${unique.join(",")})` });
++  const rows = await restGet<Parameters<typeof mapBuyerRow>[0][]>(`buyers?${params}`);
++  return rows.map(mapBuyerRow);
++}
++
++export async function getBuyerById(buyerId: string): Promise<LeadBuyerRow | null> {
++  const params = new URLSearchParams({ select: BUYER_SELECT, id: `eq.${buyerId}`, limit: "1" });
++  const rows = await restGet<Parameters<typeof mapBuyerRow>[0][]>(`buyers?${params}`);
++  const row = rows[0];
++  return row ? mapBuyerRow(row) : null;
++}
++
++export async function getAllBuyers(): Promise<LeadBuyerRow[]> {
++  const params = new URLSearchParams({ select: BUYER_SELECT, order: "created_at.desc" });
++  const rows = await restGet<Parameters<typeof mapBuyerRow>[0][]>(`buyers?${params}`);
++  return rows.map(mapBuyerRow);
++}
++
++// ---- vendor_recommendations (vendor-side: "who is interested in us") ------
++// Mirrors buyer-lookup.ts's getVendorRecommendations, filtered by vendor_id
++// instead of buyer_id — this is the real "buyers exploring your solution"
++// list the vendor dashboard needs instead of dummy-data's static engagements.
++
++export interface VendorRecommendationForVendorRow {
++  id: string;
++  buyerId: string;
++  fitScore: number | null;
++  keyMatch: string | null;
++  reason: string | null;
++  confidence: number | null;
++}
++
++export async function getVendorRecommendationsForVendor(vendorId: string): Promise<VendorRecommendationForVendorRow[]> {
++  const params = new URLSearchParams({
++    select: "id,buyer_id,fit_score,key_match,reason,confidence",
++    vendor_id: `eq.${vendorId}`,
++    order: "fit_score.desc",
++  });
++  const rows = await restGet<
++    { id: string; buyer_id: string; fit_score: number | null; key_match: string | null; reason: string | null; confidence: number | null }[]
++  >(`vendor_recommendations?${params}`);
++  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, fitScore: r.fit_score, keyMatch: r.key_match, reason: r.reason, confidence: r.confidence }));
++}
++
++// ---- buyer_vendor_selections (vendor-side: who actively picked us) --------
++
++export interface BuyerVendorSelectionForVendorRow {
++  id: string;
++  buyerId: string;
++  isActive: boolean;
++}
++
++export async function getBuyerVendorSelectionsForVendor(vendorId: string): Promise<BuyerVendorSelectionForVendorRow[]> {
++  const params = new URLSearchParams({
++    select: "id,buyer_id,is_active",
++    vendor_id: `eq.${vendorId}`,
++  });
++  const rows = await restGet<{ id: string; buyer_id: string; is_active: boolean }[]>(`buyer_vendor_selections?${params}`);
++  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, isActive: r.is_active }));
++}
++
++// ---- solution matches / gaps / requirements for a specific buyer+vendor ---
++// Used by the vendor's buyer-detail page — mirrors buyer-lookup.ts's
++// getFitAndGapAssessment / getBuyerRequirements / getClientRealityProfile
++// exactly, just called from the vendor side of the same tables.
++
++export interface VendorSideMatchRow {
++  id: string;
++  requirementText: string | null;
++  capabilityName: string | null;
++  matchStatus: "strong_match" | "partial_match" | "unmatched" | "requires_validation";
++  confidence: number | null;
++  reasoning: string | null;
++}
++
++export interface VendorSideGapRow {
++  id: string;
++  currentState: string | null;
++  desiredState: string | null;
++  gap: string | null;
++  severity: "high" | "medium" | "low";
++}
++
++export async function getMatchesAndGapsForBuyer(
++  buyerId: string,
++  vendorId: string
++): Promise<{ matches: VendorSideMatchRow[]; gaps: VendorSideGapRow[] }> {
++  const matchParams = new URLSearchParams({
++    select: "id,requirement_text,capability_name,match_status,confidence,reasoning",
++    buyer_id: `eq.${buyerId}`,
++    vendor_id: `eq.${vendorId}`,
++  });
++  const gapParams = new URLSearchParams({
++    select: "id,current_state,desired_state,gap,severity",
++    buyer_id: `eq.${buyerId}`,
++    vendor_id: `eq.${vendorId}`,
++  });
++  const [matchRows, gapRows] = await Promise.all([
++    restGet<
++      { id: string; requirement_text: string | null; capability_name: string | null; match_status: VendorSideMatchRow["matchStatus"]; confidence: number | null; reasoning: string | null }[]
++    >(`solution_matches?${matchParams}`),
++    restGet<{ id: string; current_state: string | null; desired_state: string | null; gap: string | null; severity: VendorSideGapRow["severity"] }[]>(
++      `gap_items?${gapParams}`
++    ),
++  ]);
++  return {
++    matches: matchRows.map((r) => ({
++      id: r.id,
++      requirementText: r.requirement_text,
++      capabilityName: r.capability_name,
++      matchStatus: r.match_status,
++      confidence: r.confidence,
++      reasoning: r.reasoning,
++    })),
++    gaps: gapRows.map((r) => ({ id: r.id, currentState: r.current_state, desiredState: r.desired_state, gap: r.gap, severity: r.severity })),
++  };
++}
++
++export interface VendorSideRequirementRow {
++  id: string;
++  text: string;
++  priority: "high" | "medium" | "low";
++  status: "captured" | "clarifying" | "confirmed";
++}
++
++export async function getRequirementsForBuyer(buyerId: string): Promise<VendorSideRequirementRow[]> {
++  const params = new URLSearchParams({
++    select: "id,requirement_text,priority,status,created_at",
++    buyer_id: `eq.${buyerId}`,
++    order: "created_at.asc",
++  });
++  const rows = await restGet<
++    { id: string; requirement_text: string; priority: VendorSideRequirementRow["priority"]; status: VendorSideRequirementRow["status"] }[]
++  >(`buyer_requirements?${params}`);
++  return rows.map((r) => ({ id: r.id, text: r.requirement_text, priority: r.priority, status: r.status }));
++}
++
++export interface VendorSideRealityProfileRow {
++  currentTechnology: string[];
++  currentCostAnnual: number | null;
++  users: number | null;
++  painPoints: string[];
++  goals: string[];
++  constraints: string[];
++  timelineMonths: number | null;
++}
++
++export async function getRealityProfileForBuyer(buyerId: string): Promise<VendorSideRealityProfileRow | null> {
++  const params = new URLSearchParams({
++    select: "current_technology,current_cost_annual,users,pain_points,goals,constraints,timeline_months",
++    buyer_id: `eq.${buyerId}`,
++    limit: "1",
++  });
++  const rows = await restGet<
++    {
++      current_technology: string[] | null;
++      current_cost_annual: number | null;
++      users: number | null;
++      pain_points: string[] | null;
++      goals: string[] | null;
++      constraints: string[] | null;
++      timeline_months: number | null;
++    }[]
++  >(`client_reality_profiles?${params}`);
++  const row = rows[0];
++  if (!row) return null;
++  return {
++    currentTechnology: row.current_technology ?? [],
++    currentCostAnnual: row.current_cost_annual,
++    users: row.users,
++    painPoints: row.pain_points ?? [],
++    goals: row.goals ?? [],
++    constraints: row.constraints ?? [],
++    timelineMonths: row.timeline_months,
++  };
++}
++
++// ---- capability_frontier / meeting_requests, scoped to one buyer+vendor ---
++// getFrontierItemsForVendor / getMeetingRequestsForVendor (vendor-frontier.ts)
++// already read these tables filtered by vendor_id only; these two add the
++// buyer_id filter for the vendor's per-buyer detail page.
++
++export async function getFrontierCountForVendor(vendorId: string): Promise<number> {
++  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
++  const params = new URLSearchParams({
++    vendor_id: `eq.${vendorId}`,
++    status: "in.(open,vendor_review)",
++  });
++  const res = await fetch(`${SUPABASE_URL}/rest/v1/capability_frontier?${params}`, {
++    cache: "no-store",
++    headers: {
++      apikey: SUPABASE_ANON_KEY,
++      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
++      Prefer: "count=exact",
++      Range: "0-0",
++    },
++  });
++  if (!res.ok) throw new Error(`Supabase read failed (${res.status}).`);
++  const range = res.headers.get("content-range");
++  const total = range?.split("/")[1];
++  return total ? parseInt(total, 10) : 0;
++}
+diff --git a/src/lib/dummy-data.ts b/src/lib/dummy-data.ts
+deleted file mode 100644
+index 9d10b67..0000000
+--- a/src/lib/dummy-data.ts
++++ /dev/null
+@@ -1,609 +0,0 @@
+-import type {
+-  AuditEvent,
+-  Buyer,
+-  Capability,
+-  CapabilityFrontierItem,
+-  ClientRealityProfile,
+-  ConversationMessage,
+-  GapItem,
+-  MeetingRequest,
+-  Requirement,
+-  RoiProjection,
+-  SolutionMatch,
+-  SolutionModel,
+-  Vendor,
+-  VendorSource,
+-} from "./types";
+-
+-export const vendors: Vendor[] = [
+-  {
+-    id: "v-cloudnova",
+-    name: "CloudNova",
+-    slug: "cloudnova",
+-    website: "https://cloudnova.io",
+-    industry: "Cloud Infrastructure",
+-    description:
+-      "CloudNova provides cloud infrastructure, data platform, and security solutions with deep expertise in Kubernetes migration and cost optimization for mid-to-large enterprises.",
+-    tagline: "Cloud transformation, verified end to end.",
+-    verificationStatus: "verified",
+-    employeeRange: "500-1,000",
+-    hq: "Bengaluru, India",
+-    foundedYear: 2016,
+-    color: "brand",
+-    fitScore: 92,
+-    keyMatch: "Kubernetes + migration",
+-    industries: ["BFSI", "Healthcare", "Manufacturing", "Retail"],
+-  },
+-  {
+-    id: "v-northbeam",
+-    name: "Northbeam Cloud",
+-    slug: "northbeam",
+-    website: "https://northbeamcloud.com",
+-    industry: "Managed Cloud Services",
+-    description:
+-      "Northbeam specializes in managed cloud operations and 24/7 infrastructure monitoring for fast-growing companies that need predictable spend.",
+-    tagline: "Cost-predictable cloud, managed for you.",
+-    verificationStatus: "verified",
+-    employeeRange: "100-250",
+-    hq: "Austin, USA",
+-    foundedYear: 2019,
+-    color: "accent",
+-    fitScore: 78,
+-    keyMatch: "Cost optimization",
+-    industries: ["SaaS", "Fintech", "E-commerce"],
+-  },
+-  {
+-    id: "v-aegis",
+-    name: "Aegis Secure Systems",
+-    slug: "aegis-secure",
+-    website: "https://aegissecure.com",
+-    industry: "Cybersecurity",
+-    description:
+-      "Aegis delivers zero-trust security architecture, compliance automation, and managed detection & response for regulated industries.",
+-    tagline: "Zero-trust security, fully managed.",
+-    verificationStatus: "verified",
+-    employeeRange: "250-500",
+-    hq: "London, UK",
+-    foundedYear: 2014,
+-    color: "modelled",
+-    fitScore: 64,
+-    keyMatch: "Compliance automation",
+-    industries: ["BFSI", "Healthcare", "Government"],
+-  },
+-  {
+-    id: "v-vertex",
+-    name: "Vertex Data Works",
+-    slug: "vertex-data",
+-    website: "https://vertexdataworks.com",
+-    industry: "Data & Analytics",
+-    description:
+-      "Vertex builds modern data platforms, ETL pipelines, and analytics infrastructure with a focus on manufacturing and logistics companies.",
+-    tagline: "Your data, unified and actionable.",
+-    verificationStatus: "pending",
+-    employeeRange: "50-100",
+-    hq: "Singapore",
+-    foundedYear: 2021,
+-    color: "verified",
+-    fitScore: 58,
+-    keyMatch: "Data modernization",
+-    industries: ["Manufacturing", "Logistics"],
+-  },
+-];
+-
+-export const primaryVendor = vendors[0];
+-
+-export const vendorSources: VendorSource[] = [
+-  {
+-    id: "src-1",
+-    vendorId: "v-cloudnova",
+-    sourceType: "website",
+-    label: "cloudnova.io",
+-    detail: "Full site crawl — 42 pages",
+-    processingStatus: "completed",
+-    uploadedAt: "2026-08-02T09:14:00Z",
+-    extractedCount: 28,
+-  },
+-  {
+-    id: "src-2",
+-    vendorId: "v-cloudnova",
+-    sourceType: "pdf",
+-    label: "CloudNova_Product_Brochure_2026.pdf",
+-    detail: "3.2 MB · 18 pages",
+-    sizeKb: 3200,
+-    processingStatus: "completed",
+-    uploadedAt: "2026-08-02T09:16:00Z",
+-    extractedCount: 14,
+-  },
+-  {
+-    id: "src-3",
+-    vendorId: "v-cloudnova",
+-    sourceType: "pdf",
+-    label: "CloudNova_Pricing_Sheet_Q3.pdf",
+-    detail: "640 KB · 4 pages",
+-    sizeKb: 640,
+-    processingStatus: "completed",
+-    uploadedAt: "2026-08-02T09:17:00Z",
+-    extractedCount: 9,
+-  },
+-  {
+-    id: "src-4",
+-    vendorId: "v-cloudnova",
+-    sourceType: "doc",
+-    label: "Technical_Architecture_Overview.docx",
+-    detail: "1.1 MB · Kubernetes migration playbook",
+-    sizeKb: 1100,
+-    processingStatus: "completed",
+-    uploadedAt: "2026-08-02T09:20:00Z",
+-    extractedCount: 11,
+-  },
+-  {
+-    id: "src-5",
+-    vendorId: "v-cloudnova",
+-    sourceType: "spreadsheet",
+-    label: "Case_Studies_Master.xlsx",
+-    detail: "310 KB · 12 case studies",
+-    sizeKb: 310,
+-    processingStatus: "processing",
+-    uploadedAt: "2026-08-16T08:02:00Z",
+-  },
+-  {
+-    id: "src-6",
+-    vendorId: "v-cloudnova",
+-    sourceType: "manual",
+-    label: "Manually entered FAQs",
+-    detail: "22 entries added by vendor admin",
+-    processingStatus: "completed",
+-    uploadedAt: "2026-08-03T11:00:00Z",
+-    extractedCount: 22,
+-  },
+-];
+-
+-export const capabilities: Capability[] = [
+-  {
+-    id: "cap-1",
+-    vendorId: "v-cloudnova",
+-    name: "Kubernetes Migration",
+-    description:
+-      "End-to-end migration of monolithic and legacy workloads into containerized, orchestrated Kubernetes environments with minimal service disruption.",
+-    category: "service",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "Technical_Architecture_Overview.docx", sourceType: "doc", snippet: "Our migration methodology moves workloads in phased waves, validating each service in a staging cluster before cutover." },
+-      { sourceLabel: "cloudnova.io", sourceType: "website", snippet: "CloudNova has completed 140+ Kubernetes migrations across BFSI, healthcare, and manufacturing clients." },
+-    ],
+-    tags: ["kubernetes", "migration", "containers"],
+-  },
+-  {
+-    id: "cap-2",
+-    vendorId: "v-cloudnova",
+-    name: "Cloud Cost Optimization",
+-    description:
+-      "Continuous rightsizing, reserved-instance planning, and idle-resource elimination to reduce infrastructure spend by 25-40%.",
+-    category: "service",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "CloudNova_Product_Brochure_2026.pdf", sourceType: "pdf", snippet: "Clients typically see 25-40% cost reduction within the first two billing cycles after optimization rollout." },
+-    ],
+-    tags: ["cost", "finops", "optimization"],
+-  },
+-  {
+-    id: "cap-3",
+-    vendorId: "v-cloudnova",
+-    name: "Managed Infrastructure",
+-    description: "24/7 monitoring, patching, and incident response for production cloud environments across AWS, Azure, and GCP.",
+-    category: "service",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "cloudnova.io", sourceType: "website", snippet: "CloudNova's SRE team provides round-the-clock monitoring with a 15-minute incident response SLA." },
+-    ],
+-    tags: ["managed-services", "sre", "monitoring"],
+-  },
+-  {
+-    id: "cap-4",
+-    vendorId: "v-cloudnova",
+-    name: "Data Platform Modernization",
+-    description: "Migration from legacy data warehouses to modern lakehouse architectures with real-time pipelines.",
+-    category: "product",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "CloudNova_Product_Brochure_2026.pdf", sourceType: "pdf", snippet: "The CloudNova Data Platform supports streaming ingestion and unifies batch + real-time analytics." },
+-    ],
+-    tags: ["data", "lakehouse", "analytics"],
+-  },
+-  {
+-    id: "cap-5",
+-    vendorId: "v-cloudnova",
+-    name: "Security Platform",
+-    description: "Identity, network segmentation, and compliance tooling layered across cloud workloads.",
+-    category: "product",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "cloudnova.io", sourceType: "website", snippet: "CloudNova Security Platform includes SOC2 Type II and ISO 27001 aligned controls out of the box." },
+-    ],
+-    tags: ["security", "compliance"],
+-  },
+-  {
+-    id: "cap-6",
+-    vendorId: "v-cloudnova",
+-    name: "AWS / Azure / GCP Integration",
+-    description: "Native integrations and multi-cloud orchestration across all three major hyperscalers.",
+-    category: "integration",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "Technical_Architecture_Overview.docx", sourceType: "doc", snippet: "Terraform modules are maintained for AWS, Azure, and GCP with parity across core services." },
+-    ],
+-    tags: ["aws", "azure", "gcp"],
+-  },
+-  {
+-    id: "cap-7",
+-    vendorId: "v-cloudnova",
+-    name: "BFSI & Healthcare Compliance",
+-    description: "Pre-built compliance frameworks for regulated industries including data residency controls.",
+-    category: "industry",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "Manually entered FAQs", sourceType: "manual", snippet: "Yes — we maintain dedicated compliance runbooks for BFSI and healthcare clients including RBI and HIPAA-aligned controls." },
+-    ],
+-    tags: ["bfsi", "healthcare", "compliance"],
+-  },
+-  {
+-    id: "cap-8",
+-    vendorId: "v-cloudnova",
+-    name: "Zero-Downtime Migration Guarantee",
+-    description: "A contractual guarantee of zero service interruption during migration windows.",
+-    category: "constraint",
+-    verificationStatus: "unverified",
+-    evidence: [],
+-    tags: ["migration", "sla"],
+-  },
+-  {
+-    id: "cap-9",
+-    vendorId: "v-cloudnova",
+-    name: "Enterprise Migration Assessment",
+-    description: "Large-scale (1000+ node) migrations require a paid technical assessment phase before a fixed-cost quote can be issued.",
+-    category: "constraint",
+-    verificationStatus: "verified",
+-    evidence: [
+-      { sourceLabel: "CloudNova_Pricing_Sheet_Q3.pdf", sourceType: "pdf", snippet: "Enterprise-scale migrations (1000+ nodes) require a 2-3 week paid assessment engagement prior to fixed pricing." },
+-    ],
+-    tags: ["migration", "pricing"],
+-  },
+-  {
+-    id: "cap-10",
+-    vendorId: "v-cloudnova",
+-    name: "On-call SLA Response Time under 5 minutes",
+-    description: "A buyer-specific SLA tighter than CloudNova's published 15-minute standard.",
+-    category: "constraint",
+-    verificationStatus: "unverified",
+-    evidence: [],
+-    tags: ["sla", "support"],
+-  },
+-];
+-
+-export const buyer: Buyer = {
+-  id: "b-meridian",
+-  companyName: "Meridian Retail Group",
+-  industry: "Retail",
+-  companySize: 500,
+-  createdAt: "2026-08-10T10:00:00Z",
+-  contactName: "Priya Sharma",
+-  contactRole: "VP of Technology",
+-};
+-
+-export const requirements: Requirement[] = [
+-  { id: "req-1", text: "Reduce annual cloud infrastructure cost", priority: "high", status: "confirmed", source: "buyer_input" },
+-  { id: "req-2", text: "Migrate legacy monolith to a scalable architecture", priority: "high", status: "confirmed", source: "buyer_input" },
+-  { id: "req-3", text: "Reduce manual maintenance overhead on infrastructure team", priority: "medium", status: "confirmed", source: "buyer_input" },
+-  { id: "req-4", text: "Support scaling to 1,000 users within 12 months", priority: "medium", status: "confirmed", source: "ai_inferred" },
+-  { id: "req-5", text: "Maintain retail compliance (PCI-DSS) throughout migration", priority: "high", status: "confirmed", source: "ai_inferred" },
+-  { id: "req-6", text: "Zero downtime during the migration window", priority: "high", status: "clarifying", source: "buyer_input" },
+-];
+-
+-export const clientRealityProfile: ClientRealityProfile = {
+-  buyerId: "b-meridian",
+-  currentTechnology: ["On-prem VMware cluster", "Legacy monolith (Java)", "MySQL 5.7", "Manual deployment scripts"],
+-  currentCostAnnual: 4200000,
+-  users: 500,
+-  processes: ["Manual deployment every release", "Quarterly capacity planning", "On-call rotation via spreadsheet"],
+-  painPoints: [
+-    "High infrastructure and maintenance cost",
+-    "Low server utilization (~28% average)",
+-    "Scaling requires 6-8 week procurement cycles",
+-    "Two major outages in the last 6 months during peak sale events",
+-  ],
+-  goals: ["Lower total cost of ownership", "Elastic scalability for seasonal peaks", "Reduce maintenance burden on the 4-person infra team"],
+-  constraints: ["PCI-DSS compliance must be maintained", "Migration cannot disrupt Q4 holiday sale season", "Budget ceiling of ₹35L/year post-migration"],
+-  timelineMonths: 6,
+-};
+-
+-export const gapItems: GapItem[] = [
+-  {
+-    id: "gap-1",
+-    current: "₹42L annual infrastructure cost on underutilized VMware cluster",
+-    desired: "Elastic, usage-based cloud spend under ₹35L/year",
+-    gap: "No consumption-based scaling; fixed capacity paid for year-round",
+-    severity: "high",
+-  },
+-  {
+-    id: "gap-2",
+-    current: "Manual deployment scripts, 6-8 week hardware procurement",
+-    desired: "Automated CI/CD with on-demand infrastructure provisioning",
+-    gap: "No infrastructure-as-code or automated release pipeline",
+-    severity: "high",
+-  },
+-  {
+-    id: "gap-3",
+-    current: "28% average server utilization, two peak-season outages",
+-    desired: "Auto-scaling that absorbs seasonal traffic spikes",
+-    gap: "Static capacity planning cannot react to real-time demand",
+-    severity: "medium",
+-  },
+-  {
+-    id: "gap-4",
+-    current: "4-person infra team manually patching and monitoring servers",
+-    desired: "Managed monitoring and patching with reduced manual load",
+-    gap: "No managed operations layer; all operations are manual",
+-    severity: "medium",
+-  },
+-];
+-
+-export const solutionMatches: SolutionMatch[] = [
+-  {
+-    id: "match-1",
+-    requirementText: "Reduce annual cloud infrastructure cost",
+-    capabilityId: "cap-2",
+-    capabilityName: "Cloud Cost Optimization",
+-    matchStatus: "strong_match",
+-    confidence: 94,
+-    reasoning: "CloudNova's optimization service directly targets the 28% utilization gap identified in your current environment, with a verified 25-40% typical reduction range.",
+-  },
+-  {
+-    id: "match-2",
+-    requirementText: "Migrate legacy monolith to a scalable architecture",
+-    capabilityId: "cap-1",
+-    capabilityName: "Kubernetes Migration",
+-    matchStatus: "strong_match",
+-    confidence: 91,
+-    reasoning: "Your Java monolith on VMware is a standard candidate for CloudNova's phased Kubernetes migration methodology, verified across 140+ prior migrations.",
+-  },
+-  {
+-    id: "match-3",
+-    requirementText: "Reduce manual maintenance overhead on infrastructure team",
+-    capabilityId: "cap-3",
+-    capabilityName: "Managed Infrastructure",
+-    matchStatus: "strong_match",
+-    confidence: 88,
+-    reasoning: "24/7 managed monitoring and patching removes the manual burden currently carried by your 4-person infra team.",
+-  },
+-  {
+-    id: "match-4",
+-    requirementText: "Support scaling to 1,000 users within 12 months",
+-    capabilityId: "cap-6",
+-    capabilityName: "AWS / Azure / GCP Integration",
+-    matchStatus: "partial_match",
+-    confidence: 76,
+-    reasoning: "Multi-cloud elasticity supports growth, but exact scaling headroom for your specific workload profile requires a technical assessment to confirm.",
+-  },
+-  {
+-    id: "match-5",
+-    requirementText: "Maintain retail compliance (PCI-DSS) throughout migration",
+-    capabilityId: "cap-7",
+-    capabilityName: "BFSI & Healthcare Compliance",
+-    matchStatus: "requires_validation",
+-    confidence: 62,
+-    reasoning: "CloudNova has verified compliance frameworks for BFSI/healthcare; PCI-DSS-specific controls for retail are not explicitly documented in current sources.",
+-  },
+-  {
+-    id: "match-6",
+-    requirementText: "Zero downtime during the migration window",
+-    capabilityId: "cap-8",
+-    capabilityName: "Zero-Downtime Migration Guarantee",
+-    matchStatus: "unmatched",
+-    confidence: 0,
+-    reasoning: "No verified vendor information confirms a zero-downtime guarantee. This has been sent to the Capability Frontier for vendor confirmation.",
+-  },
+-];
+-
+-export const roiProjection: RoiProjection = {
+-  currentAnnualCost: 4200000,
+-  projectedAnnualCost: 2730000,
+-  savingsPercent: 35,
+-  paybackMonths: 8,
+-  threeYearSavings: 4410000,
+-  chart: [
+-    { year: "Current", current: 4200000, projected: 4200000 },
+-    { year: "Year 1", current: 4200000, projected: 2940000 },
+-    { year: "Year 2", current: 4200000, projected: 2730000 },
+-    { year: "Year 3", current: 4200000, projected: 2600000 },
+-  ],
+-};
+-
+-export const solutionModel: SolutionModel = {
+-  id: "sm-1",
+-  buyerId: "b-meridian",
+-  vendorId: "v-cloudnova",
+-  version: 3,
+-  status: "active",
+-  executiveSummary:
+-    "Meridian Retail Group is spending ₹42L annually on an underutilized on-prem VMware cluster running a legacy Java monolith. CloudNova's verified Kubernetes migration and cost optimization capabilities directly address the two highest-priority gaps — infrastructure cost and scalability — with a projected 35% cost reduction and an 8-month payback period. One requirement, zero-downtime migration, is not yet verified against CloudNova's Solution DNA and has been escalated for vendor confirmation.",
+-  matches: solutionMatches,
+-  gaps: gapItems,
+-  roi: roiProjection,
+-  updatedAt: "2026-08-16T07:40:00Z",
+-};
+-
+-export const capabilityFrontierItems: CapabilityFrontierItem[] = [
+-  {
+-    id: "cf-1",
+-    buyerId: "b-meridian",
+-    buyerName: "Meridian Retail Group",
+-    vendorId: "v-cloudnova",
+-    vendorName: "CloudNova",
+-    question: "Can your platform migrate our legacy system with zero downtime?",
+-    requirement: "Zero-downtime migration",
+-    context: "Legacy Java monolith on VMware, PCI-DSS retail environment, cannot disrupt Q4 holiday sale season.",
+-    evidenceChecked: ["Technical_Architecture_Overview.docx", "cloudnova.io migration pages", "CloudNova_Product_Brochure_2026.pdf"],
+-    reasonUnresolved: "No verified vendor information guarantees zero downtime; migration docs describe phased cutover with brief maintenance windows.",
+-    status: "open",
+-    recommendedExpert: "Solutions Architect",
+-    createdAt: "2026-08-15T14:22:00Z",
+-  },
+-  {
+-    id: "cf-2",
+-    buyerId: "b-meridian",
+-    buyerName: "Meridian Retail Group",
+-    vendorId: "v-cloudnova",
+-    vendorName: "CloudNova",
+-    question: "Do you have PCI-DSS specific compliance controls for retail payment systems?",
+-    requirement: "PCI-DSS compliance validation",
+-    context: "Retail payment processing environment handling card-present and card-not-present transactions.",
+-    evidenceChecked: ["Manually entered FAQs", "CloudNova Security Platform docs"],
+-    reasonUnresolved: "Compliance frameworks are documented for BFSI and healthcare (RBI, HIPAA) but PCI-DSS is not explicitly named in current sources.",
+-    status: "vendor_review",
+-    recommendedExpert: "Compliance Specialist",
+-    createdAt: "2026-08-14T09:10:00Z",
+-    vendorResponse: "Confirming with our compliance team — PCI-DSS Level 1 controls are supported, documentation update in progress.",
+-  },
+-  {
+-    id: "cf-3",
+-    buyerId: "b-meridian",
+-    buyerName: "Meridian Retail Group",
+-    vendorId: "v-cloudnova",
+-    vendorName: "CloudNova",
+-    question: "Can you commit to a sub-5-minute incident response SLA instead of the standard 15 minutes?",
+-    requirement: "Tighter on-call SLA",
+-    context: "Buyer experienced two outages during peak sale events last year and wants faster incident response.",
+-    evidenceChecked: ["cloudnova.io", "CloudNova_Pricing_Sheet_Q3.pdf"],
+-    reasonUnresolved: "Published SLA is 15 minutes; a tighter custom SLA is a commercial negotiation point outside verified Solution DNA.",
+-    status: "resolved",
+-    recommendedExpert: "Account Executive",
+-    createdAt: "2026-08-12T16:45:00Z",
+-    vendorResponse: "We can offer a 5-minute SLA as part of the Enterprise support tier at an additional cost — details shared with buyer.",
+-  },
+-];
+-
+-export const conversation: ConversationMessage[] = [
+-  {
+-    id: "msg-1",
+-    role: "assistant",
+-    content:
+-      "Hi Priya — I'm the CloudNova solution assistant for Meridian Retail Group. I can answer questions about your personalized solution, pricing, migration approach, or ROI. What would you like to explore?",
+-    createdAt: "2026-08-16T07:00:00Z",
+-  },
+-  {
+-    id: "msg-2",
+-    role: "user",
+-    content: "How much can we realistically save in the first year?",
+-    createdAt: "2026-08-16T07:01:00Z",
+-  },
+-  {
+-    id: "msg-3",
+-    role: "assistant",
+-    content:
+-      "Based on your current ₹42L annual infrastructure cost and CloudNova's verified 25-40% optimization range, your Year 1 projection is approximately ₹29.4L — a saving of roughly ₹12.6L (30%). This ramps to ~35% by Year 2 as workloads fully migrate.",
+-    responseStatus: "modelled",
+-    assumptions: ["Assumes phased migration completes within 6 months", "Assumes current 28% utilization baseline holds until cutover"],
+-    evidence: [{ sourceLabel: "CloudNova_Product_Brochure_2026.pdf", sourceType: "pdf", snippet: "Clients typically see 25-40% cost reduction within the first two billing cycles after optimization rollout." }],
+-    createdAt: "2026-08-16T07:01:20Z",
+-  },
+-  {
+-    id: "msg-4",
+-    role: "user",
+-    content: "What happens if our users increase to 1,000 next year?",
+-    createdAt: "2026-08-16T07:03:00Z",
+-  },
+-  {
+-    id: "msg-5",
+-    role: "assistant",
+-    content:
+-      "At 1,000 users, projected infrastructure cost rises to approximately ₹34.8L/year — still 17% below your current ₹42L baseline — because Kubernetes auto-scaling only provisions the additional capacity you actually use, unlike your current fixed-capacity model.",
+-    responseStatus: "modelled",
+-    assumptions: ["Linear scaling assumption on compute; storage/network costs may vary", "Based on your current workload mix remaining stable"],
+-    createdAt: "2026-08-16T07:03:25Z",
+-  },
+-  {
+-    id: "msg-6",
+-    role: "user",
+-    content: "Can you guarantee zero downtime during migration?",
+-    createdAt: "2026-08-16T07:05:00Z",
+-  },
+-  {
+-    id: "msg-7",
+-    role: "assistant",
+-    content:
+-      "This specific requirement isn't verified in CloudNova's available information — their documentation describes phased cutover with brief maintenance windows, but no explicit zero-downtime guarantee is on record. I've flagged this for a CloudNova Solutions Architect to confirm directly rather than assume an answer.",
+-    responseStatus: "escalated",
+-    evidence: [
+-      { sourceLabel: "Technical_Architecture_Overview.docx", sourceType: "doc", snippet: "Our migration methodology moves workloads in phased waves, validating each service in a staging cluster before cutover." },
+-    ],
+-    createdAt: "2026-08-16T07:05:15Z",
+-  },
+-];
+-
+-export const auditEvents: AuditEvent[] = [
+-  { id: "ae-1", agentName: "Vendor Intelligence Agent", action: "Extracted capability", entityType: "Capability", entityName: "Kubernetes Migration", confidence: "verified", humanVerified: true, timestamp: "2026-08-02T09:18:00Z" },
+-  { id: "ae-2", agentName: "Vendor Intelligence Agent", action: "Extracted capability", entityType: "Capability", entityName: "Cloud Cost Optimization", confidence: "verified", humanVerified: true, timestamp: "2026-08-02T09:19:00Z" },
+-  { id: "ae-3", agentName: "Buyer Discovery Agent", action: "Captured requirement", entityType: "Requirement", entityName: "Reduce annual cloud infrastructure cost", confidence: "verified", humanVerified: false, timestamp: "2026-08-10T10:12:00Z" },
+-  { id: "ae-4", agentName: "Solution Matching Agent", action: "Generated match", entityType: "Solution Match", entityName: "Cloud Cost Optimization → Cost requirement", confidence: "verified", humanVerified: false, timestamp: "2026-08-11T08:30:00Z" },
+-  { id: "ae-5", agentName: "Solution Model Agent", action: "Calculated ROI projection", entityType: "Solution Model", entityName: "Meridian Retail Group v3", confidence: "modelled", humanVerified: false, timestamp: "2026-08-16T07:01:20Z" },
+-  { id: "ae-6", agentName: "Grounding & Escalation Agent", action: "Created Capability Frontier item", entityType: "Capability Frontier", entityName: "Zero-downtime migration", confidence: "escalated", humanVerified: false, timestamp: "2026-08-15T14:22:00Z" },
+-  { id: "ae-7", agentName: "Grounding & Escalation Agent", action: "Notified vendor", entityType: "Notification", entityName: "CloudNova Solutions Team", confidence: "escalated", humanVerified: false, timestamp: "2026-08-15T14:23:00Z" },
+-];
+-
+-export const meetingRequests: MeetingRequest[] = [
+-  { id: "mr-1", buyerName: "Meridian Retail Group", vendorName: "CloudNova", status: "requested", unresolvedCount: 2, expert: "Solutions Architect" },
+-  { id: "mr-2", buyerName: "Kestrel Logistics", vendorName: "CloudNova", status: "scheduled", unresolvedCount: 1, proposedDate: "2026-08-20T15:00:00Z", expert: "Solutions Architect" },
+-  { id: "mr-3", buyerName: "Solace Health Systems", vendorName: "CloudNova", status: "completed", unresolvedCount: 0, expert: "Account Executive" },
+-];
+-
+-export const otherBuyerEngagements = [
+-  { id: "eng-2", buyerName: "Kestrel Logistics", industry: "Logistics", stage: "Solution Review", lastActive: "2026-08-15T12:00:00Z", frontierOpen: 1, fitScore: 81 },
+-  { id: "eng-3", buyerName: "Solace Health Systems", industry: "Healthcare", stage: "Closed - Won", lastActive: "2026-08-09T09:30:00Z", frontierOpen: 0, fitScore: 88 },
+-  { id: "eng-4", buyerName: "Fintrust Bank", industry: "BFSI", stage: "Discovery", lastActive: "2026-08-16T06:20:00Z", frontierOpen: 0, fitScore: 74 },
+-  { id: "eng-5", buyerName: "Prairie Foods Co.", industry: "Manufacturing", stage: "Vendor Selection", lastActive: "2026-08-13T10:00:00Z", frontierOpen: 0, fitScore: 69 },
+-];
+-
+-export const engagements = [
+-  { id: buyer.id, buyerName: buyer.companyName, industry: buyer.industry, stage: "Solution Workspace", fitScore: 92, frontierOpen: 2, lastActive: "2026-08-16T07:40:00Z" },
+-  ...otherBuyerEngagements,
+-];
+-
+-export const platformActivity = [
+-  { week: "Wk 1", solutions: 12, questions: 34 },
+-  { week: "Wk 2", solutions: 18, questions: 51 },
+-  { week: "Wk 3", solutions: 22, questions: 63 },
+-  { week: "Wk 4", solutions: 19, questions: 58 },
+-  { week: "Wk 5", solutions: 27, questions: 74 },
+-  { week: "Wk 6", solutions: 34, questions: 89 },
+-];
+-
+-export const recentOrganizations = [
+-  { id: "org-1", name: "CloudNova", type: "vendor" as const, joinedAt: "2026-08-02T09:00:00Z", status: "verified" as const },
+-  { id: "org-2", name: "Meridian Retail Group", type: "buyer" as const, joinedAt: "2026-08-10T10:00:00Z", status: "verified" as const },
+-  { id: "org-3", name: "Northbeam Cloud", type: "vendor" as const, joinedAt: "2026-08-11T14:20:00Z", status: "verified" as const },
+-  { id: "org-4", name: "Fintrust Bank", type: "buyer" as const, joinedAt: "2026-08-16T06:00:00Z", status: "pending" as const },
+-  { id: "org-5", name: "Vertex Data Works", type: "vendor" as const, joinedAt: "2026-08-14T11:00:00Z", status: "pending" as const },
+-];
+-
+-export const dashboardStats = {
+-  vendor: {
+-    activeBuyers: 12,
+-    solutionsGenerated: 34,
+-    openFrontierItems: 5,
+-    avgFitScore: 79,
+-    presalesHoursSaved: 146,
+-  },
+-  buyer: {
+-    questionsResolved: 18,
+-    vendorsExplored: 4,
+-    solutionReadiness: 82,
+-    openQuestions: 2,
+-  },
+-  admin: {
+-    totalOrganizations: 47,
+-    activeVendors: 19,
+-    activeBuyers: 28,
+-    totalSolutionModels: 112,
+-    groundedAnswerRate: 94,
+-  },
+-};
+-- 
+2.43.0
+

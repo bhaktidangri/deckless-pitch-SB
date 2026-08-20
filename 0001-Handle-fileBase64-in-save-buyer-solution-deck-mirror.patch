@@ -1,0 +1,115 @@
+From fb6f5ea6772224fcd3a15cc66da5913c72c38724 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 19 Aug 2026 23:21:14 +0000
+Subject: [PATCH] Handle fileBase64 in save-buyer-solution-deck, mirroring the
+ vendor-side deck function
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The buyer-side deck webhook only ever wrote pptx_url from a fileUrl and
+silently marked the row "failed" on any base64 delivery, unlike
+save-vendor-knowledge-document which already handles both. Decode
+fileBase64 (or fetch fileUrl) and upload to the buyer-solution-pptx storage
+bucket either way, so a real delivery isn't dropped once one actually
+reaches this function.
+
+Deployed directly to the project as version 3 (verify_jwt: false, matching
+every other function here) via Supabase MCP; this commit just keeps the
+checked-in source in sync.
+
+Note: as of this commit, buyer_solution_decks and
+buyer_workflow_approval_requests have zero rows, ever, project-wide (same
+on the vendor side). Confirmed directly in the Yoxa dashboard: the
+"Generate Solution Pitch Deck" Output Tool node has no webhook/callback
+field at all, and the deployment's Integrate > Review and Activate page
+states "Human Approvals — remain managed in Yoxa." Neither the deck
+Output Tool nor the human-approval flow in this workflow version currently
+pushes anything to our webhooks — this fix is necessary but not sufficient
+until that's wired on the Yoxa side (see chat writeup for options).
+---
+ .../save-buyer-solution-deck/index.ts         | 54 ++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/supabase-buyer/functions/save-buyer-solution-deck/index.ts b/supabase-buyer/functions/save-buyer-solution-deck/index.ts
+index f4babfd..e0bae40 100644
+--- a/supabase-buyer/functions/save-buyer-solution-deck/index.ts
++++ b/supabase-buyer/functions/save-buyer-solution-deck/index.ts
+@@ -3,6 +3,14 @@
+ // regenerated deck after a What-If Scenarios change — same table, newest
+ // row wins). Called by src/app/api/webhooks/yoxa-buyer-deck/route.ts.
+ // verify_jwt: false, mirrors save-vendor-knowledge-document.
++//
++// Accepts either a fileUrl (fetched and re-uploaded) or fileBase64
++// (decoded), same defensive both-paths pattern as save-vendor-knowledge-
++// document, since Yoxa's real delivery shape for this Output Tool has not
++// been directly observed — this only matters once whatever calls this
++// function actually reaches it (a raw Output Tool artifact currently stays
++// inside Yoxa's own dashboard; nothing pushes it here yet — see the
++// yoxa-buyer-deck route's own comment and supabase-buyer/README.md).
+ import { createClient } from "jsr:@supabase/supabase-js@2";
+ 
+ const corsHeaders = {
+@@ -47,6 +55,48 @@ Deno.serve(async (req) => {
+   }
+ 
+   const supabase = createClient(supabaseUrl, serviceRoleKey);
++
++  const fileUrl = body.fileUrl as string | undefined;
++  const fileBase64 = body.fileBase64 as string | undefined;
++  const fileName = body.fileName as string | undefined;
++
++  let pptxUrl: string | null = null;
++
++  try {
++    let bytes: Uint8Array | null = null;
++
++    if (fileBase64 && typeof fileBase64 === "string") {
++      const binary = atob(fileBase64.includes(",") ? fileBase64.split(",").pop()! : fileBase64);
++      bytes = new Uint8Array(binary.length);
++      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
++    } else if (fileUrl && typeof fileUrl === "string") {
++      const fileRes = await fetch(fileUrl);
++      if (fileRes.ok) bytes = new Uint8Array(await fileRes.arrayBuffer());
++    }
++
++    if (bytes) {
++      const safeName = (typeof fileName === "string" && fileName.trim()) || "solution-pitch-deck.pptx";
++      const path = `${buyerId}/${Date.now()}-${safeName}`;
++      const { error: uploadError } = await supabase.storage
++        .from("buyer-solution-pptx")
++        .upload(path, bytes, {
++          contentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
++          upsert: true,
++        });
++      if (!uploadError) {
++        pptxUrl = supabase.storage.from("buyer-solution-pptx").getPublicUrl(path).data.publicUrl;
++      }
++    } else if (fileUrl) {
++      // Fetch failed or was skipped for some reason but a URL was still
++      // supplied — fall back to linking it directly rather than losing it.
++      pptxUrl = fileUrl;
++    }
++  } catch {
++    // Fall through — still record the row (with rawPayload) even if the
++    // file itself couldn't be fetched/decoded/uploaded, so this is
++    // diagnosable from the stored raw_payload instead of silently vanishing.
++  }
++
+   const { data, error } = await supabase
+     .from("buyer_solution_decks")
+     .insert({
+@@ -55,8 +105,8 @@ Deno.serve(async (req) => {
+       solution_model_id: (body.solutionModelId as string | undefined) ?? null,
+       workflow_run_id: (body.workflowRunId as string | undefined) ?? null,
+       title: (body.title as string | undefined) ?? "Solution Pitch Deck",
+-      pptx_url: (body.fileUrl as string | undefined) ?? null,
+-      status: body.fileUrl ? "ready" : "failed",
++      pptx_url: pptxUrl,
++      status: pptxUrl ? "ready" : "failed",
+       raw_payload: body.rawPayload ?? body,
+     })
+     .select("id, buyer_id, pptx_url, status")
+-- 
+2.43.0
+

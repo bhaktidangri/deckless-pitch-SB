@@ -1,0 +1,1855 @@
+From bcff45f4c6bc18bf71ddc573818667d68b155d66 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 07:47:10 +0000
+Subject: [PATCH] Redesign the buyer portal: modern UI, unified agent-waiting
+ flow, global capability search, and a real caching fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Visual: editorial display font, hero-glow/noise treatments, route-level page
+transitions, a pipeline tracker on the dashboard, and an activity feed —
+the portal now reads as a designed product instead of a bare admin panel.
+
+Fixes the reported "data gets cached" bug at its actual root cause: the
+buyer layout read localStorage once in its render body and never noticed
+buyerId/companyName appearing mid-session (nothing to do with fetch
+caching, which was already correct everywhere). Replaced with a reactive
+useBuyerSession() hook, and disabled the App Router's client-side route
+staleTime so navigating back to a page always remounts fresh.
+
+Unifies five different scattered "waiting for the agent" visual patterns
+(ad-hoc spinners, static amber cards, full-page loaders) into one
+AgentWaitingState component, used consistently across discover, vendors,
+solution, scenarios, and handoff. After a short delay it offers an
+interactive canvas mini-game (a small themed runner, in the spirit of
+Chrome's offline dinosaur game) so a multi-minute agent step isn't just a
+static spinner.
+
+Adds a real "search by capability" feature: a header command-palette
+(Cmd/Ctrl+K) searching every published vendor's full Solution DNA, not
+just the buyer's own recommendation list, which was the only capability
+search that existed before.
+
+Adds deck/run history: previous pitch-deck versions on the solution
+workspace, and a run activity feed on the dashboard, both backed by the
+buyer_workflow_runs/buyer_solution_decks tables.
+---
+ next.config.ts                                |  15 +-
+ src/app/buyer/chat/page.tsx                   |   7 +-
+ src/app/buyer/discover/page.tsx               |  54 ++--
+ src/app/buyer/handoff/page.tsx                |  12 +-
+ src/app/buyer/layout.tsx                      |  22 +-
+ src/app/buyer/page.tsx                        | 129 ++++++++--
+ src/app/buyer/requirements/page.tsx           |   8 +-
+ src/app/buyer/scenarios/page.tsx              |  23 +-
+ src/app/buyer/solution/page.tsx               |  74 ++++--
+ src/app/buyer/vendors/[id]/page.tsx           |  18 +-
+ src/app/buyer/vendors/page.tsx                |  17 +-
+ src/app/globals.css                           |  33 +++
+ src/app/layout.tsx                            |  15 +-
+ src/components/layout/page-header.tsx         |   2 +-
+ src/components/layout/page-transition.tsx     |  26 ++
+ src/components/shared/agent-waiting-state.tsx | 140 +++++++++++
+ .../shared/global-capability-search.tsx       | 199 +++++++++++++++
+ src/components/shared/pipeline-tracker.tsx    |  69 ++++++
+ src/components/shared/runner-game.tsx         | 230 ++++++++++++++++++
+ src/lib/api/buyer-lookup.ts                   |  56 +++++
+ src/lib/buyer-session.ts                      |  32 +++
+ src/lib/hooks/use-buyer-session.ts            |  60 +++++
+ 22 files changed, 1120 insertions(+), 121 deletions(-)
+ create mode 100644 src/components/layout/page-transition.tsx
+ create mode 100644 src/components/shared/agent-waiting-state.tsx
+ create mode 100644 src/components/shared/global-capability-search.tsx
+ create mode 100644 src/components/shared/pipeline-tracker.tsx
+ create mode 100644 src/components/shared/runner-game.tsx
+ create mode 100644 src/lib/hooks/use-buyer-session.ts
+
+diff --git a/next.config.ts b/next.config.ts
+index e9ffa30..0306d31 100644
+--- a/next.config.ts
++++ b/next.config.ts
+@@ -1,7 +1,20 @@
+ import type { NextConfig } from "next";
+ 
+ const nextConfig: NextConfig = {
+-  /* config options here */
++  // Every buyer/vendor page is a "use client" component whose data comes
++  // from its own useEffect poll against Supabase, not from Next's server
++  // data-fetching — but the App Router's *client-side* Router Cache still
++  // applies to the route segments themselves. Its default staleTime for
++  // dynamic routes (~30s) meant navigating away and back within that window
++  // could reuse the previously-rendered segment instead of remounting,
++  // which silently froze a page's data mid-poll ("the data gets cached").
++  // Setting this to 0 makes every buyer/vendor route always remount fresh
++  // on navigation, so its poll loop actually restarts every time.
++  experimental: {
++    staleTimes: {
++      dynamic: 0,
++    },
++  },
+ };
+ 
+ export default nextConfig;
+diff --git a/src/app/buyer/chat/page.tsx b/src/app/buyer/chat/page.tsx
+index 7d05e5f..af8ae60 100644
+--- a/src/app/buyer/chat/page.tsx
++++ b/src/app/buyer/chat/page.tsx
+@@ -4,12 +4,11 @@ import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { LiveChatPanel } from "@/components/shared/live-chat-panel";
+-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredCompanyName, getStoredSelectedVendorName } from "@/lib/buyer-session";
++import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ 
+ export default function BuyerChatPage() {
+-  const buyerId = getStoredBuyerId();
+-  const vendorName = getStoredSelectedVendorName();
+-  const companyName = getStoredCompanyName();
++  const { buyerId, vendorName, companyName } = useBuyerSession();
+ 
+   return (
+     <div>
+diff --git a/src/app/buyer/discover/page.tsx b/src/app/buyer/discover/page.tsx
+index 826cc9d..d655fd2 100644
+--- a/src/app/buyer/discover/page.tsx
++++ b/src/app/buyer/discover/page.tsx
+@@ -2,13 +2,14 @@
+ 
+ import { useEffect, useRef, useState } from "react";
+ import Link from "next/link";
+-import { AlertTriangle, ArrowRight, Clock, Loader2, Sparkles } from "lucide-react";
++import { AlertTriangle, ArrowRight, Sparkles } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+ import { Input, Label, Select, Textarea } from "@/components/ui/input";
+ import { Button, buttonVariants } from "@/components/ui/button";
+ import { Badge } from "@/components/ui/badge";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import {
+   addStoredBuyerWorkflowRunId,
+   clearPendingBuyerSubmission,
+@@ -189,28 +190,31 @@ export default function DiscoverPage() {
+           title="Analyzing your submission…"
+           description="The Buyer Discovery Agent is capturing your requirements and will match them against verified vendor capabilities."
+         />
+-        <Card className="max-w-md p-6 text-center">
+-          {stage === "processing" ? (
+-            <>
+-              <Loader2 className="mx-auto h-6 w-6 animate-spin text-brand-500" />
+-              <p className="mt-3 text-sm text-muted">This can take a minute or two while the agent works.</p>
+-              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
+-            </>
+-          ) : (
+-            <>
+-              <Clock className="mx-auto h-6 w-6 text-modelled" />
+-              <p className="mt-3 text-sm font-medium text-foreground">Still processing after a few minutes.</p>
+-              <p className="mt-1 text-sm text-muted">
+-                Your submission is running —{" "}
++        <AgentWaitingState
++          variant="fullpage"
++          title={stage === "timed-out" ? "Still processing after a few minutes" : "Setting up your workspace"}
++          description={
++            stage === "timed-out" ? (
++              <>
++                Your submission is still running — it&apos;ll load automatically once your buyer record is ready. In the
++                meantime you can{" "}
+                 <button className="text-brand-600 underline dark:text-brand-400" onClick={resumePolling}>
+-                  keep checking
++                  check again now
+                 </button>
+-                . It&apos;ll load automatically once your buyer record is ready.
+-              </p>
+-              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
+-            </>
+-          )}
+-        </Card>
++                .
++              </>
++            ) : (
++              "This usually takes a minute or two while the agent parses your submission."
++            )
++          }
++          messages={[
++            "Reading through your problem statement…",
++            "Registering your buyer record…",
++            "Cross-checking the vendor catalog…",
++            "Almost there…",
++          ]}
++        />
++        {runId && <p className="mt-3 text-center font-mono text-[11px] text-subtle">run {runId}</p>}
+       </div>
+     );
+   }
+@@ -257,9 +261,11 @@ export default function DiscoverPage() {
+             </CardHeader>
+             <CardContent className="space-y-2 pt-2">
+               {requirements.length === 0 ? (
+-                <p className="flex items-center gap-2 text-sm text-muted">
+-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waiting for the agent to parse your submission…
+-                </p>
++                <AgentWaitingState
++                  variant="card"
++                  title="Parsing your submission"
++                  description="Requirements will appear here the moment the agent extracts them."
++                />
+               ) : (
+                 requirements.map((r) => (
+                   <div key={r.id} className="flex items-center justify-between gap-3 rounded-lg bg-surface-2 p-3">
+diff --git a/src/app/buyer/handoff/page.tsx b/src/app/buyer/handoff/page.tsx
+index 0b84248..214e36d 100644
+--- a/src/app/buyer/handoff/page.tsx
++++ b/src/app/buyer/handoff/page.tsx
+@@ -2,7 +2,7 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { CalendarCheck2, CheckCircle2, Loader2, MessageSquareText } from "lucide-react";
++import { CalendarCheck2, CheckCircle2, MessageSquareText } from "lucide-react";
+ import { motion } from "motion/react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+@@ -10,8 +10,10 @@ import { Badge } from "@/components/ui/badge";
+ import { buttonVariants } from "@/components/ui/button";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
+ import { FrontierCard } from "@/components/shared/frontier-card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { getCapabilityFrontierItems, getMeetingRequests, type CapabilityFrontierRow, type MeetingRequestRow } from "@/lib/api/buyer-lookup";
+-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredSelectedVendorName } from "@/lib/buyer-session";
++import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn } from "@/lib/utils";
+ import type { CapabilityFrontierItem } from "@/lib/types";
+@@ -42,8 +44,8 @@ const statusConfig: Record<MeetingRequestRow["status"], { label: string; variant
+ };
+ 
+ export default function HandoffPage() {
+-  const buyerId = getStoredBuyerId();
+-  const vendorName = getStoredSelectedVendorName() ?? "your vendor";
++  const { buyerId, vendorName: storedVendorName } = useBuyerSession();
++  const vendorName = storedVendorName ?? "your vendor";
+   const workflowRunIds = getStoredBuyerWorkflowRunIds();
+ 
+   const [items, setItems] = useState<CapabilityFrontierRow[]>([]);
+@@ -99,7 +101,7 @@ export default function HandoffPage() {
+       <div className="grid gap-6 lg:grid-cols-3">
+         <div className="space-y-4 lg:col-span-2">
+           {loading ? (
+-            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
++            <AgentWaitingState variant="card" title="Loading open questions" />
+           ) : openItems.length === 0 ? (
+             <Card className="p-6 text-center text-sm text-muted">No open questions right now.</Card>
+           ) : (
+diff --git a/src/app/buyer/layout.tsx b/src/app/buyer/layout.tsx
+index 67f10b7..fdb14b1 100644
+--- a/src/app/buyer/layout.tsx
++++ b/src/app/buyer/layout.tsx
+@@ -11,8 +11,10 @@ import {
+   CalendarClock,
+ } from "lucide-react";
+ import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
++import { PageTransition } from "@/components/layout/page-transition";
+ import { AgentStatusPill } from "@/components/shared/agent-status-pill";
+-import { getStoredBuyerId, getStoredCompanyName } from "@/lib/buyer-session";
++import { GlobalCapabilitySearch } from "@/components/shared/global-capability-search";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ 
+ const sections: NavSection[] = [
+   {
+@@ -44,11 +46,10 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
+   // Mirrors vendor/layout.tsx: no real auth session exists yet, so this
+   // reflects whichever buyer actually submitted a discovery form in this
+   // browser (src/lib/buyer-session.ts) instead of a static demo placeholder.
+-  // Read directly in the render body (not useState+useEffect) — localStorage
+-  // is available synchronously on the client and this avoids a
+-  // set-state-in-effect render flash on first paint.
+-  const companyName = getStoredCompanyName();
+-  const buyerId = getStoredBuyerId();
++  // useBuyerSession (not a raw getStoredX() read) because this layout never
++  // unmounts while the buyer navigates the portal — it needs to notice
++  // buyerId/companyName appearing mid-session, not just at first paint.
++  const { companyName, buyerId } = useBuyerSession();
+ 
+   return (
+     <PortalShell
+@@ -56,9 +57,14 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
+       sections={sections}
+       userName={companyName ?? "Not started yet"}
+       userRole="Buyer"
+-      headerSlot={<AgentStatusPill buyerId={buyerId} />}
++      headerSlot={
++        <>
++          <GlobalCapabilitySearch />
++          <AgentStatusPill buyerId={buyerId} />
++        </>
++      }
+     >
+-      {children}
++      <PageTransition>{children}</PageTransition>
+     </PortalShell>
+   );
+ }
+diff --git a/src/app/buyer/page.tsx b/src/app/buyer/page.tsx
+index 635efca..34976d5 100644
+--- a/src/app/buyer/page.tsx
++++ b/src/app/buyer/page.tsx
+@@ -2,10 +2,25 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowUpRight, MessageSquareText, PartyPopper, Sparkles, Store, TrendingUp } from "lucide-react";
++import {
++  ArrowUpRight,
++  CalendarClock,
++  CheckCircle2,
++  Clock,
++  Loader2,
++  MessageSquareText,
++  PartyPopper,
++  Search,
++  Sparkles,
++  SlidersHorizontal,
++  Store,
++  TrendingUp,
++  XCircle,
++} from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { StatCard } from "@/components/shared/stat-card";
+ import { LoadingState } from "@/components/shared/loading-state";
++import { PipelineTracker, type PipelineStage } from "@/components/shared/pipeline-tracker";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Progress } from "@/components/ui/progress";
+ import { buttonVariants } from "@/components/ui/button";
+@@ -13,26 +28,26 @@ import { Badge } from "@/components/ui/badge";
+ import { EvidenceBadge } from "@/components/shared/status-badge";
+ import {
+   getBuyerRequirements,
++  getBuyerWorkflowRunHistory,
+   getCapabilityFrontierItems,
+   getRoiProjection,
+   getSolutionModel,
+   type BuyerRequirementRow,
++  type BuyerWorkflowRunRow,
+   type CapabilityFrontierRow,
+   type RoiProjectionRow,
+ } from "@/lib/api/buyer-lookup";
+ import { useAgentStatus } from "@/lib/hooks/use-agent-status";
+-import { getStoredBuyerId, getStoredCompanyName, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
+-import { cn, formatCurrencyINR } from "@/lib/utils";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
++import { cn, formatCurrencyINR, formatRelativeTime } from "@/lib/utils";
+ 
+ export default function BuyerDashboardPage() {
+-  const buyerId = getStoredBuyerId();
+-  const companyName = getStoredCompanyName();
+-  const vendorId = getStoredSelectedVendorId();
+-  const vendorName = getStoredSelectedVendorName();
++  const { buyerId, companyName, vendorId, vendorName } = useBuyerSession();
+ 
+   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
+   const [frontierItems, setFrontierItems] = useState<CapabilityFrontierRow[]>([]);
+   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
++  const [runs, setRuns] = useState<BuyerWorkflowRunRow[]>([]);
+   const [loading, setLoading] = useState(true);
+   const agentStatus = useAgentStatus(buyerId);
+ 
+@@ -44,10 +59,15 @@ export default function BuyerDashboardPage() {
+     let cancelled = false;
+     async function load() {
+       try {
+-        const [reqs, frontier] = await Promise.all([getBuyerRequirements(buyerId!), getCapabilityFrontierItems(buyerId!)]);
++        const [reqs, frontier, history] = await Promise.all([
++          getBuyerRequirements(buyerId!),
++          getCapabilityFrontierItems(buyerId!),
++          getBuyerWorkflowRunHistory(buyerId!, 6),
++        ]);
+         if (cancelled) return;
+         setRequirements(reqs);
+         setFrontierItems(frontier);
++        setRuns(history);
+         if (vendorId) {
+           const model = await getSolutionModel(buyerId!, vendorId);
+           if (model && !cancelled) setRoi(await getRoiProjection(model.id));
+@@ -64,13 +84,20 @@ export default function BuyerDashboardPage() {
+ 
+   if (!buyerId) {
+     return (
+-      <div>
+-        <PageHeader eyebrow="Welcome" title="Start your discovery" description="No buyer session found in this browser yet." />
+-        <Card className="max-w-md p-6 text-center">
+-          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }))}>
+-            Go to Discover <ArrowUpRight className="h-4 w-4" />
+-          </Link>
+-        </Card>
++      <div className="hero-glow bg-noise rounded-3xl border border-border bg-surface px-6 py-16 text-center sm:px-12">
++        <span className="mb-4 inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-gradient-to-r from-brand-50 to-accent-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-brand-600 dark:border-brand-800 dark:from-brand-950/50 dark:to-accent-500/10 dark:text-brand-300">
++          <Sparkles className="h-3 w-3" /> Deck-less Pitch
++        </span>
++        <h1 className="font-display mx-auto max-w-xl text-4xl font-semibold tracking-tight text-foreground sm:text-5xl">
++          No deck. A live model of your business, built for you.
++        </h1>
++        <p className="mx-auto mt-4 max-w-md text-sm text-muted sm:text-base">
++          Tell us what you&apos;re trying to solve — our agent builds an evidence-grounded, personalized solution you can
++          explore yourself, no sales deck required.
++        </p>
++        <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary", size: "lg" }), "mt-8")}>
++          Start your discovery <ArrowUpRight className="h-4 w-4" />
++        </Link>
+       </div>
+     );
+   }
+@@ -78,18 +105,34 @@ export default function BuyerDashboardPage() {
+   const openItems = frontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
+   const confirmedCount = requirements.filter((r) => r.status === "confirmed").length;
+ 
++  const stages: PipelineStage[] = [
++    { key: "discover", label: "Discover", href: "/buyer/discover", icon: Search, done: requirements.length > 0 },
++    { key: "vendor", label: "Vendor", href: "/buyer/vendors", icon: Store, done: !!vendorId },
++    { key: "solution", label: "Solution", href: "/buyer/solution", icon: Sparkles, done: !!roi },
++    { key: "scenarios", label: "Scenarios", href: "/buyer/scenarios", icon: SlidersHorizontal, done: !!roi && openItems.length === 0 },
++    { key: "handoff", label: "Handoff", href: "/buyer/handoff", icon: CalendarClock, done: agentStatus.status === "completed" },
++  ];
++
+   return (
+     <div>
+-      <PageHeader
+-        eyebrow={companyName ?? "Your organization"}
+-        title="Welcome back"
+-        description={vendorName ? `Here's where your ${vendorName} solution stands, and what still needs an answer.` : "Confirm a vendor to build your personalized solution."}
+-        actions={
+-          <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
+-            Open solution workspace <ArrowUpRight className="h-4 w-4" />
+-          </Link>
+-        }
+-      />
++      <div className="hero-glow bg-noise mb-6 overflow-hidden rounded-3xl border border-border bg-surface px-6 py-8 sm:px-8 sm:py-10">
++        <PageHeader
++          eyebrow={companyName ?? "Your organization"}
++          title="Welcome back"
++          description={
++            vendorName
++              ? `Here's where your ${vendorName} solution stands, and what still needs an answer.`
++              : "Confirm a vendor to build your personalized solution."
++          }
++          actions={
++            <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
++              Open solution workspace <ArrowUpRight className="h-4 w-4" />
++            </Link>
++          }
++          className="mb-8"
++        />
++        <PipelineTracker stages={stages} />
++      </div>
+ 
+       {agentStatus.status === "completed" && (
+         <Card className="mb-6 border-brand-300 bg-gradient-to-br from-brand-50 to-accent-50 dark:border-brand-800 dark:from-brand-950/30 dark:to-accent-950/20 animate-slide-up">
+@@ -200,6 +243,42 @@ export default function BuyerDashboardPage() {
+               </CardContent>
+             </Card>
+           </div>
++
++          {runs.length > 0 && (
++            <Card className="mt-6 animate-slide-up">
++              <CardHeader>
++                <CardTitle>Agent activity</CardTitle>
++              </CardHeader>
++              <CardContent className="pt-2">
++                <ul className="space-y-1">
++                  {runs.map((run) => (
++                    <li key={run.id} className="flex items-center gap-3 rounded-lg px-2 py-2.5 hover:bg-surface-2">
++                      {run.status === "completed" ? (
++                        <CheckCircle2 className="h-4 w-4 shrink-0 text-verified" />
++                      ) : run.status === "failed" ? (
++                        <XCircle className="h-4 w-4 shrink-0 text-escalated" />
++                      ) : (
++                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-500" />
++                      )}
++                      <div className="min-w-0 flex-1">
++                        <p className="truncate text-sm text-foreground">
++                          {run.status === "completed"
++                            ? "Agent run completed"
++                            : run.status === "failed"
++                              ? "Agent run failed"
++                              : "Agent working…"}
++                          {run.deckSyncedAt && <span className="ml-1.5 text-xs text-verified">· deck ready</span>}
++                        </p>
++                      </div>
++                      <span className="flex shrink-0 items-center gap-1 text-xs text-subtle">
++                        <Clock className="h-3 w-3" /> {formatRelativeTime(run.completedAt ?? run.startedAt)}
++                      </span>
++                    </li>
++                  ))}
++                </ul>
++              </CardContent>
++            </Card>
++          )}
+         </>
+       )}
+     </div>
+diff --git a/src/app/buyer/requirements/page.tsx b/src/app/buyer/requirements/page.tsx
+index 12331eb..b771a6b 100644
+--- a/src/app/buyer/requirements/page.tsx
++++ b/src/app/buyer/requirements/page.tsx
+@@ -2,13 +2,13 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { Loader2 } from "lucide-react";
+ import { PageHeader } from "@/components/layout/page-header";
+ import { Card, CardContent } from "@/components/ui/card";
+ import { buttonVariants } from "@/components/ui/button";
+ import { RequirementCard } from "@/components/shared/requirement-card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
+-import { getStoredBuyerId } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
+ import type { Requirement } from "@/lib/types";
+ 
+@@ -16,7 +16,7 @@ import type { Requirement } from "@/lib/types";
+ // Summary runs once on submission with no later "append a requirement"
+ // tool, so there's nothing for a manual-add box here to actually persist.
+ export default function RequirementsPage() {
+-  const buyerId = getStoredBuyerId();
++  const { buyerId } = useBuyerSession();
+   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
+   const [profile, setProfile] = useState<ClientRealityProfileRow | null>(null);
+   const [loading, setLoading] = useState(true);
+@@ -71,7 +71,7 @@ export default function RequirementsPage() {
+       <div className="grid gap-6 lg:grid-cols-3">
+         <div className="space-y-2.5 lg:col-span-2">
+           {loading && requirements.length === 0 ? (
+-            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
++            <AgentWaitingState variant="card" title="Loading your requirements" description="Fetching what the agent has captured so far." />
+           ) : requirements.length === 0 ? (
+             <Card className="p-6 text-center text-sm text-muted">No requirements captured yet.</Card>
+           ) : (
+diff --git a/src/app/buyer/scenarios/page.tsx b/src/app/buyer/scenarios/page.tsx
+index 5972a7b..b966714 100644
+--- a/src/app/buyer/scenarios/page.tsx
++++ b/src/app/buyer/scenarios/page.tsx
+@@ -16,7 +16,9 @@ import {
+   getSolutionModel,
+   type RoiProjectionRow,
+ } from "@/lib/api/buyer-lookup";
+-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
++import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn, formatNumber } from "@/lib/utils";
+ import type { RoiProjection } from "@/lib/types";
+@@ -40,9 +42,7 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
+ // a continuous slider (PRD §7.3); this treats each debounced "settle" as one
+ // approval round-trip, per the PRD's own suggested resolution.
+ export default function ScenariosPage() {
+-  const buyerId = getStoredBuyerId();
+-  const vendorId = getStoredSelectedVendorId();
+-  const vendorName = getStoredSelectedVendorName();
++  const { buyerId, vendorId, vendorName } = useBuyerSession();
+   const workflowRunIds = getStoredBuyerWorkflowRunIds();
+ 
+   const [solutionModelId, setSolutionModelId] = useState<string | null>(null);
+@@ -132,9 +132,8 @@ export default function ScenariosPage() {
+ 
+   if (loading) {
+     return (
+-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
+-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
+-        <p className="text-sm text-muted">Loading your baseline projection…</p>
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState variant="fullpage" title="Loading your baseline projection" />
+       </div>
+     );
+   }
+@@ -214,11 +213,11 @@ export default function ScenariosPage() {
+           {roi ? (
+             <RoiWidget roi={toRoiProjection(roi)} />
+           ) : (
+-            <Card>
+-              <CardContent className="py-10 text-center text-sm text-muted">
+-                No baseline projection yet — this fills in once the Solution Model Agent runs Solution Scenarios.
+-              </CardContent>
+-            </Card>
++            <AgentWaitingState
++              variant="card"
++              title="Modelling your baseline"
++              description="This fills in once the Solution Model Agent runs Solution Scenarios."
++            />
+           )}
+ 
+           <Card className="h-[420px]">
+diff --git a/src/app/buyer/solution/page.tsx b/src/app/buyer/solution/page.tsx
+index 52a1b07..751493f 100644
+--- a/src/app/buyer/solution/page.tsx
++++ b/src/app/buyer/solution/page.tsx
+@@ -10,9 +10,10 @@ import { buttonVariants } from "@/components/ui/button";
+ import { GapCard } from "@/components/shared/gap-card";
+ import { MatchRow } from "@/components/shared/match-row";
+ import { RoiWidget } from "@/components/shared/roi-widget";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import {
++  getBuyerSolutionDecks,
+   getFitAndGapAssessment,
+-  getLatestSolutionDeck,
+   getRoiProjection,
+   getSolutionModel,
+   type BuyerSolutionDeckRow,
+@@ -21,7 +22,8 @@ import {
+   type SolutionMatchRow,
+   type SolutionModelRow,
+ } from "@/lib/api/buyer-lookup";
+-import { getStoredBuyerId, getStoredSelectedVendorId, getStoredSelectedVendorName, setStoredSolutionModelId } from "@/lib/buyer-session";
++import { setStoredSolutionModelId } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { cn, formatRelativeTime } from "@/lib/utils";
+ import type { GapItem, RoiProjection, SolutionMatch } from "@/lib/types";
+ 
+@@ -59,15 +61,14 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
+ }
+ 
+ export default function SolutionWorkspacePage() {
+-  const buyerId = getStoredBuyerId();
+-  const vendorId = getStoredSelectedVendorId();
+-  const vendorName = getStoredSelectedVendorName();
++  const { buyerId, vendorId, vendorName } = useBuyerSession();
+ 
+   const [matches, setMatches] = useState<SolutionMatchRow[]>([]);
+   const [gaps, setGaps] = useState<GapItemRow[]>([]);
+   const [model, setModel] = useState<SolutionModelRow | null>(null);
+   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
+   const [deck, setDeck] = useState<BuyerSolutionDeckRow | null>(null);
++  const [deckHistory, setDeckHistory] = useState<BuyerSolutionDeckRow[]>([]);
+   const [loading, setLoading] = useState(true);
+ 
+   useEffect(() => {
+@@ -78,16 +79,17 @@ export default function SolutionWorkspacePage() {
+     let cancelled = false;
+     async function load() {
+       try {
+-        const [fitGap, m, deckDoc] = await Promise.all([
++        const [fitGap, m, decks] = await Promise.all([
+           getFitAndGapAssessment(buyerId!, vendorId!),
+           getSolutionModel(buyerId!, vendorId!),
+-          getLatestSolutionDeck(buyerId!),
++          getBuyerSolutionDecks(buyerId!, 10),
+         ]);
+         if (cancelled) return;
+         setMatches(fitGap.matches);
+         setGaps(fitGap.gaps);
+         setModel(m);
+-        setDeck(deckDoc);
++        setDeck(decks[0] ?? null);
++        setDeckHistory(decks);
+         if (m) {
+           setStoredSolutionModelId(m.id);
+           const roiRow = await getRoiProjection(m.id);
+@@ -120,9 +122,12 @@ export default function SolutionWorkspacePage() {
+ 
+   if (loading) {
+     return (
+-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
+-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
+-        <p className="text-sm text-muted">Loading your solution workspace…</p>
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState
++          variant="fullpage"
++          title="Loading your solution workspace"
++          description="Pulling your fit and gap assessment, ROI model, and pitch deck."
++        />
+       </div>
+     );
+   }
+@@ -166,11 +171,11 @@ export default function SolutionWorkspacePage() {
+             </CardContent>
+           </Card>
+         ) : (
+-          <Card className="border-modelled-border bg-modelled-bg">
+-            <CardContent className="py-4 text-sm text-foreground">
+-              The Solution Model Agent hasn&apos;t produced your executive summary yet — this fills in automatically once it does.
+-            </CardContent>
+-          </Card>
++          <AgentWaitingState
++            variant="card"
++            title="Building your executive summary"
++            description="The Solution Model Agent hasn't produced it yet — this fills in automatically once it does."
++          />
+         )}
+ 
+         <Card className={deck?.status === "ready" ? "border-verified-border bg-verified-bg" : undefined}>
+@@ -198,6 +203,33 @@ export default function SolutionWorkspacePage() {
+           </CardContent>
+         </Card>
+ 
++        {deckHistory.length > 1 && (
++          <Card>
++            <CardHeader>
++              <CardTitle className="text-sm">Previous versions</CardTitle>
++            </CardHeader>
++            <CardContent className="space-y-1 pt-2">
++              {deckHistory.slice(1).map((d) => (
++                <div key={d.id} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 hover:bg-surface-2">
++                  <div className="flex min-w-0 items-center gap-2.5">
++                    <FileText className="h-3.5 w-3.5 shrink-0 text-subtle" />
++                    <span className="truncate text-sm text-foreground">{d.title ?? "Solution Pitch Deck"}</span>
++                    {d.status === "failed" && <Badge variant="escalated" size="sm">failed</Badge>}
++                  </div>
++                  <div className="flex shrink-0 items-center gap-3">
++                    <span className="text-xs text-subtle">{formatRelativeTime(d.createdAt)}</span>
++                    {d.pptxUrl && (
++                      <a href={d.pptxUrl} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline dark:text-brand-400">
++                        <Download className="h-3.5 w-3.5" />
++                      </a>
++                    )}
++                  </div>
++                </div>
++              ))}
++            </CardContent>
++          </Card>
++        )}
++
+         {gaps.length > 0 && (
+           <Card>
+             <CardHeader>
+@@ -225,11 +257,11 @@ export default function SolutionWorkspacePage() {
+         )}
+ 
+         {matches.length === 0 && gaps.length === 0 && (
+-          <Card>
+-            <CardContent className="py-10 text-center text-sm text-muted">
+-              Waiting for the Solution Matching Agent to assess fit and gaps against {vendorName ?? "your vendor"}&apos;s published capabilities.
+-            </CardContent>
+-          </Card>
++          <AgentWaitingState
++            variant="card"
++            title="Assessing fit and gaps"
++            description={`Comparing your requirements against ${vendorName ?? "your vendor"}'s published capabilities.`}
++          />
+         )}
+ 
+         {roi && <RoiWidget roi={toRoiProjection(roi)} />}
+diff --git a/src/app/buyer/vendors/[id]/page.tsx b/src/app/buyer/vendors/[id]/page.tsx
+index a908d80..620f5fe 100644
+--- a/src/app/buyer/vendors/[id]/page.tsx
++++ b/src/app/buyer/vendors/[id]/page.tsx
+@@ -2,11 +2,12 @@
+ 
+ import { useEffect, useState } from "react";
+ import Link from "next/link";
+-import { ArrowLeft, CheckCircle2, Globe, Loader2, Sparkles } from "lucide-react";
++import { ArrowLeft, CheckCircle2, Globe, Sparkles } from "lucide-react";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+ import { Badge } from "@/components/ui/badge";
+ import { buttonVariants } from "@/components/ui/button";
+ import { CapabilityCard } from "@/components/shared/capability-card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import { getVendorRecommendations, type VendorRecommendationRow } from "@/lib/api/buyer-lookup";
+ import {
+   queryApprovedVendorSolutionDna,
+@@ -14,7 +15,7 @@ import {
+   type ApprovedCapability,
+   type PublishedVendor,
+ } from "@/lib/api/buyer-vendor-dna";
+-import { getStoredBuyerId, getStoredSelectedVendorId } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import type { Capability, SourceType } from "@/lib/types";
+ import { cn } from "@/lib/utils";
+ 
+@@ -43,8 +44,8 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
+   const [loading, setLoading] = useState(true);
+   const [error, setError] = useState<string | null>(null);
+ 
+-  const buyerId = getStoredBuyerId();
+-  const isSelected = vendorId !== null && getStoredSelectedVendorId() === vendorId;
++  const { buyerId, vendorId: selectedVendorId } = useBuyerSession();
++  const isSelected = vendorId !== null && selectedVendorId === vendorId;
+ 
+   useEffect(() => {
+     let cancelled = false;
+@@ -80,9 +81,12 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
+ 
+   if (loading) {
+     return (
+-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
+-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
+-        <p className="text-sm text-muted">Loading vendor profile…</p>
++      <div className="flex min-h-[40vh] items-center justify-center">
++        <AgentWaitingState
++          variant="fullpage"
++          title="Loading vendor profile"
++          description="Pulling their published capabilities and evidence."
++        />
+       </div>
+     );
+   }
+diff --git a/src/app/buyer/vendors/page.tsx b/src/app/buyer/vendors/page.tsx
+index 02024d4..7f8449d 100644
+--- a/src/app/buyer/vendors/page.tsx
++++ b/src/app/buyer/vendors/page.tsx
+@@ -11,13 +11,15 @@ import { Badge } from "@/components/ui/badge";
+ import { LoadingState } from "@/components/shared/loading-state";
+ import { ApprovalButtons } from "@/components/shared/approval-buttons";
+ import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
++import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+ import {
+   getActiveVendorSelection,
+   getVendorRecommendations,
+   type VendorRecommendationRow,
+ } from "@/lib/api/buyer-lookup";
+ import { queryPublishedVendorSolutionDna, type PublishedVendor } from "@/lib/api/buyer-vendor-dna";
+-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, setStoredSelectedVendor } from "@/lib/buyer-session";
++import { getStoredBuyerWorkflowRunIds, setStoredSelectedVendor } from "@/lib/buyer-session";
++import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+ import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
+ import { cn } from "@/lib/utils";
+ 
+@@ -47,7 +49,7 @@ function matchingCapabilityName(vendor: PublishedVendor | undefined, query: stri
+ // shows the ranked comparison, but only unlocks moving on once
+ // buyer_vendor_selections has an active row.
+ export default function BuyerVendorsPage() {
+-  const buyerId = getStoredBuyerId();
++  const { buyerId } = useBuyerSession();
+   const [recommendations, setRecommendations] = useState<VendorRecommendationRow[]>([]);
+   const [vendorsById, setVendorsById] = useState<Record<string, PublishedVendor>>({});
+   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
+@@ -166,11 +168,12 @@ export default function BuyerVendorsPage() {
+         </Card>
+       ) : (
+         !loading && (
+-          <Card className="mb-6 border-modelled-border bg-modelled-bg">
+-            <CardContent className="py-4 text-sm text-foreground">
+-              Waiting for the Solution Matching Agent to present your vendor choice — this appears here as soon as it&apos;s ready.
+-            </CardContent>
+-          </Card>
++          <AgentWaitingState
++            variant="card"
++            title="Waiting for your vendor choice"
++            description="The Solution Matching Agent will present ranked options here as soon as they're ready."
++            className="mb-6"
++          />
+         )
+       )}
+ 
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 93210cf..cfbd9af 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -83,6 +83,7 @@
+ @theme inline {
+   --font-sans: var(--font-geist-sans);
+   --font-mono: var(--font-geist-mono);
++  --font-display: var(--font-fraunces);
+ 
+   --color-background: var(--background);
+   --color-surface: var(--surface);
+@@ -204,9 +205,41 @@ body {
+   background-size: 44px 44px;
+ }
+ 
++/* Was a dead stub (position:relative with no texture) — now an actual
++   subtle grain, used behind hero sections so a flat brand-gradient block
++   doesn't look like a plain CSS swatch. SVG data-uri keeps it a single
++   inline rule with no extra asset request. */
+ .bg-noise {
+   position: relative;
+ }
++.bg-noise::before {
++  content: "";
++  position: absolute;
++  inset: 0;
++  pointer-events: none;
++  opacity: 0.5;
++  mix-blend-mode: overlay;
++  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/></svg>");
++}
++
++/* A soft, layered radial glow behind a hero block — the one "designed
++   product" flourish reused across the dashboard hero and empty/marketing-
++   style states, instead of every hero being a flat surface color. */
++.hero-glow {
++  position: relative;
++  isolation: isolate;
++  overflow: hidden;
++}
++.hero-glow::before {
++  content: "";
++  position: absolute;
++  inset: -20%;
++  z-index: -1;
++  background:
++    radial-gradient(38% 55% at 15% 10%, color-mix(in srgb, var(--brand-500) 30%, transparent), transparent 70%),
++    radial-gradient(32% 45% at 85% 0%, color-mix(in srgb, var(--accent-500) 28%, transparent), transparent 70%);
++  filter: blur(40px);
++}
+ 
+ .text-balance {
+   text-wrap: balance;
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 0a57cb9..c1ef7e6 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -1,5 +1,5 @@
+ import type { Metadata } from "next";
+-import { Geist, Geist_Mono } from "next/font/google";
++import { Fraunces, Geist, Geist_Mono } from "next/font/google";
+ import { ThemeProvider, THEME_INIT_SCRIPT } from "@/components/theme-provider";
+ import "./globals.css";
+ 
+@@ -13,6 +13,17 @@ const geistMono = Geist_Mono({
+   subsets: ["latin"],
+ });
+ 
++// The one editorial touch across an otherwise clean, functional dashboard —
++// used sparingly for page/section headlines (see globals.css's `font-display`
++// utility and PageHeader) so the whole portal reads as a designed product
++// rather than a generic admin template, without turning every label into a
++// serif and hurting legibility in dense data views.
++const fraunces = Fraunces({
++  variable: "--font-fraunces",
++  subsets: ["latin"],
++  axes: ["opsz"],
++});
++
+ export const metadata: Metadata = {
+   title: "Deck-less Pitch — AI-Powered Vendor-to-Buyer Solution Platform",
+   description:
+@@ -24,7 +35,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
+     <html
+       lang="en"
+       suppressHydrationWarning
+-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
++      className={`${geistSans.variable} ${geistMono.variable} ${fraunces.variable} h-full antialiased`}
+     >
+       <head>
+         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+diff --git a/src/components/layout/page-header.tsx b/src/components/layout/page-header.tsx
+index d8425ed..037cee7 100644
+--- a/src/components/layout/page-header.tsx
++++ b/src/components/layout/page-header.tsx
+@@ -29,7 +29,7 @@ export function PageHeader({
+             {eyebrow}
+           </span>
+         )}
+-        <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">{title}</h1>
++        <h1 className="font-display text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">{title}</h1>
+         {description && <p className="mt-1.5 max-w-2xl text-sm text-muted sm:text-base">{description}</p>}
+       </div>
+       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+diff --git a/src/components/layout/page-transition.tsx b/src/components/layout/page-transition.tsx
+new file mode 100644
+index 0000000..51f6652
+--- /dev/null
++++ b/src/components/layout/page-transition.tsx
+@@ -0,0 +1,26 @@
++"use client";
++
++// Route-to-route motion for the buyer portal's <main> content — previously
++// every navigation just hard-cut between pages with no transition at all,
++// which is part of why the app read as "admin panel" rather than a
++// designed product. Keyed on pathname so AnimatePresence treats each route
++// as a distinct element and animates the swap.
++import { AnimatePresence, motion } from "motion/react";
++import { usePathname } from "next/navigation";
++
++export function PageTransition({ children }: { children: React.ReactNode }) {
++  const pathname = usePathname();
++  return (
++    <AnimatePresence mode="wait" initial={false}>
++      <motion.div
++        key={pathname}
++        initial={{ opacity: 0, y: 8 }}
++        animate={{ opacity: 1, y: 0 }}
++        exit={{ opacity: 0, y: -8 }}
++        transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
++      >
++        {children}
++      </motion.div>
++    </AnimatePresence>
++  );
++}
+diff --git a/src/components/shared/agent-waiting-state.tsx b/src/components/shared/agent-waiting-state.tsx
+new file mode 100644
+index 0000000..38216d7
+--- /dev/null
++++ b/src/components/shared/agent-waiting-state.tsx
+@@ -0,0 +1,140 @@
++"use client";
++
++// The one "the agent is working on this" experience for the whole buyer
++// portal. Before this, waiting states were scattered across five different
++// visual languages — LoadingState skeletons, ad-hoc `Loader2` spinners with
++// slightly different copy, full-page centered spinner blocks, static amber
++// "modelled" cards with no animation at all, and the chat panel's own
++// bespoke queued-message bubble. This component replaces every one of
++// those *except* the chat bubble (which is correctly chat-native and left
++// alone) with a single consistent flow: a pulsing status orb, rotating
++// status copy so a long wait doesn't feel frozen, an honest elapsed-time
++// readout, and — after a short delay — an offer to play a tiny runner game
++// instead of staring at a spinner.
++import { useEffect, useState } from "react";
++import { AnimatePresence, motion } from "motion/react";
++import { Gamepad2, Sparkles } from "lucide-react";
++import { Card, CardContent } from "@/components/ui/card";
++import { Button } from "@/components/ui/button";
++import { RunnerGame } from "@/components/shared/runner-game";
++import { cn } from "@/lib/utils";
++
++const DEFAULT_MESSAGES = [
++  "Reading through what you've told us…",
++  "Cross-checking against the evidence base…",
++  "This step can take a little while — the agent is being thorough, not stuck…",
++  "Still working…",
++];
++
++// Below this, showing "play a game" would just be visual noise for a wait
++// that's about to resolve on its own anyway.
++const GAME_OFFER_THRESHOLD_MS = 7000;
++
++function useElapsedMs() {
++  const [elapsed, setElapsed] = useState(0);
++  useEffect(() => {
++    const start = Date.now();
++    const id = setInterval(() => setElapsed(Date.now() - start), 1000);
++    return () => clearInterval(id);
++  }, []);
++  return elapsed;
++}
++
++function formatElapsed(ms: number) {
++  const s = Math.floor(ms / 1000);
++  if (s < 60) return `${s}s`;
++  const m = Math.floor(s / 60);
++  const rem = s % 60;
++  return `${m}m ${rem}s`;
++}
++
++export function AgentWaitingState({
++  title,
++  description,
++  messages = DEFAULT_MESSAGES,
++  variant = "card",
++  className,
++}: {
++  title: string;
++  description?: React.ReactNode;
++  /** Rotates through these underneath the title, ~4s apart, to keep a long wait from feeling frozen. */
++  messages?: string[];
++  /** "fullpage" for a page that has nothing else to show yet; "card" to sit inline among other content. */
++  variant?: "fullpage" | "card";
++  className?: string;
++}) {
++  const elapsed = useElapsedMs();
++  const [messageIndex, setMessageIndex] = useState(0);
++  const [gameOpen, setGameOpen] = useState(false);
++
++  useEffect(() => {
++    const id = setInterval(() => setMessageIndex((i) => (i + 1) % messages.length), 4000);
++    return () => clearInterval(id);
++  }, [messages.length]);
++
++  const canOfferGame = elapsed >= GAME_OFFER_THRESHOLD_MS;
++
++  return (
++    <Card
++      className={cn(
++        "border-border bg-surface",
++        variant === "fullpage" && "mx-auto max-w-xl border-none bg-transparent shadow-none",
++        className
++      )}
++    >
++      <CardContent className={cn("flex flex-col items-center gap-4 text-center", variant === "fullpage" ? "py-10" : "py-8")}>
++        <div className="relative flex h-14 w-14 items-center justify-center">
++          <motion.span
++            className="absolute inset-0 rounded-full bg-gradient-to-br from-brand-500 to-accent-500 opacity-20"
++            animate={{ scale: [1, 1.5, 1], opacity: [0.25, 0, 0.25] }}
++            transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
++          />
++          <div className="relative flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-brand-500 to-accent-500 text-white shadow-md shadow-brand-900/20">
++            <Sparkles className="h-5 w-5" />
++          </div>
++        </div>
++
++        <div>
++          <p className="text-base font-semibold text-foreground">{title}</p>
++          {description && <p className="mt-1 max-w-sm text-sm text-muted">{description}</p>}
++        </div>
++
++        <div className="h-5">
++          <AnimatePresence mode="wait">
++            <motion.p
++              key={messageIndex}
++              initial={{ opacity: 0, y: 4 }}
++              animate={{ opacity: 1, y: 0 }}
++              exit={{ opacity: 0, y: -4 }}
++              transition={{ duration: 0.3 }}
++              className="text-xs text-subtle"
++            >
++              {messages[messageIndex]}
++            </motion.p>
++          </AnimatePresence>
++        </div>
++
++        <p className="text-[11px] tabular-nums text-subtle">Working for {formatElapsed(elapsed)}</p>
++
++        {canOfferGame && !gameOpen && (
++          <Button variant="subtle" size="sm" onClick={() => setGameOpen(true)}>
++            <Gamepad2 className="h-3.5 w-3.5" /> Play while you wait
++          </Button>
++        )}
++
++        <AnimatePresence>
++          {gameOpen && (
++            <motion.div
++              initial={{ opacity: 0, height: 0 }}
++              animate={{ opacity: 1, height: "auto" }}
++              exit={{ opacity: 0, height: 0 }}
++              className="w-full overflow-hidden"
++            >
++              <RunnerGame />
++            </motion.div>
++          )}
++        </AnimatePresence>
++      </CardContent>
++    </Card>
++  );
++}
+diff --git a/src/components/shared/global-capability-search.tsx b/src/components/shared/global-capability-search.tsx
+new file mode 100644
+index 0000000..d93c36b
+--- /dev/null
++++ b/src/components/shared/global-capability-search.tsx
+@@ -0,0 +1,199 @@
++"use client";
++
++// A real, catalog-wide "search by capability" surface — reachable from
++// anywhere in the buyer portal via ⌘K / Ctrl+K or the header search button.
++// Before this, the only capability search in the app was the ~15-line
++// filter bolted onto /buyer/vendors, and it only searched within *this
++// buyer's own* recommended vendors. This searches every published vendor's
++// full Solution DNA (the same query-published-vendor-solution-dna function
++// the vendors page already calls), so a buyer can explore what's out there
++// before or independent of their own recommendation list.
++import { useEffect, useMemo, useState } from "react";
++import { AnimatePresence, motion } from "motion/react";
++import { Building2, ChevronDown, Loader2, Search, Sparkles } from "lucide-react";
++import { Modal } from "@/components/ui/drawer";
++import { Input } from "@/components/ui/input";
++import { Badge } from "@/components/ui/badge";
++import { EvidenceBadge } from "@/components/shared/status-badge";
++import { queryPublishedVendorSolutionDna, type PublishedCapability, type PublishedVendor } from "@/lib/api/buyer-vendor-dna";
++import { cn } from "@/lib/utils";
++
++function vendorMatches(vendor: PublishedVendor, q: string): boolean {
++  if (!q) return true;
++  const haystack = [vendor.companyName, vendor.tagline, vendor.description, vendor.industry, ...vendor.industries]
++    .filter(Boolean)
++    .join(" ")
++    .toLowerCase();
++  if (haystack.includes(q)) return true;
++  return vendor.capabilities.some((c) => capabilityMatches(c, q));
++}
++
++function capabilityMatches(capability: PublishedCapability, q: string): boolean {
++  if (!q) return true;
++  const haystack = [capability.name, capability.description, capability.category, ...capability.tags]
++    .filter(Boolean)
++    .join(" ")
++    .toLowerCase();
++  return haystack.includes(q);
++}
++
++export function GlobalCapabilitySearch() {
++  const [open, setOpen] = useState(false);
++  const [query, setQuery] = useState("");
++  const [vendors, setVendors] = useState<PublishedVendor[] | null>(null);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [expandedId, setExpandedId] = useState<string | null>(null);
++
++  useEffect(() => {
++    function onKey(e: KeyboardEvent) {
++      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
++        e.preventDefault();
++        setOpen(true);
++      }
++    }
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, []);
++
++  useEffect(() => {
++    if (!open || vendors !== null) return;
++    let cancelled = false;
++    setLoading(true);
++    setError(null);
++    queryPublishedVendorSolutionDna()
++      .then((res) => {
++        if (!cancelled) setVendors(res.vendors);
++      })
++      .catch(() => {
++        if (!cancelled) setError("Could not load the vendor capability catalog. Try again in a moment.");
++      })
++      .finally(() => {
++        if (!cancelled) setLoading(false);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [open, vendors]);
++
++  const q = query.trim().toLowerCase();
++  const filtered = useMemo(() => {
++    if (!vendors) return [];
++    return vendors.filter((v) => vendorMatches(v, q));
++  }, [vendors, q]);
++
++  return (
++    <>
++      <button
++        onClick={() => setOpen(true)}
++        className="hidden items-center gap-2 rounded-full border border-border bg-surface-2 px-3.5 py-1.5 text-xs text-muted transition-colors hover:border-border-strong hover:text-foreground sm:flex"
++      >
++        <Search className="h-3.5 w-3.5" />
++        Search capabilities…
++        <kbd className="ml-3 rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[10px] text-subtle">⌘K</kbd>
++      </button>
++      <button
++        onClick={() => setOpen(true)}
++        aria-label="Search capabilities"
++        className="flex h-9 w-9 items-center justify-center rounded-lg border border-border text-muted hover:bg-surface-2 sm:hidden"
++      >
++        <Search className="h-4 w-4" />
++      </button>
++
++      <Modal open={open} onClose={() => setOpen(false)} widthClassName="w-full max-w-2xl">
++        <div className="flex items-center gap-2 border-b border-border pb-4">
++          <Search className="h-4 w-4 shrink-0 text-subtle" />
++          <Input
++            autoFocus
++            value={query}
++            onChange={(e) => setQuery(e.target.value)}
++            placeholder="Search capabilities, industries, or vendors…"
++            className="h-auto border-0 px-0 py-0 focus:ring-0"
++          />
++        </div>
++
++        <div className="mt-3 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
++          {loading && (
++            <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted">
++              <Loader2 className="h-4 w-4 animate-spin" /> Loading the capability catalog…
++            </div>
++          )}
++          {error && <p className="py-6 text-center text-sm text-escalated">{error}</p>}
++          {!loading && !error && filtered.length === 0 && (
++            <p className="py-10 text-center text-sm text-subtle">No vendors or capabilities match &ldquo;{query}&rdquo;.</p>
++          )}
++          {!loading &&
++            filtered.map((vendor) => {
++              const matchingCapabilities = q ? vendor.capabilities.filter((c) => capabilityMatches(c, q)) : vendor.capabilities;
++              const isExpanded = expandedId === vendor.vendorId;
++              return (
++                <div key={vendor.vendorId} className="rounded-xl border border-border bg-surface-2/60">
++                  <button
++                    onClick={() => setExpandedId(isExpanded ? null : vendor.vendorId)}
++                    className="flex w-full items-center gap-3 p-3.5 text-left"
++                  >
++                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-accent-500 text-xs font-bold text-white">
++                      {vendor.companyName.slice(0, 2).toUpperCase()}
++                    </div>
++                    <div className="min-w-0 flex-1">
++                      <p className="truncate text-sm font-semibold text-foreground">{vendor.companyName}</p>
++                      <p className="truncate text-xs text-muted">{vendor.tagline ?? vendor.industry ?? "Vendor"}</p>
++                    </div>
++                    <span className="shrink-0 text-xs text-subtle">{matchingCapabilities.length} match{matchingCapabilities.length === 1 ? "" : "es"}</span>
++                    <ChevronDown className={cn("h-4 w-4 shrink-0 text-subtle transition-transform", isExpanded && "rotate-180")} />
++                  </button>
++
++                  {!isExpanded && (
++                    <div className="flex flex-wrap gap-1.5 px-3.5 pb-3.5">
++                      {matchingCapabilities.slice(0, 6).map((c) => (
++                        <Badge key={c.id} variant="outline" size="sm">{c.name}</Badge>
++                      ))}
++                    </div>
++                  )}
++
++                  <AnimatePresence>
++                    {isExpanded && (
++                      <motion.div
++                        initial={{ opacity: 0, height: 0 }}
++                        animate={{ opacity: 1, height: "auto" }}
++                        exit={{ opacity: 0, height: 0 }}
++                        className="overflow-hidden"
++                      >
++                        <div className="space-y-2.5 border-t border-border px-3.5 py-3.5">
++                          {vendor.description && <p className="text-xs text-muted">{vendor.description}</p>}
++                          {matchingCapabilities.map((c) => (
++                            <div key={c.id} className="rounded-lg border border-border bg-surface p-3">
++                              <div className="flex items-center justify-between gap-2">
++                                <p className="flex items-center gap-1.5 text-sm font-medium text-foreground">
++                                  <Sparkles className="h-3.5 w-3.5 shrink-0 text-brand-500" /> {c.name}
++                                </p>
++                                <EvidenceBadge status={c.verificationStatus} />
++                              </div>
++                              {c.description && <p className="mt-1.5 text-xs text-muted">{c.description}</p>}
++                              {c.tags.length > 0 && (
++                                <div className="mt-2 flex flex-wrap gap-1">
++                                  {c.tags.map((t) => (
++                                    <Badge key={t} variant="default" size="sm">{t}</Badge>
++                                  ))}
++                                </div>
++                              )}
++                            </div>
++                          ))}
++                        </div>
++                      </motion.div>
++                    )}
++                  </AnimatePresence>
++                </div>
++              );
++            })}
++        </div>
++
++        {!loading && !error && vendors && (
++          <p className="mt-3 flex items-center gap-1.5 border-t border-border pt-3 text-[11px] text-subtle">
++            <Building2 className="h-3 w-3" /> Searching {vendors.length} published vendor{vendors.length === 1 ? "" : "s"} and their full Solution DNA.
++          </p>
++        )}
++      </Modal>
++    </>
++  );
++}
+diff --git a/src/components/shared/pipeline-tracker.tsx b/src/components/shared/pipeline-tracker.tsx
+new file mode 100644
+index 0000000..7bfd5c1
+--- /dev/null
++++ b/src/components/shared/pipeline-tracker.tsx
+@@ -0,0 +1,69 @@
++"use client";
++
++// A horizontal stepper showing where the buyer actually is in the journey
++// (Discover → Vendor → Solution → Scenarios → Handoff), computed from real
++// Supabase state rather than a hardcoded "step 3 of 5" — the dashboard is
++// the one place a buyer should be able to see the whole flow at a glance
++// instead of piecing it together from five separate nav items.
++import Link from "next/link";
++import { motion } from "motion/react";
++import { Check } from "lucide-react";
++import type { LucideIcon } from "lucide-react";
++import { cn } from "@/lib/utils";
++
++export interface PipelineStage {
++  key: string;
++  label: string;
++  href: string;
++  icon: LucideIcon;
++  done: boolean;
++}
++
++export function PipelineTracker({ stages }: { stages: PipelineStage[] }) {
++  // The current stage is the first one not yet done — everything before it
++  // is complete, everything after is upcoming.
++  const currentIndex = stages.findIndex((s) => !s.done);
++  const activeIndex = currentIndex === -1 ? stages.length - 1 : currentIndex;
++
++  return (
++    <div className="flex items-start">
++      {stages.map((stage, i) => {
++        const Icon = stage.icon;
++        const isDone = stage.done;
++        const isActive = i === activeIndex && !isDone;
++        return (
++          <div key={stage.key} className="flex flex-1 items-start last:flex-none">
++            <Link href={stage.href} className="group flex flex-col items-center gap-2 text-center">
++              <motion.div
++                initial={false}
++                animate={isActive ? { scale: [1, 1.08, 1] } : { scale: 1 }}
++                transition={isActive ? { duration: 1.8, repeat: Infinity, ease: "easeInOut" } : undefined}
++                className={cn(
++                  "flex h-10 w-10 shrink-0 items-center justify-center rounded-full border-2 transition-colors",
++                  isDone
++                    ? "border-verified bg-verified text-white"
++                    : isActive
++                      ? "border-brand-500 bg-brand-50 text-brand-600 dark:bg-brand-950/50 dark:text-brand-300"
++                      : "border-border bg-surface text-subtle group-hover:border-border-strong"
++                )}
++              >
++                {isDone ? <Check className="h-4 w-4" /> : <Icon className="h-4 w-4" />}
++              </motion.div>
++              <span
++                className={cn(
++                  "max-w-[6.5rem] text-xs font-medium",
++                  isDone || isActive ? "text-foreground" : "text-subtle"
++                )}
++              >
++                {stage.label}
++              </span>
++            </Link>
++            {i < stages.length - 1 && (
++              <div className={cn("mt-5 h-0.5 flex-1 rounded-full", isDone ? "bg-verified" : "bg-border")} />
++            )}
++          </div>
++        );
++      })}
++    </div>
++  );
++}
+diff --git a/src/components/shared/runner-game.tsx b/src/components/shared/runner-game.tsx
+new file mode 100644
+index 0000000..64174cd
+--- /dev/null
++++ b/src/components/shared/runner-game.tsx
+@@ -0,0 +1,230 @@
++"use client";
++
++// A tiny Chrome-dino-style canvas runner — the "something interactive to do
++// while you wait" the redesign asked for. Self-contained: no assets, no
++// dependencies beyond canvas + rAF. Lives inside <AgentWaitingState> and is
++// meant to entertain someone stuck on a multi-minute agent step, not to be
++// a standalone game page.
++//
++// Theming ties back to the app rather than being a generic dino clone: the
++// runner is the brand "spark" (matches the Sparkles mark in the sidebar),
++// obstacles are little "gap" blocks — the same shape language as a
++// GapCard's severity dot — so a screenshot of this still reads as
++// Deck-less Pitch, not a stock arcade widget.
++import { useCallback, useEffect, useRef, useState } from "react";
++
++const WIDTH = 720;
++const HEIGHT = 200;
++const GROUND_Y = HEIGHT - 36;
++const GRAVITY = 0.0022;
++const JUMP_VELOCITY = -0.62;
++const PLAYER_SIZE = 26;
++const PLAYER_X = 56;
++const HIGH_SCORE_KEY = "deckless-pitch:runner-high-score";
++
++interface Obstacle {
++  x: number;
++  width: number;
++  height: number;
++}
++
++type GameState = "idle" | "playing" | "over";
++
++export function RunnerGame({ compact = false }: { compact?: boolean }) {
++  const canvasRef = useRef<HTMLCanvasElement | null>(null);
++  const stateRef = useRef<GameState>("idle");
++  const playerYRef = useRef(GROUND_Y - PLAYER_SIZE);
++  const velocityRef = useRef(0);
++  const obstaclesRef = useRef<Obstacle[]>([]);
++  const speedRef = useRef(0.32);
++  const distanceRef = useRef(0);
++  const lastTsRef = useRef<number | null>(null);
++  const rafRef = useRef<number | null>(null);
++  const nextSpawnRef = useRef(900);
++
++  const [display, setDisplay] = useState<GameState>("idle");
++  const [score, setScore] = useState(0);
++  const [highScore, setHighScore] = useState(0);
++
++  useEffect(() => {
++    try {
++      const stored = window.localStorage.getItem(HIGH_SCORE_KEY);
++      if (stored) setHighScore(Number(stored) || 0);
++    } catch {
++      // localStorage can throw in locked-down contexts — a missing high
++      // score is a cosmetic loss, not worth surfacing an error for
++    }
++  }, []);
++
++  const reset = useCallback(() => {
++    playerYRef.current = GROUND_Y - PLAYER_SIZE;
++    velocityRef.current = 0;
++    obstaclesRef.current = [];
++    speedRef.current = 0.32;
++    distanceRef.current = 0;
++    nextSpawnRef.current = 900;
++    lastTsRef.current = null;
++    setScore(0);
++  }, []);
++
++  const jump = useCallback(() => {
++    if (stateRef.current === "idle" || stateRef.current === "over") {
++      reset();
++      stateRef.current = "playing";
++      setDisplay("playing");
++      return;
++    }
++    // Only jump from (near) the ground — no double-jumping into the void.
++    if (playerYRef.current >= GROUND_Y - PLAYER_SIZE - 1) {
++      velocityRef.current = JUMP_VELOCITY;
++    }
++  }, [reset]);
++
++  useEffect(() => {
++    const canvas = canvasRef.current;
++    if (!canvas) return;
++    const ctx = canvas.getContext("2d");
++    if (!ctx) return;
++
++    function drawFrame() {
++      if (!ctx) return;
++      const isDark = document.documentElement.classList.contains("dark");
++      ctx.clearRect(0, 0, WIDTH, HEIGHT);
++
++      // ground
++      ctx.strokeStyle = isDark ? "#35353c" : "#d4d4d9";
++      ctx.lineWidth = 2;
++      ctx.beginPath();
++      ctx.moveTo(0, GROUND_Y);
++      ctx.lineTo(WIDTH, GROUND_Y);
++      ctx.stroke();
++
++      // player — a rounded "spark" square with a little glow, matching the
++      // sidebar logo mark rather than a generic pixel dinosaur
++      const py = playerYRef.current;
++      const grad = ctx.createLinearGradient(PLAYER_X, py, PLAYER_X + PLAYER_SIZE, py + PLAYER_SIZE);
++      grad.addColorStop(0, "#8b5cf6");
++      grad.addColorStop(1, "#06b6d4");
++      ctx.fillStyle = grad;
++      const r = 7;
++      ctx.beginPath();
++      ctx.roundRect(PLAYER_X, py, PLAYER_SIZE, PLAYER_SIZE, r);
++      ctx.fill();
++
++      // obstacles — "gap" blocks
++      ctx.fillStyle = isDark ? "#fb7185" : "#e11d48";
++      for (const o of obstaclesRef.current) {
++        ctx.beginPath();
++        ctx.roundRect(o.x, GROUND_Y - o.height, o.width, o.height, 4);
++        ctx.fill();
++      }
++
++      if (stateRef.current !== "playing") {
++        ctx.fillStyle = isDark ? "rgba(250,250,250,0.9)" : "rgba(24,24,27,0.85)";
++        ctx.font = "600 15px system-ui, sans-serif";
++        ctx.textAlign = "center";
++        ctx.fillText(
++          stateRef.current === "over" ? "Hit a gap — tap or press space to try again" : "Tap or press space to play",
++          WIDTH / 2,
++          HEIGHT / 2
++        );
++      }
++    }
++
++    function tick(ts: number) {
++      if (stateRef.current !== "playing") {
++        drawFrame();
++        rafRef.current = requestAnimationFrame(tick);
++        return;
++      }
++      const last = lastTsRef.current ?? ts;
++      const dt = Math.min(ts - last, 48);
++      lastTsRef.current = ts;
++
++      velocityRef.current += GRAVITY * dt;
++      playerYRef.current = Math.min(GROUND_Y - PLAYER_SIZE, playerYRef.current + velocityRef.current * dt);
++      if (playerYRef.current > GROUND_Y - PLAYER_SIZE) playerYRef.current = GROUND_Y - PLAYER_SIZE;
++
++      speedRef.current = Math.min(0.72, speedRef.current + 0.00002 * dt);
++      distanceRef.current += speedRef.current * dt;
++      nextSpawnRef.current -= dt;
++
++      if (nextSpawnRef.current <= 0) {
++        const height = 22 + Math.random() * 22;
++        obstaclesRef.current.push({ x: WIDTH + 10, width: 16 + Math.random() * 10, height });
++        nextSpawnRef.current = 700 + Math.random() * 700 - speedRef.current * 400;
++      }
++
++      for (const o of obstaclesRef.current) o.x -= speedRef.current * dt;
++      obstaclesRef.current = obstaclesRef.current.filter((o) => o.x + o.width > -10);
++
++      const playerBox = { x: PLAYER_X + 3, y: playerYRef.current + 3, w: PLAYER_SIZE - 6, h: PLAYER_SIZE - 6 };
++      for (const o of obstaclesRef.current) {
++        const obsBox = { x: o.x, y: GROUND_Y - o.height, w: o.width, h: o.height };
++        const hit =
++          playerBox.x < obsBox.x + obsBox.w &&
++          playerBox.x + playerBox.w > obsBox.x &&
++          playerBox.y < obsBox.y + obsBox.h &&
++          playerBox.y + playerBox.h > obsBox.y;
++        if (hit) {
++          stateRef.current = "over";
++          setDisplay("over");
++          const finalScore = Math.floor(distanceRef.current / 10);
++          setScore(finalScore);
++          if (finalScore > highScore) {
++            setHighScore(finalScore);
++            try {
++              window.localStorage.setItem(HIGH_SCORE_KEY, String(finalScore));
++            } catch {
++              // best-effort persistence only
++            }
++          }
++          break;
++        }
++      }
++
++      if (stateRef.current === "playing") setScore(Math.floor(distanceRef.current / 10));
++
++      drawFrame();
++      rafRef.current = requestAnimationFrame(tick);
++    }
++
++    rafRef.current = requestAnimationFrame(tick);
++    return () => {
++      if (rafRef.current) cancelAnimationFrame(rafRef.current);
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  useEffect(() => {
++    function onKey(e: KeyboardEvent) {
++      if (e.code === "Space" || e.code === "ArrowUp") {
++        e.preventDefault();
++        jump();
++      }
++    }
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [jump]);
++
++  return (
++    <div className={compact ? "" : "mx-auto max-w-2xl"}>
++      <div className="mb-2 flex items-center justify-between text-xs text-muted">
++        <span>Score: <span className="font-semibold text-foreground">{score}</span></span>
++        <span>Best: <span className="font-semibold text-foreground">{highScore}</span></span>
++      </div>
++      <canvas
++        ref={canvasRef}
++        width={WIDTH}
++        height={HEIGHT}
++        onClick={jump}
++        role="button"
++        aria-label={display === "playing" ? "Jump" : "Start the waiting-room runner game"}
++        tabIndex={0}
++        className="w-full cursor-pointer touch-manipulation rounded-xl border border-border bg-surface-2"
++        style={{ aspectRatio: `${WIDTH} / ${HEIGHT}` }}
++      />
++      <p className="mt-2 text-center text-[11px] text-subtle">Space / tap to jump — dodge the gaps while the agent works</p>
++    </div>
++  );
++}
+diff --git a/src/lib/api/buyer-lookup.ts b/src/lib/api/buyer-lookup.ts
+index 479d9b0..3f0a8ad 100644
+--- a/src/lib/api/buyer-lookup.ts
++++ b/src/lib/api/buyer-lookup.ts
+@@ -493,6 +493,30 @@ export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolut
+   return { id: row.id, buyerId: row.buyer_id, title: row.title, pptxUrl: row.pptx_url, status: row.status, createdAt: row.created_at };
+ }
+ 
++// Full deck history (every generated deck, not just the newest) — the
++// solution workspace shows this so a buyer can see or re-download a
++// previous version after a What-If Scenarios re-generation (PRD §7.4), not
++// only the current one.
++export async function getBuyerSolutionDecks(buyerId: string, limit = 10): Promise<BuyerSolutionDeckRow[]> {
++  const params = new URLSearchParams({
++    select: "id,buyer_id,title,pptx_url,status,created_at",
++    buyer_id: `eq.${buyerId}`,
++    order: "created_at.desc",
++    limit: String(limit),
++  });
++  const rows = await restGet<
++    { id: string; buyer_id: string; title: string | null; pptx_url: string | null; status: "ready" | "failed"; created_at: string }[]
++  >(`buyer_solution_decks?${params}`);
++  return rows.map((row) => ({
++    id: row.id,
++    buyerId: row.buyer_id,
++    title: row.title,
++    pptxUrl: row.pptx_url,
++    status: row.status,
++    createdAt: row.created_at,
++  }));
++}
++
+ // ---- buyer_workflow_runs (run-completion tracking) -------------------------
+ // See supabase-buyer/migrations/0004_buyer_workflow_runs.sql — the durable,
+ // server-side record of "does this run exist and has it finished", used by
+@@ -510,6 +534,38 @@ export interface BuyerWorkflowRunRow {
+   startedAt: string;
+ }
+ 
++// Full history (not just the latest), for the dashboard's activity feed and
++// the solution workspace's "past runs" section — see getBuyerSolutionDecks
++// just below for the matching deck-history read.
++export async function getBuyerWorkflowRunHistory(buyerId: string, limit = 10): Promise<BuyerWorkflowRunRow[]> {
++  const params = new URLSearchParams({
++    select: "id,workflow_run_id,buyer_id,status,deck_synced_at,completed_at,started_at",
++    buyer_id: `eq.${buyerId}`,
++    order: "started_at.desc",
++    limit: String(limit),
++  });
++  const rows = await restGet<
++    {
++      id: string;
++      workflow_run_id: string;
++      buyer_id: string | null;
++      status: "running" | "completed" | "failed";
++      deck_synced_at: string | null;
++      completed_at: string | null;
++      started_at: string;
++    }[]
++  >(`buyer_workflow_runs?${params}`);
++  return rows.map((row) => ({
++    id: row.id,
++    workflowRunId: row.workflow_run_id,
++    buyerId: row.buyer_id,
++    status: row.status,
++    deckSyncedAt: row.deck_synced_at,
++    completedAt: row.completed_at,
++    startedAt: row.started_at,
++  }));
++}
++
+ export async function getLatestBuyerWorkflowRun(buyerId: string): Promise<BuyerWorkflowRunRow | null> {
+   const params = new URLSearchParams({
+     select: "id,workflow_run_id,buyer_id,status,deck_synced_at,completed_at,started_at",
+diff --git a/src/lib/buyer-session.ts b/src/lib/buyer-session.ts
+index 0346975..2f69dbb 100644
+--- a/src/lib/buyer-session.ts
++++ b/src/lib/buyer-session.ts
+@@ -3,6 +3,33 @@
+ // workflow trigger response carries no buyerId of its own (same limitation
+ // as the vendor trigger), so buyerId is discovered by polling the `buyers`
+ // table (see buyer-lookup.ts) and then stored here for every later page.
++//
++// Every identity setter below also fires SESSION_EVENT so a long-lived
++// component (src/app/buyer/layout.tsx in particular, which never unmounts
++// while the buyer clicks around the portal) can react the instant a value
++// changes instead of only picking it up on the next full route change —
++// see src/lib/hooks/use-buyer-session.ts, the reactive read side of this.
++// Before this existed, the layout read localStorage once per its own mount
++// and had no way to notice buyerId showing up mid-session, which looked
++// exactly like "stale/cached data" even though every actual network fetch
++// was already using cache: "no-store".
++const SESSION_EVENT = "deckless-pitch:session-changed";
++
++function notifySessionChanged() {
++  if (typeof window === "undefined") return;
++  window.dispatchEvent(new Event(SESSION_EVENT));
++}
++
++export function subscribeToBuyerSession(onChange: () => void): () => void {
++  if (typeof window === "undefined") return () => {};
++  window.addEventListener("storage", onChange);
++  window.addEventListener(SESSION_EVENT, onChange);
++  return () => {
++    window.removeEventListener("storage", onChange);
++    window.removeEventListener(SESSION_EVENT, onChange);
++  };
++}
++
+ const BUYER_ID_KEY = "deckless-pitch:buyer-id";
+ const COMPANY_NAME_KEY = "deckless-pitch:buyer-company-name";
+ const SELECTED_VENDOR_ID_KEY = "deckless-pitch:selected-vendor-id";
+@@ -17,6 +44,7 @@ export function getStoredBuyerId(): string | null {
+ export function setStoredBuyerId(buyerId: string) {
+   if (typeof window === "undefined") return;
+   window.localStorage.setItem(BUYER_ID_KEY, buyerId);
++  notifySessionChanged();
+ }
+ 
+ export function getStoredCompanyName(): string | null {
+@@ -27,6 +55,7 @@ export function getStoredCompanyName(): string | null {
+ export function setStoredCompanyName(companyName: string) {
+   if (typeof window === "undefined") return;
+   window.localStorage.setItem(COMPANY_NAME_KEY, companyName);
++  notifySessionChanged();
+ }
+ 
+ // Step 3 ("Confirm Vendor Selection") is a hard gate — every page from
+@@ -43,6 +72,7 @@ export function setStoredSelectedVendor(vendorId: string, companyName?: string)
+   if (typeof window === "undefined") return;
+   window.localStorage.setItem(SELECTED_VENDOR_ID_KEY, vendorId);
+   if (companyName) window.localStorage.setItem(SELECTED_VENDOR_NAME_KEY, companyName);
++  notifySessionChanged();
+ }
+ 
+ export function getStoredSelectedVendorName(): string | null {
+@@ -58,6 +88,7 @@ export function getStoredSolutionModelId(): string | null {
+ export function setStoredSolutionModelId(id: string) {
+   if (typeof window === "undefined") return;
+   window.localStorage.setItem(SOLUTION_MODEL_ID_KEY, id);
++  notifySessionChanged();
+ }
+ 
+ export function clearBuyerSession() {
+@@ -67,6 +98,7 @@ export function clearBuyerSession() {
+   window.localStorage.removeItem(SELECTED_VENDOR_ID_KEY);
+   window.localStorage.removeItem(SELECTED_VENDOR_NAME_KEY);
+   window.localStorage.removeItem(SOLUTION_MODEL_ID_KEY);
++  notifySessionChanged();
+ }
+ 
+ // A trigger the agent hasn't finished resolving to a buyerId yet, persisted
+diff --git a/src/lib/hooks/use-buyer-session.ts b/src/lib/hooks/use-buyer-session.ts
+new file mode 100644
+index 0000000..afdd34d
+--- /dev/null
++++ b/src/lib/hooks/use-buyer-session.ts
+@@ -0,0 +1,60 @@
++"use client";
++
++// Single reactive read of the buyer's client-side session identity
++// (buyerId, companyName, selected vendor, solution model id), replacing the
++// pattern of every page calling getStoredBuyerId()/getStoredCompanyName()
++// etc. directly in its render body. That pattern is fine for a page
++// component that remounts on every navigation, but src/app/buyer/layout.tsx
++// never unmounts while the buyer clicks around the portal — so it used to
++// freeze on whatever buyerId/companyName existed at first paint (often
++// null, before discover/page.tsx's polling flow resolves one) until an
++// unrelated re-render happened to touch it. That looked exactly like a
++// caching bug, even though every actual Supabase fetch already disabled
++// caching (see buyer-lookup.ts's cache: "no-store").
++//
++// Subscribes to both the cross-tab `storage` event and the same-tab
++// SESSION_EVENT that every setter in buyer-session.ts now dispatches (the
++// browser's own `storage` event only fires in *other* tabs, never the one
++// that made the change).
++import { useEffect, useState } from "react";
++import {
++  getStoredBuyerId,
++  getStoredCompanyName,
++  getStoredSelectedVendorId,
++  getStoredSelectedVendorName,
++  getStoredSolutionModelId,
++  subscribeToBuyerSession,
++} from "@/lib/buyer-session";
++
++export interface BuyerSession {
++  buyerId: string | null;
++  companyName: string | null;
++  vendorId: string | null;
++  vendorName: string | null;
++  solutionModelId: string | null;
++}
++
++function readSession(): BuyerSession {
++  return {
++    buyerId: getStoredBuyerId(),
++    companyName: getStoredCompanyName(),
++    vendorId: getStoredSelectedVendorId(),
++    vendorName: getStoredSelectedVendorName(),
++    solutionModelId: getStoredSolutionModelId(),
++  };
++}
++
++export function useBuyerSession(): BuyerSession {
++  const [session, setSession] = useState<BuyerSession>(() =>
++    typeof window === "undefined"
++      ? { buyerId: null, companyName: null, vendorId: null, vendorName: null, solutionModelId: null }
++      : readSession()
++  );
++
++  useEffect(() => {
++    setSession(readSession());
++    return subscribeToBuyerSession(() => setSession(readSession()));
++  }, []);
++
++  return session;
++}
+-- 
+2.43.0
+
