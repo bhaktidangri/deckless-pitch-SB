@@ -2,124 +2,106 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { AnimatePresence, motion } from "motion/react";
-import { ArrowLeft, ArrowRight, Building2, Check, ShoppingBag } from "lucide-react";
+import { motion } from "motion/react";
+import { ArrowRight, Building2, CheckCircle2, Mail, ShoppingBag, AlertTriangle } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Input, Label, Select } from "@/components/ui/input";
+import { Input, Label } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { getSupabaseClient } from "@/lib/supabase-client";
 import { cn } from "@/lib/utils";
 
-type Role = "vendor" | "buyer";
-
+// Passwordless auth means "sign up" and "sign in" are the same mechanism —
+// Supabase creates the auth.users row automatically the first time an email
+// verifies its magic link. This page exists for the "I'm new here" framing
+// and copy, but sends the exact same signInWithOtp call as /login. Company
+// details (name, website, industry...) aren't collected here — they're
+// captured by the real Discover / vendor onboarding flow right after first
+// sign-in, which is also what actually creates the buyer/vendor record.
 export default function SignupPage() {
-  const router = useRouter();
-  const [step, setStep] = useState(1);
-  const [role, setRole] = useState<Role | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [role, setRole] = useState<"vendor" | "buyer">("buyer");
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true);
-    setTimeout(() => {
-      router.push(role === "vendor" ? "/vendor/onboarding" : "/buyer/discover");
-    }, 700);
+    if (!email.trim()) return;
+    setStatus("sending");
+    setError(null);
+    try {
+      const supabase = getSupabaseClient();
+      const redirectTo = `${window.location.origin}/auth/callback?role=${role}`;
+      const { error: otpError } = await supabase.auth.signInWithOtp({
+        email: email.trim(),
+        options: { emailRedirectTo: redirectTo },
+      });
+      if (otpError) throw otpError;
+      setStatus("sent");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not send the sign-in link.");
+      setStatus("error");
+    }
   }
 
   return (
-    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="w-full max-w-lg">
+    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="w-full max-w-md">
       <Card>
         <CardHeader>
-          <div className="mb-2 flex items-center gap-2">
-            <Step number={1} label="Role" active={step === 1} done={step > 1} />
-            <div className="h-px flex-1 bg-border" />
-            <Step number={2} label="Details" active={step === 2} done={false} />
-          </div>
           <CardTitle className="text-xl">Create your account</CardTitle>
-          <CardDescription>
-            {step === 1 ? "Tell us which side of the platform you're joining." : `Set up your ${role} workspace.`}
-          </CardDescription>
+          <CardDescription>Tell us which side of the platform you&apos;re joining, then verify your email — no password needed.</CardDescription>
         </CardHeader>
         <CardContent>
-          <AnimatePresence mode="wait">
-            {step === 1 ? (
-              <motion.div
-                key="step1"
-                initial={{ opacity: 0, x: 16 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -16 }}
-                transition={{ duration: 0.25 }}
-                className="grid gap-3 sm:grid-cols-2"
-              >
-                <RoleCard
-                  icon={Building2}
-                  title="I'm a Vendor"
-                  desc="Register your solution capabilities and reach qualified buyers."
-                  active={role === "vendor"}
-                  onClick={() => setRole("vendor")}
-                />
-                <RoleCard
-                  icon={ShoppingBag}
-                  title="I'm a Buyer"
-                  desc="Describe your requirement and get a personalized solution."
-                  active={role === "buyer"}
-                  onClick={() => setRole("buyer")}
-                />
-                <Button
-                  type="button"
-                  disabled={!role}
-                  onClick={() => setStep(2)}
-                  className="col-span-full mt-2"
-                >
-                  Continue <ArrowRight className="h-4 w-4" />
+          {status === "sent" ? (
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-verified-bg text-verified">
+                <CheckCircle2 className="h-6 w-6" />
+              </div>
+              <p className="text-sm font-medium text-foreground">Check your email</p>
+              <p className="max-w-xs text-sm text-muted">
+                We sent a verification link to <span className="font-medium text-foreground">{email}</span>. Open it on this device
+                — we&apos;ll take you straight to {role === "vendor" ? "vendor onboarding" : "discovery"}.
+              </p>
+              <button type="button" onClick={() => setStatus("idle")} className="mt-2 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
+                Use a different email
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="mb-5 grid grid-cols-2 gap-2 rounded-xl border border-border bg-surface-2 p-1">
+                <RoleTab active={role === "buyer"} onClick={() => setRole("buyer")} icon={ShoppingBag} label="I'm a Buyer" />
+                <RoleTab active={role === "vendor"} onClick={() => setRole("vendor")} icon={Building2} label="I'm a Vendor" />
+              </div>
+
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div>
+                  <Label htmlFor="email">Work email</Label>
+                  <div className="relative">
+                    <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+                    <Input
+                      id="email"
+                      type="email"
+                      placeholder="you@company.com"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      className="pl-9"
+                      required
+                    />
+                  </div>
+                </div>
+
+                {status === "error" && error && (
+                  <div className="flex items-start gap-2 rounded-lg border border-escalated-border bg-escalated-bg px-3 py-2.5 text-sm text-escalated">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    {error}
+                  </div>
+                )}
+
+                <Button type="submit" className="w-full" loading={status === "sending"}>
+                  Continue as {role === "vendor" ? "Vendor" : "Buyer"} <ArrowRight className="h-4 w-4" />
                 </Button>
-              </motion.div>
-            ) : (
-              <motion.form
-                key="step2"
-                initial={{ opacity: 0, x: 16 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -16 }}
-                transition={{ duration: 0.25 }}
-                onSubmit={handleSubmit}
-                className="space-y-4"
-              >
-                <div>
-                  <Label htmlFor="company">Company name</Label>
-                  <Input id="company" placeholder={role === "vendor" ? "CloudNova" : "Meridian Retail Group"} required />
-                </div>
-                <div>
-                  <Label htmlFor="website">Website</Label>
-                  <Input id="website" placeholder="https://yourcompany.com" required />
-                </div>
-                <div>
-                  <Label htmlFor="industry">Industry</Label>
-                  <Select id="industry" defaultValue="">
-                    <option value="" disabled>Select industry</option>
-                    <option>Cloud Infrastructure</option>
-                    <option>Retail</option>
-                    <option>Manufacturing</option>
-                    <option>BFSI</option>
-                    <option>Healthcare</option>
-                    <option>SaaS</option>
-                    <option>Other</option>
-                  </Select>
-                </div>
-                <div>
-                  <Label htmlFor="work-email">Work email</Label>
-                  <Input id="work-email" type="email" placeholder="you@company.com" required />
-                </div>
-                <div className="flex gap-2 pt-2">
-                  <Button type="button" variant="secondary" onClick={() => setStep(1)}>
-                    <ArrowLeft className="h-4 w-4" /> Back
-                  </Button>
-                  <Button type="submit" className="flex-1" loading={loading}>
-                    Create {role} workspace <ArrowRight className="h-4 w-4" />
-                  </Button>
-                </div>
-              </motion.form>
-            )}
-          </AnimatePresence>
+              </form>
+            </>
+          )}
 
           <p className="mt-6 text-center text-sm text-muted">
             Already have an account?{" "}
@@ -133,37 +115,17 @@ export default function SignupPage() {
   );
 }
 
-function RoleCard({ icon: Icon, title, desc, active, onClick }: { icon: React.ElementType; title: string; desc: string; active: boolean; onClick: () => void }) {
+function RoleTab({ active, onClick, icon: Icon, label }: { active: boolean; onClick: () => void; icon: React.ElementType; label: string }) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={cn(
-        "flex flex-col items-start gap-2 rounded-xl border p-4 text-left transition-all",
-        active ? "border-brand-500 bg-brand-50 ring-2 ring-brand-500/20 dark:bg-brand-950/30" : "border-border bg-surface hover:border-border-strong"
+        "flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-medium transition-all",
+        active ? "bg-surface text-foreground shadow-sm" : "text-muted hover:text-foreground"
       )}
     >
-      <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg", active ? "bg-brand-600 text-white" : "bg-surface-2 text-muted")}>
-        <Icon className="h-4 w-4" />
-      </div>
-      <p className="text-sm font-semibold text-foreground">{title}</p>
-      <p className="text-xs text-muted">{desc}</p>
+      <Icon className="h-3.5 w-3.5" /> {label}
     </button>
-  );
-}
-
-function Step({ number, label, active, done }: { number: number; label: string; active: boolean; done: boolean }) {
-  return (
-    <div className="flex items-center gap-2">
-      <div
-        className={cn(
-          "flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold",
-          done ? "bg-brand-600 text-white" : active ? "bg-brand-100 text-brand-700 dark:bg-brand-950 dark:text-brand-300" : "bg-surface-2 text-subtle"
-        )}
-      >
-        {done ? <Check className="h-3.5 w-3.5" /> : number}
-      </div>
-      <span className={cn("text-xs font-medium", active || done ? "text-foreground" : "text-subtle")}>{label}</span>
-    </div>
   );
 }

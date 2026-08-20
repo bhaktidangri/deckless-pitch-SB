@@ -17,6 +17,7 @@ import {
   setStoredVendorName,
 } from "@/lib/vendor-session";
 import { countDraftCapabilities } from "@/lib/api/vendor-lookup";
+import { linkVendorAccount } from "@/lib/api/account";
 import { POLL_TIMEOUT_MS, pollForNewCapabilities, pollForNewVendorId, type PollHandle } from "@/lib/vendor-poll";
 
 const industryOptions = ["BFSI", "Healthcare", "Manufacturing", "Retail", "SaaS", "Government", "Logistics", "Other"];
@@ -103,6 +104,7 @@ export default function VendorOnboardingPage() {
       // where this leaves off if the vendor navigates away early — this
       // page's own poll dies with the component on unmount.
       if (existingVendorId) {
+        linkVendorAccount(existingVendorId).catch(() => {});
         setPendingSubmission({ kind: "existing-vendor", vendorId: existingVendorId, baseline, deadline });
         pollHandleRef.current = pollForNewCapabilities(
           existingVendorId,
@@ -122,6 +124,7 @@ export default function VendorOnboardingPage() {
           deadline,
           (vendorId) => {
             setStoredVendorId(vendorId);
+            linkVendorAccount(vendorId).catch(() => {});
             clearPendingSubmission();
             router.push("/vendor/solution-dna");
           },

@@ -77,6 +77,7 @@ export interface VendorDetailRow {
   hq: string | null;
   foundedYear: number | null;
   verificationStatus: string;
+  email: string | null;
   createdAt: string;
 }
 
@@ -92,6 +93,7 @@ function mapVendorRow(row: {
   hq: string | null;
   founded_year: number | null;
   verification_status: string;
+  email: string | null;
   created_at: string;
 }): VendorDetailRow {
   return {
@@ -106,12 +108,13 @@ function mapVendorRow(row: {
     hq: row.hq,
     foundedYear: row.founded_year,
     verificationStatus: row.verification_status,
+    email: row.email,
     createdAt: row.created_at,
   };
 }
 
 const VENDOR_SELECT =
-  "id,company_name,industry,industries,website,tagline,description,employee_range,hq,founded_year,verification_status,created_at";
+  "id,company_name,industry,industries,website,tagline,description,employee_range,hq,founded_year,verification_status,email,created_at";
 
 export async function getVendorById(vendorId: string): Promise<VendorDetailRow | null> {
   const params = new URLSearchParams({ select: VENDOR_SELECT, id: `eq.${vendorId}`, limit: "1" });

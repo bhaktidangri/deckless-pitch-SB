@@ -22,6 +22,7 @@ import {
   setStoredCompanyName,
 } from "@/lib/buyer-session";
 import { getBuyerRequirements, getClientRealityProfile, linkBuyerWorkflowRun, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
+import { linkBuyerAccount } from "@/lib/api/account";
 import { POLL_TIMEOUT_MS, pollForNewBuyerId, type PollHandle } from "@/lib/buyer-poll";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
@@ -133,6 +134,7 @@ export default function DiscoverPage() {
         setBuyerId(existingBuyerId);
         setStage("ready");
         if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, existingBuyerId);
+        linkBuyerAccount(existingBuyerId).catch(() => {});
         return;
       }
 
@@ -149,6 +151,7 @@ export default function DiscoverPage() {
           clearPendingBuyerSubmission();
           setStage("ready");
           if (workflowRunId) linkBuyerWorkflowRun(workflowRunId, id);
+          linkBuyerAccount(id).catch(() => {});
         },
         () => setStage("timed-out")
       );
@@ -177,6 +180,7 @@ export default function DiscoverPage() {
         // most recent stored run id is the one this submission created.
         const [mostRecentRunId] = getStoredBuyerWorkflowRunIds();
         if (mostRecentRunId) linkBuyerWorkflowRun(mostRecentRunId, id);
+        linkBuyerAccount(id).catch(() => {});
       },
       () => setStage("timed-out")
     );

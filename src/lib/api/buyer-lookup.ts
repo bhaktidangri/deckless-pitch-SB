@@ -44,6 +44,7 @@ export interface BuyerRow {
   companySize: number | null;
   contactName: string | null;
   contactRole: string | null;
+  email: string | null;
   createdAt: string;
 }
 
@@ -54,14 +55,14 @@ export interface BuyerRow {
 // no buyerId of its own).
 export async function findBuyerCreatedAfter(companyName: string, afterIso: string): Promise<BuyerRow | null> {
   const params = new URLSearchParams({
-    select: "id,company_name,industry,company_size,contact_name,contact_role,created_at",
+    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
     company_name: `eq.${companyName}`,
     created_at: `gt.${afterIso}`,
     order: "created_at.asc",
     limit: "1",
   });
   const rows = await restGet<
-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; created_at: string }[]
+    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
   >(`buyers?${params}`);
   const row = rows[0];
   if (!row) return null;
@@ -72,18 +73,19 @@ export async function findBuyerCreatedAfter(companyName: string, afterIso: strin
     companySize: row.company_size,
     contactName: row.contact_name,
     contactRole: row.contact_role,
+    email: row.email,
     createdAt: row.created_at,
   };
 }
 
 export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
   const params = new URLSearchParams({
-    select: "id,company_name,industry,company_size,contact_name,contact_role,created_at",
+    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
     id: `eq.${buyerId}`,
     limit: "1",
   });
   const rows = await restGet<
-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; created_at: string }[]
+    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
   >(`buyers?${params}`);
   const row = rows[0];
   if (!row) return null;
@@ -94,6 +96,7 @@ export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
     companySize: row.company_size,
     contactName: row.contact_name,
     contactRole: row.contact_role,
+    email: row.email,
     createdAt: row.created_at,
   };
 }

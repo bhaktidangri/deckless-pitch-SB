@@ -10,8 +10,11 @@ import {
   CalendarClock,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
 import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
+import { useRequireAuth } from "@/lib/hooks/use-require-auth";
+import { UserCircle } from "lucide-react";
 
 const sections: NavSection[] = [
   {
@@ -32,6 +35,10 @@ const sections: NavSection[] = [
       { href: "/vendor/meetings", label: "Meetings", icon: CalendarClock },
     ],
   },
+  {
+    title: "Account",
+    items: [{ href: "/vendor/profile", label: "Profile", icon: UserCircle }],
+  },
 ];
 
 export default function VendorLayout({ children }: { children: React.ReactNode }) {
@@ -42,6 +49,7 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
   const [vendorName, setVendorName] = useState<string | null>(null);
   const [vendorId, setVendorId] = useState<string | null>(null);
   const [openFrontier, setOpenFrontier] = useState<number | undefined>(undefined);
+  const { ready } = useRequireAuth();
 
   useEffect(() => {
     const id = getStoredVendorId();
@@ -71,6 +79,14 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
       item.href === "/vendor/capability-frontier" ? { ...item, badge: openFrontier || undefined } : item
     ),
   }));
+
+  if (!ready) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <AgentWaitingState variant="fullpage" title="Checking your session" description="One moment…" />
+      </div>
+    );
+  }
 
   return (
     <PortalShell

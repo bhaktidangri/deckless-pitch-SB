@@ -9,12 +9,15 @@ import {
   SlidersHorizontal,
   MessageSquareText,
   CalendarClock,
+  UserCircle,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
 import { PageTransition } from "@/components/layout/page-transition";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { AgentStatusPill } from "@/components/shared/agent-status-pill";
 import { GlobalCapabilitySearch } from "@/components/shared/global-capability-search";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+import { useRequireAuth } from "@/lib/hooks/use-require-auth";
 
 const sections: NavSection[] = [
   {
@@ -40,6 +43,10 @@ const sections: NavSection[] = [
     title: "Closure",
     items: [{ href: "/buyer/handoff", label: "Expert handoff", icon: CalendarClock }],
   },
+  {
+    title: "Account",
+    items: [{ href: "/buyer/profile", label: "Profile", icon: UserCircle }],
+  },
 ];
 
 export default function BuyerLayout({ children }: { children: React.ReactNode }) {
@@ -50,6 +57,15 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
   // unmounts while the buyer navigates the portal — it needs to notice
   // buyerId/companyName appearing mid-session, not just at first paint.
   const { companyName, buyerId } = useBuyerSession();
+  const { ready } = useRequireAuth();
+
+  if (!ready) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <AgentWaitingState variant="fullpage" title="Checking your session" description="One moment…" />
+      </div>
+    );
+  }
 
   return (
     <PortalShell

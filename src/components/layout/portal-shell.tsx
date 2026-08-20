@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Menu, Sparkles } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { LogOut, Menu, Sparkles } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { NavLink } from "@/components/layout/nav-link";
 import { RoleSwitcher } from "@/components/layout/role-switcher";
@@ -10,6 +11,9 @@ import { NotificationsMenu } from "@/components/layout/notifications-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Avatar } from "@/components/ui/avatar";
 import { Drawer } from "@/components/ui/drawer";
+import { getSupabaseClient } from "@/lib/supabase-client";
+import { clearBuyerSession } from "@/lib/buyer-session";
+import { clearStoredVendorId } from "@/lib/vendor-session";
 
 export interface NavSection {
   title?: string;
@@ -44,6 +48,20 @@ export function PortalShell({
   children: React.ReactNode;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const router = useRouter();
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    try {
+      await getSupabaseClient().auth.signOut();
+    } catch {
+      // best-effort — clear local session state regardless
+    }
+    clearBuyerSession();
+    clearStoredVendorId();
+    router.push("/login");
+  }
 
   const navContent = (onNavigate?: () => void) => (
     <div className="flex h-full flex-col">
@@ -80,6 +98,15 @@ export function PortalShell({
             <p className="truncate text-sm font-medium text-foreground">{userName}</p>
             <p className="truncate text-xs text-muted">{userRole}</p>
           </div>
+          <button
+            onClick={handleSignOut}
+            disabled={signingOut}
+            title="Sign out"
+            aria-label="Sign out"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-surface-2 hover:text-escalated disabled:opacity-50"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </div>
