@@ -96,17 +96,33 @@ export interface VendorMeetingRequestRow {
   proposedDate: string | null;
   expert: string | null;
   unresolvedCount: number;
+  title: string | null;
+  notes: string | null;
+  meetingLink: string | null;
+  durationMinutes: number;
   createdAt: string;
 }
 
 export async function getMeetingRequestsForVendor(vendorId: string): Promise<VendorMeetingRequestRow[]> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,status,proposed_date,expert,unresolved_count,created_at",
+    select: "id,buyer_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at",
     vendor_id: `eq.${vendorId}`,
     order: "created_at.desc",
   });
   const rows = await restGet<
-    { id: string; buyer_id: string; status: VendorMeetingRequestRow["status"]; proposed_date: string | null; expert: string | null; unresolved_count: number | null; created_at: string }[]
+    {
+      id: string;
+      buyer_id: string;
+      status: VendorMeetingRequestRow["status"];
+      proposed_date: string | null;
+      expert: string | null;
+      unresolved_count: number | null;
+      title: string | null;
+      notes: string | null;
+      meeting_link: string | null;
+      duration_minutes: number | null;
+      created_at: string;
+    }[]
   >(`meeting_requests?${params}`);
   return rows.map((r) => ({
     id: r.id,
@@ -115,6 +131,10 @@ export async function getMeetingRequestsForVendor(vendorId: string): Promise<Ven
     proposedDate: r.proposed_date,
     expert: r.expert,
     unresolvedCount: r.unresolved_count ?? 0,
+    title: r.title,
+    notes: r.notes,
+    meetingLink: r.meeting_link,
+    durationMinutes: r.duration_minutes ?? 30,
     createdAt: r.created_at,
   }));
 }

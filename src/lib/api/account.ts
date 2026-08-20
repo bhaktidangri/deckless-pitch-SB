@@ -121,3 +121,35 @@ export interface RecordedVendorOutreach {
 export function recordVendorOutreach(input: RecordVendorOutreachInput): Promise<RecordedVendorOutreach> {
   return callAuthedFunction<RecordedVendorOutreach>("record-vendor-outreach", input);
 }
+
+export interface ScheduleMeetingInput {
+  buyerId: string;
+  meetingRequestId?: string;
+  title: string;
+  proposedDate: string;
+  durationMinutes?: number;
+  meetingLink?: string;
+  notes?: string;
+}
+
+export interface ScheduledMeeting {
+  meetingRequestId: string;
+  status: string;
+  proposedDate: string;
+  title: string | null;
+  notes: string | null;
+  meetingLink: string | null;
+  durationMinutes: number;
+  buyerEmail: string | null;
+  buyerContactName: string | null;
+  buyerCompanyName: string;
+  vendorCompanyName: string;
+}
+
+// Directly schedules (or reschedules, when meetingRequestId is passed) a
+// meeting with a buyer — status goes straight to "scheduled" instead of
+// waiting on a buyer-initiated "requested" row. Returns everything needed to
+// build a calendar invite (.ics) and a mailto: link client-side.
+export function scheduleMeetingDirect(input: ScheduleMeetingInput): Promise<ScheduledMeeting> {
+  return callAuthedFunction<ScheduledMeeting>("schedule-meeting-direct", input);
+}

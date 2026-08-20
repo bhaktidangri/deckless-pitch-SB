@@ -1,15 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CalendarCheck2, CalendarClock, CheckCircle2, ChevronDown, ClipboardList, Loader2 } from "lucide-react";
+import Link from "next/link";
+import { CalendarCheck2, CalendarClock, CheckCircle2, ChevronDown, ClipboardList, Download, ExternalLink, Loader2 } from "lucide-react";
 import { motion } from "motion/react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { getBuyer } from "@/lib/api/buyer-lookup";
+import { getVendorById } from "@/lib/api/vendor-lookup";
 import { confirmVendorDiscussionMeeting, getMeetingRequestsForVendor, type VendorMeetingRequestRow } from "@/lib/api/vendor-frontier";
 import { getStoredVendorId } from "@/lib/vendor-session";
+import { downloadIcs } from "@/lib/ics";
 import { cn } from "@/lib/utils";
 
 const statusConfig = {
@@ -25,7 +28,8 @@ const statusConfig = {
 export default function MeetingsPage() {
   const vendorId = getStoredVendorId();
   const [meetings, setMeetings] = useState<VendorMeetingRequestRow[]>([]);
-  const [buyerNames, setBuyerNames] = useState<Record<string, string>>({});
+  const [buyerInfo, setBuyerInfo] = useState<Record<string, { companyName: string; email: string | null }>>({});
+  const [vendorEmail, setVendorEmail] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
@@ -36,16 +40,17 @@ export default function MeetingsPage() {
       return;
     }
     try {
-      const rows = await getMeetingRequestsForVendor(vendorId);
+      const [rows, vendor] = await Promise.all([getMeetingRequestsForVendor(vendorId), getVendorById(vendorId).catch(() => null)]);
       setMeetings(rows);
+      setVendorEmail(vendor?.email ?? null);
       if (!expandedId && rows[0]) setExpandedId(rows[0].id);
-      const unknownBuyerIds = [...new Set(rows.map((r) => r.buyerId))].filter((id) => !buyerNames[id]);
+      const unknownBuyerIds = [...new Set(rows.map((r) => r.buyerId))].filter((id) => !buyerInfo[id]);
       if (unknownBuyerIds.length > 0) {
         const buyers = await Promise.all(unknownBuyerIds.map((id) => getBuyer(id).catch(() => null)));
-        setBuyerNames((prev) => {
+        setBuyerInfo((prev) => {
           const next = { ...prev };
           buyers.forEach((b) => {
-            if (b) next[b.id] = b.companyName;
+            if (b) next[b.id] = { companyName: b.companyName, email: b.email };
           });
           return next;
         });
@@ -105,8 +110,11 @@ export default function MeetingsPage() {
                       <cfg.icon className="h-4.5 w-4.5" />
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-foreground">{buyerNames[m.buyerId] ?? "Buyer"}</p>
-                      <p className="text-xs text-muted">Recommended expert: {m.expert ?? "—"}</p>
+                      <p className="text-sm font-semibold text-foreground">{m.title ?? buyerInfo[m.buyerId]?.companyName ?? "Buyer"}</p>
+                      <p className="text-xs text-muted">
+                        {buyerInfo[m.buyerId]?.companyName ?? "Buyer"}
+                        {m.expert ? ` · Recommended expert: ${m.expert}` : ""}
+                      </p>
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
@@ -124,14 +132,56 @@ export default function MeetingsPage() {
                 >
                   <CardContent className="border-t border-border pt-4">
                     {m.proposedDate && (
-                      <p className="mb-3 text-sm text-foreground">Proposed: {new Date(m.proposedDate).toLocaleString()}</p>
+                      <p className="mb-1 text-sm text-foreground">
+                        {new Date(m.proposedDate).toLocaleString()} · {m.durationMinutes} min
+                      </p>
                     )}
-                    <div className="flex gap-2">
+                    {m.notes && <p className="mb-3 text-sm text-muted">{m.notes}</p>}
+                    <div className="flex flex-wrap items-center gap-2">
                       {m.status === "requested" && (
                         <Button size="sm" loading={confirming === m.id} onClick={() => confirm(m.id)}>
                           <CalendarCheck2 className="h-3.5 w-3.5" /> Confirm meeting slot
                         </Button>
                       )}
+                      {m.meetingLink && (
+                        <a
+                          href={m.meetingLink}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-surface-2"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" /> Join link
+                        </a>
+                      )}
+                      {m.proposedDate && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            downloadIcs(
+                              {
+                                uid: `${m.id}@deckless-pitch`,
+                                title: m.title ?? buyerInfo[m.buyerId]?.companyName ?? "Meeting",
+                                description: m.notes ?? undefined,
+                                location: m.meetingLink ?? undefined,
+                                startIso: m.proposedDate!,
+                                durationMinutes: m.durationMinutes,
+                                organizerEmail: vendorEmail,
+                                attendeeEmail: buyerInfo[m.buyerId]?.email ?? null,
+                              },
+                              `${(m.title ?? "meeting").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.ics`
+                            )
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted hover:bg-surface-2 hover:text-foreground"
+                        >
+                          <Download className="h-3.5 w-3.5" /> Download .ics
+                        </button>
+                      )}
+                      <Link
+                        href={`/vendor/buyers/${m.buyerId}`}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted hover:bg-surface-2 hover:text-foreground"
+                      >
+                        Reschedule from buyer page
+                      </Link>
                     </div>
                   </CardContent>
                 </motion.div>
