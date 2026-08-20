@@ -1,13 +1,10 @@
-// Logs a vendor's outreach to a buyer (subject/message) for the vendor's own
-// CRM-style tracking dashboard, and — when SENDGRID_API_KEY is configured —
-// actually sends it via SendGrid, tracking delivery/open/click state on the
-// row itself (see the email_status/opened_at/clicked_at columns from the
-// email_delivery_tracking migration). Falls back to leaving email_status
-// "not_sent" if no API key is configured yet, or "skipped_no_email" if the
-// buyer has no email on file — callers (EmailBuyerCard) still get
-// buyerEmail back either way so a mailto: fallback stays available. Caller
-// must be the authenticated vendor (verified by email, never a
-// client-supplied id), mirroring link-vendor-account / update-vendor-profile.
+// Reverse direction of record-vendor-outreach: lets a logged-in buyer email
+// a particular vendor directly from /buyer/chat (Ask AI), instead of only
+// ever being contacted BY vendors. Writes to buyer_outreach_events (a
+// separate table from vendor_outreach_events, see its migration comment) so
+// the vendor dashboard's existing "Outreach sent" stat isn't corrupted by
+// outreach it didn't send. Caller must be the authenticated buyer (verified
+// by email, never a client-supplied id), mirroring record-vendor-outreach.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -29,11 +26,6 @@ interface SendGridResult {
   error: string | null;
 }
 
-// SendGrid's /mail/send returns 202 with no body, so there's no message id
-// to key off of the way Resend's response gave one. Instead we mint our own
-// tracking id up front and pass it through as a custom_args entry, which
-// SendGrid echoes back verbatim on every delivery/open/click webhook event
-// for this message — see record-email-delivery-event, which matches on it.
 async function sendViaSendGrid(opts: { to: string; subject: string; text: string; html: string; trackingId: string }): Promise<SendGridResult> {
   const apiKey = Deno.env.get("SENDGRID_API_KEY");
   if (!apiKey) return { status: "failed", providerId: null, error: "SENDGRID_API_KEY is not configured." };
@@ -88,40 +80,36 @@ Deno.serve(async (req) => {
   } catch {
     return json({ error: "The request body was not valid JSON." }, 400);
   }
-  const buyerId = body.buyerId as string | undefined;
+  const vendorId = body.vendorId as string | undefined;
   const subject = typeof body.subject === "string" ? body.subject.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
-  if (!buyerId) return json({ error: "buyerId is required." }, 400);
+  if (!vendorId) return json({ error: "vendorId is required." }, 400);
   if (!subject || !message) return json({ error: "subject and message are required." }, 400);
 
   const admin = createClient(supabaseUrl, serviceRoleKey);
 
+  const { data: buyer, error: buyerError } = await admin
+    .from("buyers")
+    .select("id, email, contact_name, company_name")
+    .eq("email", email)
+    .maybeSingle();
+  if (buyerError || !buyer) return json({ error: "No buyer account is linked to this login yet." }, 403);
+
   const { data: vendor, error: vendorError } = await admin
     .from("vendors")
     .select("id, email, company_name")
-    .eq("email", email)
+    .eq("id", vendorId)
     .maybeSingle();
-  if (vendorError || !vendor) return json({ error: "No vendor account is linked to this login yet." }, 403);
-
-  const { data: buyer, error: buyerError } = await admin
-    .from("buyers")
-    .select("id, email, contact_name, company_name, engagement_status")
-    .eq("id", buyerId)
-    .maybeSingle();
-  if (buyerError || !buyer) return json({ error: "Buyer not found." }, 404);
-
-  if (buyer.engagement_status === "closed") {
-    return json({ error: "This buyer has closed their vendor search — outreach is disabled." }, 403);
-  }
+  if (vendorError || !vendor) return json({ error: "Vendor not found." }, 404);
 
   let emailStatus: "not_sent" | "sent" | "failed" | "skipped_no_email" = "skipped_no_email";
   let emailProviderId: string | null = null;
   let emailError: string | null = null;
 
-  if (buyer.email) {
-    const html = `<p>${escapeHtml(message).replace(/\n/g, "<br>")}</p><p style="color:#888;font-size:12px;margin-top:24px;">Sent via Deckless Pitch on behalf of ${escapeHtml(vendor.company_name)}.</p>`;
+  if (vendor.email) {
+    const html = `<p>${escapeHtml(message).replace(/\n/g, "<br>")}</p><p style="color:#888;font-size:12px;margin-top:24px;">Sent via Deckless Pitch on behalf of ${escapeHtml(buyer.company_name)}.</p>`;
     const trackingId = crypto.randomUUID();
-    const result = await sendViaSendGrid({ to: buyer.email, subject, text: message, html, trackingId });
+    const result = await sendViaSendGrid({ to: vendor.email, subject, text: message, html, trackingId });
     if (result.error === "SENDGRID_API_KEY is not configured." || result.error === "SENDGRID_FROM_EMAIL is not configured.") {
       emailStatus = "not_sent";
     } else {
@@ -132,14 +120,14 @@ Deno.serve(async (req) => {
   }
 
   const { data: inserted, error: insertError } = await admin
-    .from("vendor_outreach_events")
+    .from("buyer_outreach_events")
     .insert({
-      vendor_id: vendor.id,
       buyer_id: buyer.id,
+      vendor_id: vendor.id,
       channel: "email",
       subject,
       message,
-      contact_email: buyer.email,
+      contact_email: vendor.email,
       sent_by_email: email,
       email_status: emailStatus,
       email_provider_id: emailProviderId,
@@ -153,9 +141,9 @@ Deno.serve(async (req) => {
     logged: true,
     id: inserted.id,
     createdAt: inserted.created_at,
-    buyerEmail: buyer.email,
-    buyerContactName: buyer.contact_name,
+    vendorEmail: vendor.email,
     vendorCompanyName: vendor.company_name,
+    buyerCompanyName: buyer.company_name,
     emailStatus: inserted.email_status,
     emailProviderId: inserted.email_provider_id,
     emailError: inserted.email_error,

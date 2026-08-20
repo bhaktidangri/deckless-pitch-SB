@@ -1,9 +1,27 @@
 "use client";
 
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "motion/react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+// `position: fixed` resolves against the nearest ancestor with an active
+// transform/filter/backdrop-filter/perspective/will-change, not always the
+// viewport — a real CSS containing-block rule, not a bug in the fixed
+// elements below. Both Drawer and Modal render `fixed inset-0` overlays, so
+// if either ever gets triggered from inside an element with one of those
+// properties (e.g. a sticky header using `backdrop-blur`, as
+// PortalShell's does), the whole overlay collapses into that ancestor's box
+// instead of covering the viewport — pinned near it and clipped/overflowing
+// instead of centered full-screen, with the backdrop dimming only that tiny
+// box instead of the page. Portaling to document.body sidesteps this
+// regardless of where the trigger happens to live in the tree.
+function usePortalReady() {
+  const [ready, setReady] = React.useState(false);
+  React.useEffect(() => setReady(true), []);
+  return ready;
+}
 
 export function Drawer({
   open,
@@ -33,7 +51,8 @@ export function Drawer({
     };
   }, [open, onClose]);
 
-  return (
+  const portalReady = usePortalReady();
+  const content = (
     <AnimatePresence>
       {open && (
         <>
@@ -76,6 +95,7 @@ export function Drawer({
       )}
     </AnimatePresence>
   );
+  return portalReady ? createPortal(content, document.body) : null;
 }
 
 export function Modal({
@@ -102,7 +122,8 @@ export function Modal({
     };
   }, [open, onClose]);
 
-  return (
+  const portalReady = usePortalReady();
+  const content = (
     <AnimatePresence>
       {open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -119,20 +140,26 @@ export function Modal({
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96, y: 8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className={cn("relative z-10 max-h-[85vh] overflow-y-auto rounded-2xl border border-border bg-surface p-6 shadow-2xl", widthClassName)}
+            className={cn("relative z-10 flex max-h-[85vh] flex-col overflow-hidden rounded-2xl border border-border bg-surface p-6 shadow-2xl", widthClassName)}
           >
             {title && (
-              <div className="mb-4 flex items-center justify-between">
+              <div className="mb-4 flex shrink-0 items-center justify-between">
                 <h2 className="text-lg font-semibold text-foreground">{title}</h2>
                 <button onClick={onClose} className="rounded-lg p-1.5 text-muted hover:bg-surface-2 hover:text-foreground">
                   <X className="h-4 w-4" />
                 </button>
               </div>
             )}
-            {children}
+            {/* min-h-0 is required for a flex child to actually shrink and
+                let its own overflow-y-auto content scroll, instead of the
+                whole card growing past max-h and scrolling as one block —
+                which used to carry the search input/header out of view
+                along with the results once the list got tall. */}
+            <div className="flex min-h-0 flex-1 flex-col">{children}</div>
           </motion.div>
         </div>
       )}
     </AnimatePresence>
   );
+  return portalReady ? createPortal(content, document.body) : null;
 }

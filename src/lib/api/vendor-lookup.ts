@@ -131,6 +131,12 @@ export async function getAllVendors(): Promise<VendorDetailRow[]> {
 
 // ---- buyers (vendor/admin-facing reads) -----------------------------------
 
+// Mirrors account.ts's BuyerEngagementStatus — buyer-controlled deal status.
+// 'closed' means the buyer has stopped taking vendor outreach: enforced
+// server-side in record-vendor-outreach / schedule-meeting-direct, not just
+// a display label, so vendor-facing UI should disable those actions too.
+export type BuyerEngagementStatus = "pending" | "in_progress" | "closed";
+
 export interface LeadBuyerRow {
   id: string;
   companyName: string;
@@ -140,6 +146,7 @@ export interface LeadBuyerRow {
   contactRole: string | null;
   email: string | null;
   createdAt: string;
+  engagementStatus: BuyerEngagementStatus;
 }
 
 function mapBuyerRow(row: {
@@ -151,6 +158,7 @@ function mapBuyerRow(row: {
   contact_role: string | null;
   email: string | null;
   created_at: string;
+  engagement_status: BuyerEngagementStatus;
 }): LeadBuyerRow {
   return {
     id: row.id,
@@ -161,10 +169,11 @@ function mapBuyerRow(row: {
     contactRole: row.contact_role,
     email: row.email,
     createdAt: row.created_at,
+    engagementStatus: row.engagement_status,
   };
 }
 
-const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,email,created_at";
+const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,email,created_at,engagement_status";
 
 // Batch lookup by id — used to resolve buyer names/industries for whichever
 // set of buyer_ids a vendor_recommendations/buyer_vendor_selections read
@@ -343,6 +352,46 @@ export interface VendorSideRealityProfileRow {
   goals: string[];
   constraints: string[];
   timelineMonths: number | null;
+}
+
+// Batch version of getRealityProfileForBuyer, for list views (e.g. the
+// vendor-facing buyers list) that need a lightweight "who is this buyer"
+// signal for many rows at once without an N+1 request per card — buyers
+// have no website/description/tagline field (unlike vendors), so goals /
+// pain points captured during onboarding are the closest real substitute
+// for a one-line "about this buyer" summary.
+export async function getRealityProfilesForBuyers(buyerIds: string[]): Promise<Record<string, VendorSideRealityProfileRow>> {
+  const unique = Array.from(new Set(buyerIds)).filter(Boolean);
+  if (unique.length === 0) return {};
+  const params = new URLSearchParams({
+    select: "buyer_id,current_technology,current_cost_annual,users,pain_points,goals,constraints,timeline_months",
+    buyer_id: `in.(${unique.join(",")})`,
+  });
+  const rows = await restGet<
+    {
+      buyer_id: string;
+      current_technology: string[] | null;
+      current_cost_annual: number | null;
+      users: number | null;
+      pain_points: string[] | null;
+      goals: string[] | null;
+      constraints: string[] | null;
+      timeline_months: number | null;
+    }[]
+  >(`client_reality_profiles?${params}`);
+  const byId: Record<string, VendorSideRealityProfileRow> = {};
+  for (const row of rows) {
+    byId[row.buyer_id] = {
+      currentTechnology: row.current_technology ?? [],
+      currentCostAnnual: row.current_cost_annual,
+      users: row.users,
+      painPoints: row.pain_points ?? [],
+      goals: row.goals ?? [],
+      constraints: row.constraints ?? [],
+      timelineMonths: row.timeline_months,
+    };
+  }
+  return byId;
 }
 
 export async function getRealityProfileForBuyer(buyerId: string): Promise<VendorSideRealityProfileRow | null> {

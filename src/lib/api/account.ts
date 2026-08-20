@@ -47,12 +47,20 @@ export function linkVendorAccount(vendorId: string): Promise<{ linked: boolean; 
   return callAuthedFunction("link-vendor-account", { vendorId });
 }
 
+// The buyer's own deal-status control — 'pending' (default, open to vendor
+// outreach), 'in_progress' (actively evaluating a vendor), 'closed' (deal
+// done). Enforced server-side: record-vendor-outreach and
+// schedule-meeting-direct both reject with 403 once a buyer is 'closed', so
+// this isn't just a display label.
+export type BuyerEngagementStatus = "pending" | "in_progress" | "closed";
+
 export interface UpdateBuyerProfileInput {
   companyName?: string;
   industry?: string;
   companySize?: number;
   contactName?: string;
   contactRole?: string;
+  engagementStatus?: BuyerEngagementStatus;
 }
 
 export interface BuyerProfile {
@@ -63,6 +71,7 @@ export interface BuyerProfile {
   contactName: string | null;
   contactRole: string | null;
   email: string | null;
+  engagementStatus: BuyerEngagementStatus;
 }
 
 export function updateBuyerProfile(input: UpdateBuyerProfileInput): Promise<BuyerProfile> {
@@ -164,4 +173,65 @@ export interface ScheduledMeeting {
 // client-side as a fallback.
 export function scheduleMeetingDirect(input: ScheduleMeetingInput): Promise<ScheduledMeeting> {
   return callAuthedFunction<ScheduledMeeting>("schedule-meeting-direct", input);
+}
+
+// ---- reverse direction: buyer -> vendor (from /buyer/chat) ---------------
+
+export interface RecordBuyerOutreachInput {
+  vendorId: string;
+  subject: string;
+  message: string;
+}
+
+export interface RecordedBuyerOutreach {
+  logged: boolean;
+  id: string;
+  createdAt: string;
+  vendorEmail: string | null;
+  vendorCompanyName: string;
+  buyerCompanyName: string;
+  emailStatus: EmailDeliveryStatus;
+  emailProviderId: string | null;
+  emailError: string | null;
+}
+
+// Mirrors recordVendorOutreach but buyer-initiated — lets a buyer email a
+// particular vendor directly from Ask AI instead of only ever being
+// contacted by vendors. Logs to buyer_outreach_events (kept separate from
+// vendor_outreach_events so the vendor dashboard's "Outreach sent" stat
+// isn't corrupted by outreach it didn't send) and, when SENDGRID_API_KEY is
+// configured server-side, actually sends it via SendGrid.
+export function recordBuyerOutreach(input: RecordBuyerOutreachInput): Promise<RecordedBuyerOutreach> {
+  return callAuthedFunction<RecordedBuyerOutreach>("record-buyer-outreach", input);
+}
+
+export interface ScheduleMeetingWithVendorInput {
+  vendorId: string;
+  meetingRequestId?: string;
+  title: string;
+  proposedDate: string;
+  durationMinutes?: number;
+  meetingLink?: string;
+  notes?: string;
+}
+
+export interface ScheduledMeetingWithVendor {
+  meetingRequestId: string;
+  status: string;
+  proposedDate: string;
+  title: string | null;
+  notes: string | null;
+  meetingLink: string | null;
+  durationMinutes: number;
+  vendorEmail: string | null;
+  vendorCompanyName: string;
+  buyerCompanyName: string;
+  inviteEmailStatus: EmailDeliveryStatus;
+  inviteEmailError: string | null;
+}
+
+// Mirrors scheduleMeetingDirect but buyer-initiated — lets a buyer directly
+// schedule (or reschedule) a meeting with a particular vendor from Ask AI.
+export function scheduleMeetingWithVendor(input: ScheduleMeetingWithVendorInput): Promise<ScheduledMeetingWithVendor> {
+  return callAuthedFunction<ScheduledMeetingWithVendor>("buyer-schedule-meeting", input);
 }

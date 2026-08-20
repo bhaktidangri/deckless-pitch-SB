@@ -39,6 +39,42 @@ export class YoxaTriggerError extends Error {
   }
 }
 
+// A 20s timeout plus one retry on network-level failure (fetch throwing
+// before any HTTP response comes back — DNS/connection reset, not a Yoxa
+// rejection) since that class of error has shown up as a transient blip
+// reaching yoxa.ai, not a real outage. Logs the underlying cause server-side
+// either way — the previous swallow-into-one-generic-message behavior made
+// this kind of blip indistinguishable from a real config/outage problem.
+async function fetchTriggerWithRetry(url: string, secret: string, triggerText: string): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Yoxa-Deployment-Secret": secret,
+          "Idempotency-Key": crypto.randomUUID(),
+        },
+        body: JSON.stringify({ trigger_text: triggerText }),
+        signal: controller.signal,
+      });
+      return res;
+    } catch (err) {
+      lastErr = err;
+      console.error(`[yoxa-trigger] attempt ${attempt} failed reaching ${url}:`, err);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw new YoxaTriggerError(
+    `Could not reach the Yoxa workflow trigger.${lastErr instanceof Error ? ` (${lastErr.message})` : ""}`,
+    502
+  );
+}
+
 export async function triggerVendorSourceSubmission(triggerText: string): Promise<TriggerVendorSourceSubmissionResult> {
   const deploymentId = process.env.YOXA_WORKFLOW_DEPLOYMENT_ID;
   const secret = process.env.YOXA_DEPLOYMENT_SECRET;
@@ -49,20 +85,7 @@ export async function triggerVendorSourceSubmission(triggerText: string): Promis
     );
   }
 
-  let res: Response;
-  try {
-    res = await fetch(`${YOXA_API_BASE}/workflow-deployments/${deploymentId}/trigger`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Yoxa-Deployment-Secret": secret,
-        "Idempotency-Key": crypto.randomUUID(),
-      },
-      body: JSON.stringify({ trigger_text: triggerText }),
-    });
-  } catch {
-    throw new YoxaTriggerError("Could not reach the Yoxa workflow trigger.", 502);
-  }
+  const res = await fetchTriggerWithRetry(`${YOXA_API_BASE}/workflow-deployments/${deploymentId}/trigger`, secret, triggerText);
 
   const data = await res.json().catch(() => ({}) as Record<string, unknown>);
   if (!res.ok || !data.accepted) {

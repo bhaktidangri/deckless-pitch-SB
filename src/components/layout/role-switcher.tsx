@@ -52,7 +52,9 @@ export function RoleSwitcher({
         </div>
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold text-foreground">{active.label}</p>
-          <p className="truncate text-xs text-muted">{activeSub}</p>
+          <p className="text-xs leading-snug text-muted" title={activeSub}>
+            {activeSub}
+          </p>
         </div>
         <ChevronsUpDown className="h-4 w-4 shrink-0 text-subtle" />
       </button>

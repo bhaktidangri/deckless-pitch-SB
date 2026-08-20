@@ -114,7 +114,7 @@ export default function VendorDashboardPage() {
         <PageHeader eyebrow="Vendor" title="Vendor Dashboard" description="Register your solution first." />
         <Card className="max-w-md p-6 text-center">
           <p className="text-sm text-muted">No vendor session found in this browser yet.</p>
-          <Link href="/vendor/onboarding" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
+          <Link href="/vendor/profile" className={cn(buttonVariants({ variant: "primary" }), "mt-4")}>
             Submit sources
           </Link>
         </Card>

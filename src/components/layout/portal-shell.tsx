@@ -95,7 +95,9 @@ export function PortalShell({
         <div className="flex items-center gap-2.5 rounded-xl p-2">
           <Avatar name={userName} size="sm" />
           <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium text-foreground">{userName}</p>
+            <p className="text-sm font-medium leading-snug text-foreground" title={userName}>
+              {userName}
+            </p>
             <p className="truncate text-xs text-muted">{userRole}</p>
           </div>
           <button

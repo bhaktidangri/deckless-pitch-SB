@@ -9,8 +9,9 @@
 // the vendors page already calls), so a buyer can explore what's out there
 // before or independent of their own recommendation list.
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { AnimatePresence, motion } from "motion/react";
-import { Building2, ChevronDown, Loader2, Search, Sparkles, Wand2 } from "lucide-react";
+import { ArrowUpRight, Building2, ChevronDown, Loader2, Search, Sparkles, Wand2 } from "lucide-react";
 import { Modal } from "@/components/ui/drawer";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -146,7 +147,7 @@ export function GlobalCapabilitySearch() {
       </button>
 
       <Modal open={open} onClose={() => setOpen(false)} widthClassName="w-full max-w-2xl">
-        <div className="flex items-center gap-2 border-b border-border pb-4">
+        <div className="flex shrink-0 items-center gap-2 border-b border-border pb-4">
           <Search className="h-4 w-4 shrink-0 text-subtle" />
           <Input
             autoFocus
@@ -158,7 +159,7 @@ export function GlobalCapabilitySearch() {
           {semanticLoading && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-subtle" />}
         </div>
 
-        <div className="mt-3 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
+        <div className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {loading && (
             <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted">
               <Loader2 className="h-4 w-4 animate-spin" /> Loading the capability catalog…
@@ -178,20 +179,31 @@ export function GlobalCapabilitySearch() {
               const isExpanded = expandedId === vendor.vendorId;
               return (
                 <div key={vendor.vendorId} className="rounded-xl border border-border bg-surface-2/60">
-                  <button
-                    onClick={() => setExpandedId(isExpanded ? null : vendor.vendorId)}
-                    className="flex w-full items-center gap-3 p-3.5 text-left"
-                  >
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-accent-500 text-xs font-bold text-white">
+                  <div className="flex w-full items-center gap-3 p-3.5">
+                    <Link
+                      href={`/buyer/vendors/${vendor.vendorId}`}
+                      onClick={() => setOpen(false)}
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-accent-500 text-xs font-bold text-white"
+                    >
                       {vendor.companyName.slice(0, 2).toUpperCase()}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-semibold text-foreground">{vendor.companyName}</p>
+                    </Link>
+                    <Link href={`/buyer/vendors/${vendor.vendorId}`} onClick={() => setOpen(false)} className="group min-w-0 flex-1">
+                      <p className="flex items-center gap-1 truncate text-sm font-semibold text-foreground group-hover:text-brand-600 dark:group-hover:text-brand-400">
+                        <span className="truncate">{vendor.companyName}</span>
+                        <ArrowUpRight className="h-3 w-3 shrink-0 text-subtle transition-colors group-hover:text-brand-500" />
+                      </p>
                       <p className="truncate text-xs text-muted">{vendor.tagline ?? vendor.industry ?? "Vendor"}</p>
-                    </div>
+                    </Link>
                     <span className="shrink-0 text-xs text-subtle">{matchingCapabilities.length} match{matchingCapabilities.length === 1 ? "" : "es"}</span>
-                    <ChevronDown className={cn("h-4 w-4 shrink-0 text-subtle transition-transform", isExpanded && "rotate-180")} />
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedId(isExpanded ? null : vendor.vendorId)}
+                      aria-label={isExpanded ? "Collapse capabilities" : "Expand capabilities"}
+                      className="shrink-0 rounded-lg p-1 text-subtle hover:bg-surface hover:text-foreground"
+                    >
+                      <ChevronDown className={cn("h-4 w-4 transition-transform", isExpanded && "rotate-180")} />
+                    </button>
+                  </div>
 
                   {!isExpanded && (
                     <div className="flex flex-wrap gap-1.5 px-3.5 pb-3.5">
@@ -246,7 +258,7 @@ export function GlobalCapabilitySearch() {
         </div>
 
         {!loading && !error && vendors && (
-          <p className="mt-3 flex items-center gap-1.5 border-t border-border pt-3 text-[11px] text-subtle">
+          <p className="mt-3 flex shrink-0 items-center gap-1.5 border-t border-border pt-3 text-[11px] text-subtle">
             <Building2 className="h-3 w-3" /> Searching {vendors.length} published vendor{vendors.length === 1 ? "" : "s"} and their full Solution DNA
             {q.length >= 3 && (
               <>

@@ -13,8 +13,11 @@ export const POLL_TIMEOUT_MS = 3 * 60 * 1000;
 // Milestone 2 now runs unattended end-to-end (query -> decide -> publish ->
 // generate PPTX), so the knowledge-deck poll gets a longer budget than the
 // draft-capability polls above — there's more agent work happening per tick
-// with nothing for the vendor to do but wait.
-export const KNOWLEDGE_POLL_TIMEOUT_MS = 6 * 60 * 1000;
+// with nothing for the vendor to do but wait. Capped at 4 minutes: once
+// capabilities have actually landed in Supabase with a real
+// verificationStatus, the "deciding/publishing" UI stops claiming that's
+// still in progress regardless of whether the PPTX itself has finished.
+export const KNOWLEDGE_POLL_TIMEOUT_MS = 4 * 60 * 1000;
 
 export interface PollHandle {
   cancel: () => void;

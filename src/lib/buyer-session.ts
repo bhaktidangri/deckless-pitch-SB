@@ -159,3 +159,22 @@ export function getStoredBuyerWorkflowRunIds(): string[] {
     return [];
   }
 }
+
+// Once use-agent-status.ts has confirmed real final output exists for a
+// buyer (an active solution model or a ready deck — see that hook's own
+// header comment on why those are the one trustworthy signal), that fact is
+// durable and can never become false again for this buyer. Persisting it
+// here lets every page's useEffect check synchronously on mount, before the
+// real network refresh even starts, so navigating back to a page never
+// flashes "still working" while re-confirming what's already known.
+const SOLUTION_COMPLETE_PREFIX = "deckless-pitch:solution-complete:";
+
+export function isSolutionMarkedComplete(buyerId: string): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(SOLUTION_COMPLETE_PREFIX + buyerId) === "1";
+}
+
+export function markSolutionComplete(buyerId: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(SOLUTION_COMPLETE_PREFIX + buyerId, "1");
+}

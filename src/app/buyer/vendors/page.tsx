@@ -13,13 +13,16 @@ import { LoadingState } from "@/components/shared/loading-state";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+import { EngagementStatusControl } from "@/components/shared/engagement-status";
 import { Globe, ArrowUpRight } from "lucide-react";
 import {
   getActiveVendorSelection,
+  getBuyer,
   getVendorRecommendations,
   type VendorRecommendationRow,
 } from "@/lib/api/buyer-lookup";
 import { queryPublishedVendorSolutionDna, type PublishedVendor } from "@/lib/api/buyer-vendor-dna";
+import { updateBuyerProfile, type BuyerEngagementStatus } from "@/lib/api/account";
 import { getStoredBuyerWorkflowRunIds, setStoredSelectedVendor } from "@/lib/buyer-session";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
@@ -59,6 +62,8 @@ export default function BuyerVendorsPage() {
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [view, setView] = useState<"recommended" | "all">("recommended");
+  const [engagementStatus, setEngagementStatus] = useState<BuyerEngagementStatus>("pending");
+  const [statusSaving, setStatusSaving] = useState(false);
 
   const selection = usePendingApproval("confirm_vendor_selection", {
     buyerId,
@@ -72,12 +77,14 @@ export default function BuyerVendorsPage() {
       return;
     }
     try {
-      const [recs, dna, active] = await Promise.all([
+      const [recs, dna, active, buyer] = await Promise.all([
         getVendorRecommendations(buyerId),
         queryPublishedVendorSolutionDna().catch(() => null),
         getActiveVendorSelection(buyerId),
+        getBuyer(buyerId).catch(() => null),
       ]);
       setRecommendations(recs);
+      if (buyer) setEngagementStatus(buyer.engagementStatus);
       if (dna) setVendorsById(Object.fromEntries(dna.vendors.map((v) => [v.vendorId, v])));
       if (active) {
         setActiveVendorId(active.vendorId);
@@ -110,6 +117,19 @@ export default function BuyerVendorsPage() {
   async function choose(optionId: string) {
     await selection.respond({ optionId });
     setTimeout(refresh, 1500);
+  }
+
+  async function handleStatusChange(next: BuyerEngagementStatus) {
+    const prev = engagementStatus;
+    setEngagementStatus(next);
+    setStatusSaving(true);
+    try {
+      await updateBuyerProfile({ engagementStatus: next });
+    } catch {
+      setEngagementStatus(prev);
+    } finally {
+      setStatusSaving(false);
+    }
   }
 
   const filteredRecommendations = useMemo(() => {
@@ -163,6 +183,18 @@ export default function BuyerVendorsPage() {
         title="Recommended vendors"
         description="Ranked by fit score against your captured requirements, using only verified or modelled vendor capabilities."
       />
+
+      {!loading && (
+        <Card className="mb-6">
+          <CardContent className="flex flex-col gap-3 pt-5 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-foreground">Vendor outreach status</p>
+              <p className="text-xs text-muted">Control whether vendors browsing this catalog can still email or schedule meetings with you.</p>
+            </div>
+            <EngagementStatusControl status={engagementStatus} onChange={handleStatusChange} saving={statusSaving} />
+          </CardContent>
+        </Card>
+      )}
 
       {activeVendorId ? (
         <Card className="mb-6 border-verified-border bg-verified-bg">

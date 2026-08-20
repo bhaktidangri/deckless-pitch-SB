@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import {
   LayoutDashboard,
-  UploadCloud,
   Dna,
   Users,
   FileSearch,
@@ -12,7 +11,7 @@ import {
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getFrontierCountForVendor } from "@/lib/api/vendor-lookup";
-import { getStoredVendorId, getStoredVendorName } from "@/lib/vendor-session";
+import { getStoredVendorId, getStoredVendorName, onVendorSessionChanged } from "@/lib/vendor-session";
 import { useRequireAuth } from "@/lib/hooks/use-require-auth";
 import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 import { UserCircle } from "lucide-react";
@@ -23,10 +22,7 @@ const sections: NavSection[] = [
   },
   {
     title: "Solution DNA",
-    items: [
-      { href: "/vendor/onboarding", label: "Submit sources", icon: UploadCloud },
-      { href: "/vendor/solution-dna", label: "Review & publish", icon: Dna },
-    ],
+    items: [{ href: "/vendor/solution-dna", label: "Review & publish", icon: Dna }],
   },
   {
     title: "Engagement",
@@ -59,15 +55,25 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
     [vendorId]
   );
 
+  // Re-reads localStorage whenever another component on this page (e.g. the
+  // profile or solution-dna page linking/loading a vendor after this layout
+  // already mounted) writes a new vendor id/name, so the sidebar doesn't get
+  // stuck showing "No vendor registered" once one actually loads.
   useEffect(() => {
-    const id = getStoredVendorId();
-    setVendorName(getStoredVendorName());
-    setVendorId(id);
-    if (!id) return;
+    const sync = () => {
+      setVendorName(getStoredVendorName());
+      setVendorId(getStoredVendorId());
+    };
+    sync();
+    return onVendorSessionChanged(sync);
+  }, []);
+
+  useEffect(() => {
+    if (!vendorId) return;
     let cancelled = false;
     async function poll() {
       try {
-        const count = await getFrontierCountForVendor(id!);
+        const count = await getFrontierCountForVendor(vendorId!);
         if (!cancelled) setOpenFrontier(count);
       } catch {
         // best-effort — badge just stays hidden
@@ -79,7 +85,7 @@ export default function VendorLayout({ children }: { children: React.ReactNode }
       cancelled = true;
       clearInterval(interval);
     };
-  }, [realtimeBump]);
+  }, [vendorId, realtimeBump]);
 
   const scopedSections = sections.map((section) => ({
     ...section,

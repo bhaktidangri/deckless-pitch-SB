@@ -21,6 +21,7 @@ import {
   type BuyerWorkflowRunRow,
 } from "@/lib/api/buyer-lookup";
 import { POLL_INTERVAL_MS } from "@/lib/buyer-poll";
+import { isSolutionMarkedComplete, markSolutionComplete } from "@/lib/buyer-session";
 import { useRealtimeRefresh } from "@/lib/hooks/use-realtime-refresh";
 
 export type AgentStatus = "idle" | "working" | "needs_input" | "completed";
@@ -79,6 +80,19 @@ export function useAgentStatus(buyerId: string | null | undefined): AgentStatusR
   const [checkedOnce, setCheckedOnce] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Synchronous, client-only check (inside an effect, not a useState
+  // initializer, so there's no SSR/hydration mismatch risk) — if a previous
+  // mount already confirmed completion for this buyer, reflect that
+  // instantly instead of waiting on the real network refresh below, so
+  // switching pages never flashes "still working" for something already
+  // known to be done.
+  useEffect(() => {
+    if (buyerId && isSolutionMarkedComplete(buyerId)) {
+      setHasFinalOutput(true);
+      setCheckedOnce(true);
+    }
+  }, [buyerId]);
+
   const refresh = useCallback(async () => {
     if (!buyerId) return;
     try {
@@ -90,7 +104,9 @@ export function useAgentStatus(buyerId: string | null | undefined): AgentStatusR
       ]);
       setApproval((prev) => (prev?.requestId === found?.requestId ? prev : found));
       setRun((prev) => (prev?.id === latestRun?.id && prev?.status === latestRun?.status ? prev : latestRun));
-      setHasFinalOutput(Boolean(activeModel) || latestDeck?.status === "ready");
+      const complete = Boolean(activeModel) || latestDeck?.status === "ready";
+      setHasFinalOutput(complete);
+      if (complete) markSolutionComplete(buyerId);
     } catch {
       // transient read error — next tick tries again
     } finally {

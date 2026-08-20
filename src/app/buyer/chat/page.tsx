@@ -1,13 +1,36 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { GroundedChatPanel } from "@/components/shared/grounded-chat-panel";
+import { EmailVendorCard } from "@/components/shared/email-vendor-card";
+import { ScheduleVendorMeetingCard } from "@/components/shared/schedule-vendor-meeting-card";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+import { useAuthSession } from "@/lib/hooks/use-auth-session";
+import { getVendorById } from "@/lib/api/vendor-lookup";
 
 export default function BuyerChatPage() {
   const { buyerId, vendorId, vendorName, companyName } = useBuyerSession();
+  const { email: buyerEmail } = useAuthSession();
+  const [vendorEmail, setVendorEmail] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!vendorId) {
+      setVendorEmail(null);
+      return;
+    }
+    let cancelled = false;
+    getVendorById(vendorId)
+      .then((v) => {
+        if (!cancelled) setVendorEmail(v?.email ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [vendorId]);
 
   return (
     <div>
@@ -45,6 +68,26 @@ export default function BuyerChatPage() {
               </p>
             </CardContent>
           </Card>
+
+          {buyerId && vendorId && (
+            <>
+              <ScheduleVendorMeetingCard
+                buyerId={buyerId}
+                vendorId={vendorId}
+                vendorCompanyName={vendorName ?? "Vendor"}
+                vendorEmail={vendorEmail}
+                buyerCompanyName={companyName ?? "Us"}
+                buyerEmail={buyerEmail}
+              />
+              <EmailVendorCard
+                buyerId={buyerId}
+                vendorId={vendorId}
+                vendorCompanyName={vendorName ?? "Vendor"}
+                vendorEmail={vendorEmail}
+                buyerCompanyName={companyName ?? "Us"}
+              />
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -41,9 +41,9 @@ function CallbackInner() {
         } else if (result.vendor) {
           setStoredVendorId(result.vendor.id);
           setStoredVendorName(result.vendor.companyName);
-          router.replace("/vendor");
+          router.replace("/vendor/profile");
         } else if (roleHint === "vendor") {
-          router.replace("/vendor/onboarding");
+          router.replace("/vendor/profile");
         } else {
           router.replace("/buyer/discover");
         }

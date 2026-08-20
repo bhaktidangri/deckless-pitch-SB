@@ -1,14 +1,12 @@
-// Lets a vendor directly schedule (or reschedule) a meeting with a buyer,
-// instead of only being able to confirm a buyer-initiated 'requested' row
-// (see confirm-vendor-discussion-meeting). Writes status='scheduled' plus
-// title/notes/duration/meeting_link straight away and, when SENDGRID_API_KEY
-// is configured, sends the buyer a real invite email with a .ics attachment
-// via SendGrid — tracked on the same row via the invite_email_* columns from
-// the email_delivery_tracking migration. Falls back to leaving
-// invite_email_status "not_sent" (no API key yet) so the frontend's
-// mailto:/downloadIcs fallback still has somewhere to land. Caller must be
-// the authenticated vendor (verified by email), mirroring
-// record-vendor-outreach.
+// Reverse direction of schedule-meeting-direct: lets a logged-in buyer
+// directly schedule (or reschedule) a meeting with a particular vendor from
+// /buyer/chat (Ask AI), instead of only ever being scheduled BY vendors.
+// Writes the same meeting_requests table (buyer_id/vendor_id, no direction
+// column needed since a meeting is inherently between exactly one of each)
+// with status='scheduled' straight away, and sends the vendor a real invite
+// email with a .ics attachment via SendGrid when configured. Caller must be
+// the authenticated buyer (verified by email, never a client-supplied id),
+// mirroring schedule-meeting-direct.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -24,9 +22,6 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Ports src/lib/ics.ts's buildIcsContent verbatim (Deno can't import
-// browser-oriented app source directly) — keep the two in sync if the
-// .ics shape ever changes.
 function toIcsDate(iso: string): string {
   return new Date(iso).toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 }
@@ -67,7 +62,6 @@ function buildIcsContent(event: {
   return lines.join("\r\n");
 }
 
-// UTF-8-safe base64 — SendGrid attachments require base64 `content`.
 function toBase64(text: string): string {
   const bytes = new TextEncoder().encode(text);
   let binary = "";
@@ -81,11 +75,6 @@ interface SendGridResult {
   error: string | null;
 }
 
-// SendGrid's /mail/send returns 202 with no body, so there's no message id
-// to key off of the way Resend's response gave one. Instead we mint our own
-// tracking id up front and pass it through as a custom_args entry, which
-// SendGrid echoes back verbatim on every delivery/open/click webhook event
-// for this message — see record-email-delivery-event, which matches on it.
 async function sendInviteViaSendGrid(opts: {
   to: string;
   subject: string;
@@ -149,36 +138,32 @@ Deno.serve(async (req) => {
   } catch {
     return json({ error: "The request body was not valid JSON." }, 400);
   }
-  const buyerId = body.buyerId as string | undefined;
+  const vendorId = body.vendorId as string | undefined;
   const meetingRequestId = body.meetingRequestId as string | undefined;
   const proposedDate = typeof body.proposedDate === "string" ? body.proposedDate : "";
   const title = typeof body.title === "string" ? body.title.trim() : "";
   const notes = typeof body.notes === "string" ? body.notes.trim() : "";
   const meetingLink = typeof body.meetingLink === "string" ? body.meetingLink.trim() : "";
   const durationMinutes = typeof body.durationMinutes === "number" && body.durationMinutes > 0 ? Math.round(body.durationMinutes) : 30;
-  if (!buyerId) return json({ error: "buyerId is required." }, 400);
+  if (!vendorId) return json({ error: "vendorId is required." }, 400);
   if (!proposedDate || Number.isNaN(new Date(proposedDate).getTime())) return json({ error: "A valid proposedDate is required." }, 400);
   if (!title) return json({ error: "title is required." }, 400);
 
   const admin = createClient(supabaseUrl, serviceRoleKey);
 
+  const { data: buyer, error: buyerError } = await admin
+    .from("buyers")
+    .select("id, email, contact_name, company_name")
+    .eq("email", email)
+    .maybeSingle();
+  if (buyerError || !buyer) return json({ error: "No buyer account is linked to this login yet." }, 403);
+
   const { data: vendor, error: vendorError } = await admin
     .from("vendors")
     .select("id, email, company_name")
-    .eq("email", email)
+    .eq("id", vendorId)
     .maybeSingle();
-  if (vendorError || !vendor) return json({ error: "No vendor account is linked to this login yet." }, 403);
-
-  const { data: buyer, error: buyerError } = await admin
-    .from("buyers")
-    .select("id, email, contact_name, company_name, engagement_status")
-    .eq("id", buyerId)
-    .maybeSingle();
-  if (buyerError || !buyer) return json({ error: "Buyer not found." }, 404);
-
-  if (buyer.engagement_status === "closed") {
-    return json({ error: "This buyer has closed their vendor search — scheduling is disabled." }, 403);
-  }
+  if (vendorError || !vendor) return json({ error: "Vendor not found." }, 404);
 
   const row: Record<string, unknown> = {
     buyer_id: buyer.id,
@@ -197,11 +182,11 @@ Deno.serve(async (req) => {
   if (meetingRequestId) {
     const { data: existing, error: existingError } = await admin
       .from("meeting_requests")
-      .select("id, vendor_id")
+      .select("id, buyer_id")
       .eq("id", meetingRequestId)
       .maybeSingle();
     if (existingError || !existing) return json({ error: "Meeting not found." }, 404);
-    if (existing.vendor_id !== vendor.id) return json({ error: "This meeting belongs to a different vendor." }, 403);
+    if (existing.buyer_id !== buyer.id) return json({ error: "This meeting belongs to a different buyer." }, 403);
     const { data, error } = await admin.from("meeting_requests").update(row).eq("id", meetingRequestId).select("*").single();
     if (error) return json({ error: error.message }, 500);
     meeting = data;
@@ -215,10 +200,10 @@ Deno.serve(async (req) => {
   let inviteProviderId: string | null = null;
   let inviteError: string | null = null;
 
-  if (buyer.email) {
+  if (vendor.email) {
     const when = new Date(proposedDate).toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" });
     const textLines = [
-      `Hi ${buyer.contact_name ?? buyer.company_name} team,`,
+      `Hi ${vendor.company_name} team,`,
       "",
       `We've scheduled a meeting: ${title}`,
       `When: ${when} (${durationMinutes} min)`,
@@ -227,14 +212,14 @@ Deno.serve(async (req) => {
       "",
       `A calendar invite is attached — accept it to add this to your calendar.`,
       "",
-      `— ${vendor.company_name}`,
+      `— ${buyer.company_name}`,
     ].filter(Boolean);
-    const html = `<p>Hi ${escapeHtml(String(buyer.contact_name ?? buyer.company_name))} team,</p>
+    const html = `<p>Hi ${escapeHtml(vendor.company_name)} team,</p>
 <p>We've scheduled a meeting: <strong>${escapeHtml(title)}</strong></p>
 <p>When: ${escapeHtml(when)} (${durationMinutes} min)${meetingLink ? `<br>Join: <a href="${escapeHtml(meetingLink)}">${escapeHtml(meetingLink)}</a>` : ""}</p>
 ${notes ? `<p>${escapeHtml(notes).replace(/\n/g, "<br>")}</p>` : ""}
 <p>A calendar invite is attached — accept it to add this to your calendar.</p>
-<p style="color:#888;font-size:12px;margin-top:24px;">Sent via Deckless Pitch on behalf of ${escapeHtml(vendor.company_name as string)}.</p>`;
+<p style="color:#888;font-size:12px;margin-top:24px;">Sent via Deckless Pitch on behalf of ${escapeHtml(buyer.company_name)}.</p>`;
 
     const icsContent = buildIcsContent({
       uid: `${meeting.id}@deckless-pitch`,
@@ -243,12 +228,12 @@ ${notes ? `<p>${escapeHtml(notes).replace(/\n/g, "<br>")}</p>` : ""}
       location: meetingLink || undefined,
       startIso: proposedDate,
       durationMinutes,
-      organizerEmail: vendor.email,
-      attendeeEmail: buyer.email,
+      organizerEmail: buyer.email,
+      attendeeEmail: vendor.email,
     });
 
     const result = await sendInviteViaSendGrid({
-      to: buyer.email,
+      to: vendor.email,
       subject: title,
       text: textLines.join("\n"),
       html,
@@ -285,10 +270,9 @@ ${notes ? `<p>${escapeHtml(notes).replace(/\n/g, "<br>")}</p>` : ""}
     notes: meeting.notes,
     meetingLink: meeting.meeting_link,
     durationMinutes: meeting.duration_minutes,
-    buyerEmail: buyer.email,
-    buyerContactName: buyer.contact_name,
-    buyerCompanyName: buyer.company_name,
+    vendorEmail: vendor.email,
     vendorCompanyName: vendor.company_name,
+    buyerCompanyName: buyer.company_name,
     inviteEmailStatus: meeting.invite_email_status,
     inviteEmailError: meeting.invite_email_error,
   });

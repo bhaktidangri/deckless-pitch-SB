@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Building2, CalendarClock, FileSearch, TrendingUp, User } from "lucide-react";
+import { Building2, CalendarClock, FileSearch, Lock, TrendingUp, User } from "lucide-react";
+import { EngagementStatusBadge } from "@/components/shared/engagement-status";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -150,9 +151,12 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
         description={`${buyer.industry ?? "Industry unknown"}${buyer.companySize ? ` · ${formatNumber(buyer.companySize)} users` : ""} · Engaged since ${new Date(buyer.createdAt).toLocaleDateString()}`}
         backHref="/vendor/buyers"
         actions={
-          <Link href="/vendor/meetings" className={cn(buttonVariants({ variant: "primary" }))}>
-            <CalendarClock className="h-4 w-4" /> Prepare handoff
-          </Link>
+          <div className="flex items-center gap-3">
+            <EngagementStatusBadge status={buyer.engagementStatus} />
+            <Link href="/vendor/meetings" className={cn(buttonVariants({ variant: "primary" }))}>
+              <CalendarClock className="h-4 w-4" /> Prepare handoff
+            </Link>
+          </div>
         }
       />
 
@@ -227,25 +231,39 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
             </CardContent>
           </Card>
 
-          {vendorId && (
-            <ScheduleMeetingCard
-              vendorId={vendorId}
-              buyerId={buyer.id}
-              buyerCompanyName={buyer.companyName}
-              buyerEmail={buyer.email}
-              vendorCompanyName={vendor?.companyName ?? "Us"}
-              vendorEmail={vendor?.email ?? null}
-            />
-          )}
+          {buyer.engagementStatus === "closed" ? (
+            <Card className="border-escalated-border bg-escalated-bg">
+              <CardContent className="flex items-start gap-3 pt-5">
+                <Lock className="mt-0.5 h-4 w-4 shrink-0 text-escalated" />
+                <div>
+                  <p className="text-sm font-medium text-foreground">This buyer has closed their vendor search</p>
+                  <p className="mt-1 text-xs text-muted">Their deal is done — email and meeting scheduling are disabled for this buyer.</p>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <>
+              {vendorId && (
+                <ScheduleMeetingCard
+                  vendorId={vendorId}
+                  buyerId={buyer.id}
+                  buyerCompanyName={buyer.companyName}
+                  buyerEmail={buyer.email}
+                  vendorCompanyName={vendor?.companyName ?? "Us"}
+                  vendorEmail={vendor?.email ?? null}
+                />
+              )}
 
-          {vendorId && (
-            <EmailBuyerCard
-              vendorId={vendorId}
-              buyerId={buyer.id}
-              buyerCompanyName={buyer.companyName}
-              buyerEmail={buyer.email}
-              vendorCompanyName={vendor?.companyName ?? "Us"}
-            />
+              {vendorId && (
+                <EmailBuyerCard
+                  vendorId={vendorId}
+                  buyerId={buyer.id}
+                  buyerCompanyName={buyer.companyName}
+                  buyerEmail={buyer.email}
+                  vendorCompanyName={vendor?.companyName ?? "Us"}
+                />
+              )}
+            </>
           )}
 
           <Card>

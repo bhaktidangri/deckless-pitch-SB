@@ -4,6 +4,25 @@
 const STORAGE_KEY = "deckless-pitch:vendor-id";
 const NAME_STORAGE_KEY = "deckless-pitch:vendor-name";
 
+// localStorage writes don't trigger re-renders in components that already
+// read it (e.g. vendor/layout.tsx reads getStoredVendorId() once on mount
+// for the sidebar) — the native "storage" event only fires in *other* tabs,
+// not the one that made the write. This custom event lets any component
+// that mutates vendor session state (profile page, solution-dna page, etc.)
+// notify same-tab listeners like the layout's sidebar to re-read and update.
+const VENDOR_SESSION_EVENT = "deckless-pitch:vendor-session-changed";
+
+function notifyVendorSessionChanged() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(VENDOR_SESSION_EVENT));
+}
+
+export function onVendorSessionChanged(callback: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(VENDOR_SESSION_EVENT, callback);
+  return () => window.removeEventListener(VENDOR_SESSION_EVENT, callback);
+}
+
 export function getStoredVendorId(): string | null {
   if (typeof window === "undefined") return null;
   return window.localStorage.getItem(STORAGE_KEY);
@@ -12,12 +31,14 @@ export function getStoredVendorId(): string | null {
 export function setStoredVendorId(vendorId: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(STORAGE_KEY, vendorId);
+  notifyVendorSessionChanged();
 }
 
 export function clearStoredVendorId() {
   if (typeof window === "undefined") return;
   window.localStorage.removeItem(STORAGE_KEY);
   window.localStorage.removeItem(NAME_STORAGE_KEY);
+  notifyVendorSessionChanged();
 }
 
 // Company name of the registered vendor, so the portal shell (nav footer,
@@ -31,6 +52,7 @@ export function getStoredVendorName(): string | null {
 export function setStoredVendorName(companyName: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(NAME_STORAGE_KEY, companyName);
+  notifyVendorSessionChanged();
 }
 
 // A submission the agent hasn't finished yet, persisted so Milestone-1

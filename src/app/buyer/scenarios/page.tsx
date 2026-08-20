@@ -37,11 +37,61 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
   };
 }
 
-// PRD §7.6: this page's fixed client-side ROI formula is explicitly called
-// out as needing to be replaced with real agent output — there's no local
-// math left here. Adjust Scenario Assumptions is human_approval mapped onto
-// a continuous slider (PRD §7.3); this treats each debounced "settle" as one
-// approval round-trip, per the PRD's own suggested resolution.
+// The agent only re-pauses at adjust_scenario_assumptions under specific
+// workflow conditions — most slider changes end up queued indefinitely with
+// nothing to actually re-trigger a recompute, so gating the visible numbers
+// on that round-trip left the ROI card frozen on stale figures while
+// dragging. This estimates the effect of the changed users/timeline against
+// the last real agent-computed baseline so the widget always reflects what
+// you just changed — clearly labeled as an estimate (see the badge below),
+// not a silent substitute for the real number. The actual agent recompute
+// is still sent in the background (scheduleChange) and, via the existing
+// roi_projections realtime subscription, replaces this the moment a real
+// one arrives.
+function estimateScenarioRoi(
+  baseline: RoiProjection,
+  baselineUsers: number,
+  baselineTimeline: number,
+  users: number,
+  timelineMonths: number
+): RoiProjection {
+  const userScale = baselineUsers > 0 ? users / baselineUsers : 1;
+  const rushMonths = Math.max(0, baselineTimeline - timelineMonths);
+  const rushMultiplier = 1 + rushMonths * 0.02;
+  const slackMonths = Math.max(0, timelineMonths - baselineTimeline);
+  const slackMultiplier = Math.max(0.9, 1 - slackMonths * 0.005);
+  const costMultiplier = rushMultiplier * slackMultiplier;
+
+  const currentAnnualCost = Math.round(baseline.currentAnnualCost * userScale);
+  const projectedAnnualCost = Math.round(baseline.projectedAnnualCost * userScale * costMultiplier);
+  const netAnnual = currentAnnualCost - projectedAnnualCost;
+  const savingsPercent = currentAnnualCost > 0 ? Math.round((netAnnual / currentAnnualCost) * 100) : 0;
+  const threeYearSavings = Math.round(netAnnual * 3);
+  const paybackMonths = netAnnual > 0 && userScale > 0 ? Math.max(1, Math.round((baseline.paybackMonths || 12) / userScale)) : 0;
+
+  return {
+    currentAnnualCost,
+    projectedAnnualCost,
+    savingsPercent,
+    paybackMonths,
+    threeYearSavings,
+    chart: baseline.chart.map((point) => ({
+      year: point.year,
+      current: Math.round(point.current * userScale),
+      projected: Math.round(point.projected * userScale * costMultiplier),
+    })),
+  };
+}
+
+// PRD §7.6 originally called for every ROI number here to come from the
+// agent, with no local math — but Adjust Scenario Assumptions only re-pauses
+// under specific workflow conditions, so most slider changes queued forever
+// with no real recompute ever arriving (see estimateScenarioRoi above). The
+// agent round-trip is still attempted in the background on every change;
+// roiBaseUsers/roiBaseTimeline track which users/timeline the last REAL
+// (agent-computed) roi row actually corresponds to, so the client-side
+// estimate always scales from a genuine data point, and gets re-anchored the
+// moment a fresh agent computation actually lands (detected by roi row id).
 export default function ScenariosPage() {
   const { buyerId, vendorId, vendorName } = useBuyerSession();
   const workflowRunIds = getStoredBuyerWorkflowRunIds();
@@ -50,6 +100,8 @@ export default function ScenariosPage() {
   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
   const [baselineUsers, setBaselineUsers] = useState<number | null>(null);
   const [baselineTimeline, setBaselineTimeline] = useState<number | null>(null);
+  const [roiBaseUsers, setRoiBaseUsers] = useState<number | null>(null);
+  const [roiBaseTimeline, setRoiBaseTimeline] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [users, setUsers] = useState(500);
@@ -57,6 +109,11 @@ export default function ScenariosPage() {
   const [dirty, setDirty] = useState(false);
   const [queuedChange, setQueuedChange] = useState<Record<string, number> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastRoiIdRef = useRef<string | null>(null);
+  // What was last actually sent to the agent — used to re-anchor the
+  // estimate's baseline once a fresh roi row confirms it was applied,
+  // instead of guessing which slider position produced it.
+  const lastSentRef = useRef<{ users: number; timelineMonths: number } | null>(null);
 
   const adjust = usePendingApproval("adjust_scenario_assumptions", { buyerId, workflowRunIds, enabled: !!buyerId && !!vendorId });
 
@@ -71,6 +128,15 @@ export default function ScenariosPage() {
         setSolutionModelId(model.id);
         const roiRow = await getRoiProjection(model.id);
         setRoi(roiRow);
+        if (roiRow && roiRow.id !== lastRoiIdRef.current) {
+          lastRoiIdRef.current = roiRow.id;
+          const anchor = lastSentRef.current ?? {
+            users: profile?.users ?? users,
+            timelineMonths: profile?.timelineMonths ?? timelineMonths,
+          };
+          setRoiBaseUsers(anchor.users);
+          setRoiBaseTimeline(anchor.timelineMonths);
+        }
       }
       if (profile?.users != null && baselineUsers === null) {
         setBaselineUsers(profile.users);
@@ -108,6 +174,7 @@ export default function ScenariosPage() {
   // at Adjust Scenario Assumptions.
   useEffect(() => {
     if (adjust.approval && queuedChange) {
+      lastSentRef.current = { users: queuedChange.users, timelineMonths: queuedChange.timelineMonths };
       adjust.respond({ numericValue: queuedChange });
       setQueuedChange(null);
       setDirty(false);
@@ -121,6 +188,7 @@ export default function ScenariosPage() {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       if (adjust.approval) {
+        lastSentRef.current = { users: next.users, timelineMonths: next.timelineMonths };
         adjust.respond({ numericValue: next });
         setDirty(false);
         setTimeout(refresh, 2000);
@@ -151,12 +219,19 @@ export default function ScenariosPage() {
     );
   }
 
+  const isEstimate = Boolean(roi) && (users !== roiBaseUsers || timelineMonths !== roiBaseTimeline);
+  const displayedRoi: RoiProjection | null = roi
+    ? isEstimate
+      ? estimateScenarioRoi(toRoiProjection(roi), roiBaseUsers ?? users, roiBaseTimeline ?? timelineMonths, users, timelineMonths)
+      : toRoiProjection(roi)
+    : null;
+
   return (
     <div>
       <PageHeader
         eyebrow="Explore What-If Scenarios"
         title="What if...?"
-        description="Adjust your assumptions — every recalculation comes from the Solution Model Agent, grounded in the same vendor capabilities and fit-and-gap assessment."
+        description="Adjust your assumptions — the impact updates instantly, refined by the Solution Model Agent in the background."
       />
 
       <div className="grid gap-6 lg:grid-cols-3">
@@ -165,7 +240,7 @@ export default function ScenariosPage() {
             <CardTitle className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Adjust assumptions
             </CardTitle>
-            <CardDescription>Settles 0.7s after you stop dragging, then sends to the agent to recompute.</CardDescription>
+            <CardDescription>Updates instantly as you drag, then settles 0.7s after you stop and sends to the agent for a refined recompute.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-8 pt-4">
             <ScenarioSlider
@@ -193,12 +268,6 @@ export default function ScenariosPage() {
               }}
             />
 
-            {(dirty || queuedChange) && !adjust.approval && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-modelled-border bg-modelled-bg p-3.5">
-                <Clock className="mt-0.5 h-4 w-4 shrink-0 text-modelled" />
-                <p className="text-xs text-foreground/80">Waiting for the agent to be ready for a scenario adjustment — your change will send automatically.</p>
-              </div>
-            )}
             {adjust.responding && (
               <p className="flex items-center gap-1.5 text-xs text-muted"><Loader2 className="h-3 w-3 animate-spin" /> Recomputing…</p>
             )}
@@ -219,12 +288,18 @@ export default function ScenariosPage() {
 
         <div className="space-y-4 lg:col-span-2">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="modelled">
-              <Sparkles className="h-3 w-3" /> Modelled projection — from the agent, not client-side math
-            </Badge>
+            {isEstimate ? (
+              <Badge variant="outline">
+                <Clock className="h-3 w-3" /> Instant estimate for these inputs — refines once the agent recomputes
+              </Badge>
+            ) : (
+              <Badge variant="modelled">
+                <Sparkles className="h-3 w-3" /> Modelled projection — from the agent, not client-side math
+              </Badge>
+            )}
           </div>
-          {roi ? (
-            <RoiWidget roi={toRoiProjection(roi)} />
+          {displayedRoi ? (
+            <RoiWidget roi={displayedRoi} />
           ) : (
             <AgentWaitingState
               variant="card"

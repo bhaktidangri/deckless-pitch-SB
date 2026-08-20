@@ -2,9 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { CheckCircle2, Globe, Sparkles } from "lucide-react";
+import { Building2, CheckCircle2, Globe, Mail, MapPin, Sparkles, Users } from "lucide-react";
 import { BackButton } from "@/components/layout/back-button";
+import { Avatar } from "@/components/ui/avatar";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { StatCard } from "@/components/shared/stat-card";
 import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
 import { CapabilityCard } from "@/components/shared/capability-card";
@@ -16,6 +18,7 @@ import {
   type ApprovedCapability,
   type PublishedVendor,
 } from "@/lib/api/buyer-vendor-dna";
+import { getVendorById, type VendorDetailRow } from "@/lib/api/vendor-lookup";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import type { Capability, SourceType } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -40,6 +43,12 @@ function toCapability(vendorId: string, c: ApprovedCapability): Capability {
 export default function VendorProfilePage({ params }: { params: Promise<{ id: string }> }) {
   const [vendorId, setVendorId] = useState<string | null>(null);
   const [vendor, setVendor] = useState<PublishedVendor | null>(null);
+  // The published Solution DNA snapshot (above) can lag behind edits made on
+  // /vendor/profile since then — this is the live vendors row, used as the
+  // primary source for identity fields (name, tagline, website, HQ, size) so
+  // this page never shows a stale company name after a vendor renames or
+  // updates their profile.
+  const [vendorDetail, setVendorDetail] = useState<VendorDetailRow | null>(null);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [recommendation, setRecommendation] = useState<VendorRecommendationRow | null>(null);
   const [loading, setLoading] = useState(true);
@@ -59,14 +68,16 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
       setLoading(true);
       setError(null);
       try {
-        const [approved, published, recs] = await Promise.all([
+        const [approved, published, recs, detail] = await Promise.all([
           queryApprovedVendorSolutionDna(id),
           queryPublishedVendorSolutionDna().catch(() => null),
           buyerId ? getVendorRecommendations(buyerId) : Promise.resolve([]),
+          getVendorById(id).catch(() => null),
         ]);
         if (cancelled) return;
         setCapabilities(approved.capabilities.map((c) => toCapability(id, c)));
         setVendor(published?.vendors.find((v) => v.vendorId === id) ?? { vendorId: id, companyName: approved.companyName, industry: null, industries: [], tagline: null, description: null, capabilities: [] });
+        setVendorDetail(detail);
         setRecommendation(recs.find((r) => r.vendorId === id) ?? null);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Could not load this vendor.");
@@ -100,56 +111,118 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
     );
   }
 
+  // vendorDetail (the live vendors row) is the source of truth for identity
+  // fields — falls back to the published Solution DNA snapshot only when the
+  // live row hasn't loaded, so a vendor rename/profile edit never shows up
+  // here as a stale name.
+  const companyName = vendorDetail?.companyName ?? vendor.companyName;
+  const tagline = vendorDetail?.tagline ?? vendor.tagline;
+  const industry = vendorDetail?.industry ?? vendor.industry;
+  const industries = vendorDetail?.industries?.length ? vendorDetail.industries : vendor.industries;
+  const description = vendorDetail?.description ?? vendor.description;
+  const website = vendorDetail?.website ?? null;
+  const hq = vendorDetail?.hq ?? null;
+  const employeeRange = vendorDetail?.employeeRange ?? null;
+  const email = vendorDetail?.email ?? null;
+
   return (
     <div>
       <BackButton href="/buyer/vendors" label="Back to vendors" className="mb-4" />
 
-      <div className="mb-8 flex flex-col gap-6 rounded-2xl border border-border bg-surface p-6 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500 to-accent-500 text-xl font-bold text-white">
-            {vendor.companyName.slice(0, 2).toUpperCase()}
-          </div>
-          <div>
-            <h1 className="text-xl font-bold text-foreground sm:text-2xl">{vendor.companyName}</h1>
-            {vendor.tagline && <p className="text-sm text-muted">{vendor.tagline}</p>}
-            {vendor.industry && (
-              <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-subtle">
-                <span className="flex items-center gap-1"><Globe className="h-3.5 w-3.5" /> {vendor.industry}</span>
+      <Card className="mb-6">
+        <CardContent className="pt-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-4">
+              <Avatar name={companyName} size="lg" className="h-16 w-16 shrink-0 text-lg" />
+              <div>
+                <p className="text-lg font-bold text-foreground">{companyName}</p>
+                <p className="text-sm text-muted">{tagline || "No tagline on file yet."}</p>
               </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-3 pb-1">
+              {recommendation?.fitScore != null && (
+                <div className="text-right">
+                  <p className="text-2xl font-bold text-brand-600 dark:text-brand-400">{recommendation.fitScore}%</p>
+                  <p className="text-[10px] uppercase tracking-wide text-subtle">requirement fit</p>
+                </div>
+              )}
+              {isSelected ? (
+                <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
+                  <Sparkles className="h-4 w-4" /> View my solution
+                </Link>
+              ) : (
+                <Link href="/buyer/vendors" className={cn(buttonVariants({ variant: "secondary" }))}>
+                  Confirm this vendor
+                </Link>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-border pt-3 text-xs text-muted">
+            {industry && (
+              <span className="flex items-center gap-1.5">
+                <Building2 className="h-3.5 w-3.5" /> {industry}
+              </span>
+            )}
+            {hq && (
+              <span className="flex items-center gap-1.5">
+                <MapPin className="h-3.5 w-3.5" /> {hq}
+              </span>
+            )}
+            {employeeRange && (
+              <span className="flex items-center gap-1.5">
+                <Users className="h-3.5 w-3.5" /> {employeeRange} employees
+              </span>
+            )}
+            {email && (
+              <span className="flex items-center gap-1.5">
+                <Mail className="h-3.5 w-3.5" /> {email}
+              </span>
+            )}
+            {website && (
+              <a
+                href={website.startsWith("http") ? website : `https://${website}`}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1.5 text-brand-600 hover:underline dark:text-brand-400"
+              >
+                <Globe className="h-3.5 w-3.5" /> {website.replace(/^https?:\/\//, "")}
+              </a>
             )}
           </div>
-        </div>
-        <div className="flex flex-col items-start gap-3 sm:items-end">
-          {recommendation?.fitScore != null && (
-            <div className="text-right">
-              <p className="text-3xl font-bold text-brand-600 dark:text-brand-400">{recommendation.fitScore}%</p>
-              <p className="text-[11px] uppercase tracking-wide text-subtle">requirement fit</p>
-            </div>
-          )}
-          {isSelected ? (
-            <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
-              <Sparkles className="h-4 w-4" /> View my personalized solution
-            </Link>
-          ) : (
-            <Link href="/buyer/vendors" className={cn(buttonVariants({ variant: "secondary" }))}>
-              Confirm this vendor
-            </Link>
-          )}
-        </div>
+        </CardContent>
+      </Card>
+
+      <div className="mb-6 grid gap-4 sm:grid-cols-3">
+        <StatCard label="Published capabilities" value={String(capabilities.length)} icon={Sparkles} tone="brand" index={0} />
+        <StatCard
+          label="Verified capabilities"
+          value={String(capabilities.filter((c) => c.verificationStatus === "verified").length)}
+          icon={CheckCircle2}
+          tone="verified"
+          index={1}
+        />
+        <StatCard
+          label="Requirement fit"
+          value={recommendation?.fitScore != null ? `${recommendation.fitScore}%` : "—"}
+          icon={Users}
+          tone="accent"
+          index={2}
+        />
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-6 lg:col-span-2">
-          {vendor.description && (
+          {description && (
             <Card>
               <CardHeader>
-                <CardTitle>About {vendor.companyName}</CardTitle>
+                <CardTitle>About {companyName}</CardTitle>
               </CardHeader>
               <CardContent className="pt-2">
-                <p className="text-sm leading-relaxed text-muted">{vendor.description}</p>
-                {vendor.industries.length > 0 && (
+                <p className="text-sm leading-relaxed text-muted">{description}</p>
+                {industries.length > 0 && (
                   <div className="mt-4 flex flex-wrap gap-1.5">
-                    {vendor.industries.map((ind) => (
+                    {industries.map((ind) => (
                       <Badge key={ind} variant="outline">{ind}</Badge>
                     ))}
                   </div>
@@ -172,7 +245,7 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
           ) : (
             <Card>
               <CardContent className="py-10 text-center">
-                <p className="text-sm text-muted">No approved capabilities published for {vendor.companyName} yet.</p>
+                <p className="text-sm text-muted">No approved capabilities published for {companyName} yet.</p>
               </CardContent>
             </Card>
           )}

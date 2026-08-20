@@ -4,8 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   CalendarClock,
+  CheckCircle2,
   Download,
-  ExternalLink,
   FileText,
   Loader2,
   MessageSquareText,
@@ -76,7 +76,14 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
 
 export default function SolutionWorkspacePage() {
   const { buyerId, vendorId, vendorName } = useBuyerSession();
-  const { startedAt: agentStartedAt } = useAgentStatus(buyerId);
+  // status is the one real completion signal this codebase has (see
+  // use-agent-status.ts's own header comment): finalize-solution-workspace's
+  // last action is flipping solution_models.status to "active", so "the last
+  // table workflow 2 edits" is solution_models — that (or a ready deck, agent
+  // or fallback) is what "completed" is actually grounded in here, not a
+  // run.status field nothing ever populates.
+  const { status: agentStatus, startedAt: agentStartedAt } = useAgentStatus(buyerId);
+  const solutionComplete = agentStatus === "completed";
 
   const [matches, setMatches] = useState<SolutionMatchRow[]>([]);
   const [gaps, setGaps] = useState<GapItemRow[]>([]);
@@ -219,6 +226,28 @@ export default function SolutionWorkspacePage() {
         }
       />
 
+      <Card className={cn("mb-6", solutionComplete ? "border-verified-border bg-verified-bg" : undefined)}>
+        <CardContent className="flex items-center gap-3 py-4">
+          {solutionComplete ? (
+            <>
+              <CheckCircle2 className="h-5 w-5 shrink-0 text-verified" />
+              <div>
+                <p className="text-sm font-semibold text-foreground">Your solution is complete</p>
+                <p className="text-xs text-muted">Every section below reflects real, final output — your pitch deck is ready below.</p>
+              </div>
+            </>
+          ) : (
+            <>
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin text-brand-500" />
+              <div>
+                <p className="text-sm font-semibold text-foreground">Your agent is still working</p>
+                <p className="text-xs text-muted">Sections below fill in as real data lands — your pitch deck unlocks once the model is finalized.</p>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
       {model && (
         <div className="mb-6 flex flex-wrap items-center gap-3">
           {model.version != null && <Badge variant="brand">Version {model.version}</Badge>}
@@ -239,6 +268,14 @@ export default function SolutionWorkspacePage() {
               <p className="text-sm leading-relaxed text-muted">{model.executiveSummary}</p>
             </CardContent>
           </Card>
+        ) : solutionComplete ? (
+          // The agent finished (real final output exists elsewhere on this
+          // page) but never wrote an executive summary this run — showing an
+          // open-ended "still working" spinner here would be false: nothing
+          // is going to make this fill in on its own once solutionComplete
+          // is true, so say so plainly instead of contradicting the banner
+          // above it.
+          <Card className="p-6 text-center text-sm text-muted">No executive summary was generated for this solution.</Card>
         ) : (
           <AgentWaitingState
             variant="card"
@@ -248,60 +285,67 @@ export default function SolutionWorkspacePage() {
           />
         )}
 
+        {!solutionComplete ? (
+          <AgentWaitingState
+            variant="card"
+            startedAt={agentStartedAt}
+            title="Your pitch deck will appear here"
+            description="The download and preview options unlock automatically once your solution is marked complete above."
+          />
+        ) : (
         <Card className={deck?.status === "ready" ? "border-verified-border bg-verified-bg" : undefined}>
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
-            <div className="flex items-center gap-3">
-              <FileText className="h-5 w-5 shrink-0 text-brand-600 dark:text-brand-400" />
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-sm font-semibold text-foreground">
-                    {deck?.status === "ready" ? "Your Solution Pitch Deck is ready" : generatingDeck ? "Building your backup deck…" : "Your presentation-ready pitch deck"}
+          <CardContent className="py-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <FileText className="h-5 w-5 shrink-0 text-brand-600 dark:text-brand-400" />
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-semibold text-foreground">
+                      {deck?.status === "ready" ? "Your Solution Pitch Deck is ready" : generatingDeck ? "Building your backup deck…" : "Your presentation-ready pitch deck"}
+                    </p>
+                  </div>
+                  <p className="text-xs text-muted">
+                    {deck?.title ?? "A polished .pptx — not this page — is the deliverable handed to you."}
                   </p>
-                  {deck?.status === "ready" && (
-                    <Badge variant={deck.source === "agent" ? "verified" : "modelled"} size="sm">
-                      {deck.source === "agent" ? "from your AI agent" : "auto-generated backup"}
-                    </Badge>
-                  )}
+                  {deckError && <p className="mt-1 text-xs text-escalated">{deckError}</p>}
                 </div>
-                <p className="text-xs text-muted">
-                  {deck?.title ?? "A polished .pptx — not this page — is the deliverable handed to you."}
-                </p>
-                {deckError && <p className="mt-1 text-xs text-escalated">{deckError}</p>}
               </div>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {deck?.pptxUrl ? (
-                <>
-                  <a
-                    href={`https://view.officeapps.live.com/op/view.aspx?src=${encodeURIComponent(deck.pptxUrl)}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className={cn(buttonVariants({ variant: "secondary", size: "sm" }))}
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" /> Open
-                  </a>
+              <div className="flex shrink-0 items-center gap-2">
+                {deck?.pptxUrl ? (
                   <a href={deck.pptxUrl} target="_blank" rel="noreferrer" download className={cn(buttonVariants({ size: "sm" }))}>
                     <Download className="h-3.5 w-3.5" /> Download .pptx
                   </a>
-                </>
-              ) : generatingDeck ? (
-                <span className="flex items-center gap-1.5 text-xs text-subtle">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => void runFallbackGeneration()}
-                  className={cn(buttonVariants({ variant: "secondary", size: "sm" }))}
-                >
-                  <RefreshCw className="h-3.5 w-3.5" /> Generate deck now
-                </button>
-              )}
+                ) : generatingDeck ? (
+                  <span className="flex items-center gap-1.5 text-xs text-subtle">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void runFallbackGeneration()}
+                    className={cn(buttonVariants({ variant: "secondary", size: "sm" }))}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" /> Generate deck now
+                  </button>
+                )}
+              </div>
             </div>
+
+            {deck?.pptxUrl && (
+              <div className="mt-4 overflow-hidden rounded-xl border border-border bg-surface">
+                <iframe
+                  key={deck.pptxUrl}
+                  src={`https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(deck.pptxUrl)}`}
+                  className="h-[560px] w-full"
+                  title={deck.title ?? "Solution Pitch Deck preview"}
+                />
+              </div>
+            )}
           </CardContent>
         </Card>
+        )}
 
-        {deckHistory.length > 1 && (
+        {solutionComplete && deckHistory.length > 1 && (
           <Card>
             <CardHeader>
               <CardTitle className="text-sm">Previous versions</CardTitle>
@@ -358,12 +402,16 @@ export default function SolutionWorkspacePage() {
         )}
 
         {matches.length === 0 && gaps.length === 0 && (
-          <AgentWaitingState
-            variant="card"
-            startedAt={agentStartedAt}
-            title="Assessing fit and gaps"
-            description={`Comparing your requirements against ${vendorName ?? "your vendor"}'s published capabilities.`}
-          />
+          solutionComplete ? (
+            <Card className="p-6 text-center text-sm text-muted">No fit or gap assessment was generated for this solution.</Card>
+          ) : (
+            <AgentWaitingState
+              variant="card"
+              startedAt={agentStartedAt}
+              title="Assessing fit and gaps"
+              description={`Comparing your requirements against ${vendorName ?? "your vendor"}'s published capabilities.`}
+            />
+          )
         )}
 
         {roi && <RoiWidget roi={toRoiProjection(roi)} />}

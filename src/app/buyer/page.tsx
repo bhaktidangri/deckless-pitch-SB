@@ -5,9 +5,6 @@ import Link from "next/link";
 import {
   ArrowUpRight,
   CalendarClock,
-  CheckCircle2,
-  Clock,
-  Loader2,
   MessageSquareText,
   PartyPopper,
   Search,
@@ -15,31 +12,31 @@ import {
   SlidersHorizontal,
   Store,
   TrendingUp,
-  XCircle,
 } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
 import { LoadingState } from "@/components/shared/loading-state";
 import { PipelineTracker, type PipelineStage } from "@/components/shared/pipeline-tracker";
+import { EngagementStatusControl } from "@/components/shared/engagement-status";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { EvidenceBadge } from "@/components/shared/status-badge";
 import {
+  getBuyer,
   getBuyerRequirements,
-  getBuyerWorkflowRunHistory,
   getCapabilityFrontierItems,
   getRoiProjection,
   getSolutionModel,
   type BuyerRequirementRow,
-  type BuyerWorkflowRunRow,
   type CapabilityFrontierRow,
   type RoiProjectionRow,
 } from "@/lib/api/buyer-lookup";
+import { updateBuyerProfile, type BuyerEngagementStatus } from "@/lib/api/account";
 import { useAgentStatus } from "@/lib/hooks/use-agent-status";
 import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
-import { cn, formatCurrencyINR, formatRelativeTime } from "@/lib/utils";
+import { cn, formatCurrencyINR } from "@/lib/utils";
 
 export default function BuyerDashboardPage() {
   const { buyerId, companyName, vendorId, vendorName } = useBuyerSession();
@@ -47,8 +44,9 @@ export default function BuyerDashboardPage() {
   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
   const [frontierItems, setFrontierItems] = useState<CapabilityFrontierRow[]>([]);
   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
-  const [runs, setRuns] = useState<BuyerWorkflowRunRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [engagementStatus, setEngagementStatus] = useState<BuyerEngagementStatus>("pending");
+  const [statusSaving, setStatusSaving] = useState(false);
   const agentStatus = useAgentStatus(buyerId);
 
   useEffect(() => {
@@ -59,15 +57,15 @@ export default function BuyerDashboardPage() {
     let cancelled = false;
     async function load() {
       try {
-        const [reqs, frontier, history] = await Promise.all([
+        const [reqs, frontier, buyer] = await Promise.all([
           getBuyerRequirements(buyerId!),
           getCapabilityFrontierItems(buyerId!),
-          getBuyerWorkflowRunHistory(buyerId!, 6),
+          getBuyer(buyerId!).catch(() => null),
         ]);
         if (cancelled) return;
         setRequirements(reqs);
         setFrontierItems(frontier);
-        setRuns(history);
+        if (buyer) setEngagementStatus(buyer.engagementStatus);
         if (vendorId) {
           const model = await getSolutionModel(buyerId!, vendorId);
           if (model && !cancelled) setRoi(await getRoiProjection(model.id));
@@ -81,6 +79,19 @@ export default function BuyerDashboardPage() {
       cancelled = true;
     };
   }, [buyerId, vendorId]);
+
+  async function handleStatusChange(next: BuyerEngagementStatus) {
+    const prev = engagementStatus;
+    setEngagementStatus(next);
+    setStatusSaving(true);
+    try {
+      await updateBuyerProfile({ engagementStatus: next });
+    } catch {
+      setEngagementStatus(prev);
+    } finally {
+      setStatusSaving(false);
+    }
+  }
 
   if (!buyerId) {
     return (
@@ -133,6 +144,18 @@ export default function BuyerDashboardPage() {
         />
         <PipelineTracker stages={stages} />
       </div>
+
+      {!loading && (
+        <Card className="mb-6">
+          <CardContent className="flex flex-col gap-3 pt-5 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-foreground">Vendor outreach status</p>
+              <p className="text-xs text-muted">Control whether vendors can still email or schedule meetings with you.</p>
+            </div>
+            <EngagementStatusControl status={engagementStatus} onChange={handleStatusChange} saving={statusSaving} />
+          </CardContent>
+        </Card>
+      )}
 
       {agentStatus.status === "completed" && (
         <Card className="mb-6 border-brand-300 bg-gradient-to-br from-brand-50 to-accent-50 dark:border-brand-800 dark:from-brand-950/30 dark:to-accent-950/20 animate-slide-up">
@@ -244,41 +267,6 @@ export default function BuyerDashboardPage() {
             </Card>
           </div>
 
-          {runs.length > 0 && (
-            <Card className="mt-6 animate-slide-up">
-              <CardHeader>
-                <CardTitle>Agent activity</CardTitle>
-              </CardHeader>
-              <CardContent className="pt-2">
-                <ul className="space-y-1">
-                  {runs.map((run) => (
-                    <li key={run.id} className="flex items-center gap-3 rounded-lg px-2 py-2.5 hover:bg-surface-2">
-                      {run.status === "completed" ? (
-                        <CheckCircle2 className="h-4 w-4 shrink-0 text-verified" />
-                      ) : run.status === "failed" ? (
-                        <XCircle className="h-4 w-4 shrink-0 text-escalated" />
-                      ) : (
-                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-500" />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm text-foreground">
-                          {run.status === "completed"
-                            ? "Agent run completed"
-                            : run.status === "failed"
-                              ? "Agent run failed"
-                              : "Agent working…"}
-                          {run.deckSyncedAt && <span className="ml-1.5 text-xs text-verified">· deck ready</span>}
-                        </p>
-                      </div>
-                      <span className="flex shrink-0 items-center gap-1 text-xs text-subtle">
-                        <Clock className="h-3 w-3" /> {formatRelativeTime(run.completedAt ?? run.startedAt)}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </CardContent>
-            </Card>
-          )}
         </>
       )}
     </div>

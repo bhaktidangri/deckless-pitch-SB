@@ -18,6 +18,8 @@
 // columns exist beyond the confirmed ones, and select("*") so nothing is
 // silently dropped once the real shape is observed.
 
+import type { EmailDeliveryStatus } from "@/lib/api/vendor-lookup";
+
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
@@ -37,6 +39,11 @@ async function restGet<T>(path: string): Promise<T> {
 
 // ---- buyers -----------------------------------------------------------
 
+// Mirrors account.ts's BuyerEngagementStatus — the buyer's own deal-status
+// control, enforced server-side (record-vendor-outreach /
+// schedule-meeting-direct reject once 'closed').
+export type BuyerEngagementStatus = "pending" | "in_progress" | "closed";
+
 export interface BuyerRow {
   id: string;
   companyName: string;
@@ -46,6 +53,7 @@ export interface BuyerRow {
   contactRole: string | null;
   email: string | null;
   createdAt: string;
+  engagementStatus: BuyerEngagementStatus;
 }
 
 // Finds the buyer row a fresh discover-form submission created, by matching
@@ -55,14 +63,14 @@ export interface BuyerRow {
 // no buyerId of its own).
 export async function findBuyerCreatedAfter(companyName: string, afterIso: string): Promise<BuyerRow | null> {
   const params = new URLSearchParams({
-    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
+    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at,engagement_status",
     company_name: `eq.${companyName}`,
     created_at: `gt.${afterIso}`,
     order: "created_at.asc",
     limit: "1",
   });
   const rows = await restGet<
-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
+    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string; engagement_status: BuyerEngagementStatus }[]
   >(`buyers?${params}`);
   const row = rows[0];
   if (!row) return null;
@@ -73,6 +81,7 @@ export async function findBuyerCreatedAfter(companyName: string, afterIso: strin
     companySize: row.company_size,
     contactName: row.contact_name,
     contactRole: row.contact_role,
+    engagementStatus: row.engagement_status,
     email: row.email,
     createdAt: row.created_at,
   };
@@ -80,12 +89,12 @@ export async function findBuyerCreatedAfter(companyName: string, afterIso: strin
 
 export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
   const params = new URLSearchParams({
-    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at",
+    select: "id,company_name,industry,company_size,contact_name,contact_role,email,created_at,engagement_status",
     id: `eq.${buyerId}`,
     limit: "1",
   });
   const rows = await restGet<
-    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string }[]
+    { id: string; company_name: string; industry: string | null; company_size: number | null; contact_name: string | null; contact_role: string | null; email: string | null; created_at: string; engagement_status: BuyerEngagementStatus }[]
   >(`buyers?${params}`);
   const row = rows[0];
   if (!row) return null;
@@ -98,6 +107,7 @@ export async function getBuyer(buyerId: string): Promise<BuyerRow | null> {
     contactRole: row.contact_role,
     email: row.email,
     createdAt: row.created_at,
+    engagementStatus: row.engagement_status,
   };
 }
 
@@ -484,11 +494,16 @@ export interface MeetingRequestRow {
   notes: string | null;
   meetingLink: string | null;
   durationMinutes: number;
+  createdAt: string;
+  inviteEmailStatus: EmailDeliveryStatus;
+  inviteOpenedAt: string | null;
+  inviteClickedAt: string | null;
 }
 
 export async function getMeetingRequests(buyerId: string): Promise<MeetingRequestRow[]> {
   const params = new URLSearchParams({
-    select: "id,buyer_id,vendor_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at",
+    select:
+      "id,buyer_id,vendor_id,status,proposed_date,expert,unresolved_count,title,notes,meeting_link,duration_minutes,created_at,invite_email_status,invite_opened_at,invite_clicked_at",
     buyer_id: `eq.${buyerId}`,
     order: "created_at.desc",
   });
@@ -505,6 +520,10 @@ export async function getMeetingRequests(buyerId: string): Promise<MeetingReques
       notes: string | null;
       meeting_link: string | null;
       duration_minutes: number | null;
+      created_at: string;
+      invite_email_status: EmailDeliveryStatus | null;
+      invite_opened_at: string | null;
+      invite_clicked_at: string | null;
     }[]
   >(`meeting_requests?${params}`);
   return rows.map((r) => ({
@@ -519,6 +538,10 @@ export async function getMeetingRequests(buyerId: string): Promise<MeetingReques
     notes: r.notes,
     meetingLink: r.meeting_link,
     durationMinutes: r.duration_minutes ?? 30,
+    createdAt: r.created_at,
+    inviteEmailStatus: r.invite_email_status ?? "not_sent",
+    inviteOpenedAt: r.invite_opened_at,
+    inviteClickedAt: r.invite_clicked_at,
   }));
 }
 
@@ -546,6 +569,60 @@ export async function getVendorOutreachEventsForBuyer(buyerId: string): Promise<
     `vendor_outreach_events?${params}`
   );
   return rows.map((r) => ({ id: r.id, vendorId: r.vendor_id, subject: r.subject, createdAt: r.created_at }));
+}
+
+// ---- buyer_outreach_events (buyer-side: "outreach I sent to a vendor") ----
+// Reverse direction of the above — this buyer's own sent history, feeding
+// EmailVendorCard's "past outreach" panel on /buyer/chat.
+
+export interface BuyerOutreachEventRow {
+  id: string;
+  vendorId: string;
+  subject: string | null;
+  message: string | null;
+  createdAt: string;
+  emailStatus: EmailDeliveryStatus;
+  emailError: string | null;
+  openedAt: string | null;
+  openCount: number;
+  clickedAt: string | null;
+  clickCount: number;
+}
+
+export async function getBuyerOutreachEvents(buyerId: string): Promise<BuyerOutreachEventRow[]> {
+  const params = new URLSearchParams({
+    select: "id,vendor_id,subject,message,created_at,email_status,email_error,opened_at,open_count,clicked_at,click_count",
+    buyer_id: `eq.${buyerId}`,
+    order: "created_at.desc",
+  });
+  const rows = await restGet<
+    {
+      id: string;
+      vendor_id: string;
+      subject: string | null;
+      message: string | null;
+      created_at: string;
+      email_status: EmailDeliveryStatus | null;
+      email_error: string | null;
+      opened_at: string | null;
+      open_count: number | null;
+      clicked_at: string | null;
+      click_count: number | null;
+    }[]
+  >(`buyer_outreach_events?${params}`);
+  return rows.map((r) => ({
+    id: r.id,
+    vendorId: r.vendor_id,
+    subject: r.subject,
+    message: r.message,
+    createdAt: r.created_at,
+    emailStatus: r.email_status ?? "not_sent",
+    emailError: r.email_error,
+    openedAt: r.opened_at,
+    openCount: r.open_count ?? 0,
+    clickedAt: r.clicked_at,
+    clickCount: r.click_count ?? 0,
+  }));
 }
 
 // ---- buyer_solution_decks ---------------------------------------------------
