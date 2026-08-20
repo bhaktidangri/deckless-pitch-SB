@@ -83,6 +83,7 @@
 @theme inline {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-fraunces);
 
   --color-background: var(--background);
   --color-surface: var(--surface);
@@ -204,8 +205,40 @@ body {
   background-size: 44px 44px;
 }
 
+/* Was a dead stub (position:relative with no texture) — now an actual
+   subtle grain, used behind hero sections so a flat brand-gradient block
+   doesn't look like a plain CSS swatch. SVG data-uri keeps it a single
+   inline rule with no extra asset request. */
 .bg-noise {
   position: relative;
+}
+.bg-noise::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/></svg>");
+}
+
+/* A soft, layered radial glow behind a hero block — the one "designed
+   product" flourish reused across the dashboard hero and empty/marketing-
+   style states, instead of every hero being a flat surface color. */
+.hero-glow {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.hero-glow::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  z-index: -1;
+  background:
+    radial-gradient(38% 55% at 15% 10%, color-mix(in srgb, var(--brand-500) 30%, transparent), transparent 70%),
+    radial-gradient(32% 45% at 85% 0%, color-mix(in srgb, var(--accent-500) 28%, transparent), transparent 70%);
+  filter: blur(40px);
 }
 
 .text-balance {

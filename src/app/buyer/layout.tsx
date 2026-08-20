@@ -11,8 +11,10 @@ import {
   CalendarClock,
 } from "lucide-react";
 import { PortalShell, type NavSection } from "@/components/layout/portal-shell";
+import { PageTransition } from "@/components/layout/page-transition";
 import { AgentStatusPill } from "@/components/shared/agent-status-pill";
-import { getStoredBuyerId, getStoredCompanyName } from "@/lib/buyer-session";
+import { GlobalCapabilitySearch } from "@/components/shared/global-capability-search";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 
 const sections: NavSection[] = [
   {
@@ -44,11 +46,10 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
   // Mirrors vendor/layout.tsx: no real auth session exists yet, so this
   // reflects whichever buyer actually submitted a discovery form in this
   // browser (src/lib/buyer-session.ts) instead of a static demo placeholder.
-  // Read directly in the render body (not useState+useEffect) — localStorage
-  // is available synchronously on the client and this avoids a
-  // set-state-in-effect render flash on first paint.
-  const companyName = getStoredCompanyName();
-  const buyerId = getStoredBuyerId();
+  // useBuyerSession (not a raw getStoredX() read) because this layout never
+  // unmounts while the buyer navigates the portal — it needs to notice
+  // buyerId/companyName appearing mid-session, not just at first paint.
+  const { companyName, buyerId } = useBuyerSession();
 
   return (
     <PortalShell
@@ -56,9 +57,14 @@ export default function BuyerLayout({ children }: { children: React.ReactNode })
       sections={sections}
       userName={companyName ?? "Not started yet"}
       userRole="Buyer"
-      headerSlot={<AgentStatusPill buyerId={buyerId} />}
+      headerSlot={
+        <>
+          <GlobalCapabilitySearch />
+          <AgentStatusPill buyerId={buyerId} />
+        </>
+      }
     >
-      {children}
+      <PageTransition>{children}</PageTransition>
     </PortalShell>
   );
 }

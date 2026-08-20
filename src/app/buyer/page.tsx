@@ -2,10 +2,25 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, MessageSquareText, PartyPopper, Sparkles, Store, TrendingUp } from "lucide-react";
+import {
+  ArrowUpRight,
+  CalendarClock,
+  CheckCircle2,
+  Clock,
+  Loader2,
+  MessageSquareText,
+  PartyPopper,
+  Search,
+  Sparkles,
+  SlidersHorizontal,
+  Store,
+  TrendingUp,
+  XCircle,
+} from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
 import { LoadingState } from "@/components/shared/loading-state";
+import { PipelineTracker, type PipelineStage } from "@/components/shared/pipeline-tracker";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { buttonVariants } from "@/components/ui/button";
@@ -13,26 +28,26 @@ import { Badge } from "@/components/ui/badge";
 import { EvidenceBadge } from "@/components/shared/status-badge";
 import {
   getBuyerRequirements,
+  getBuyerWorkflowRunHistory,
   getCapabilityFrontierItems,
   getRoiProjection,
   getSolutionModel,
   type BuyerRequirementRow,
+  type BuyerWorkflowRunRow,
   type CapabilityFrontierRow,
   type RoiProjectionRow,
 } from "@/lib/api/buyer-lookup";
 import { useAgentStatus } from "@/lib/hooks/use-agent-status";
-import { getStoredBuyerId, getStoredCompanyName, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
-import { cn, formatCurrencyINR } from "@/lib/utils";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
+import { cn, formatCurrencyINR, formatRelativeTime } from "@/lib/utils";
 
 export default function BuyerDashboardPage() {
-  const buyerId = getStoredBuyerId();
-  const companyName = getStoredCompanyName();
-  const vendorId = getStoredSelectedVendorId();
-  const vendorName = getStoredSelectedVendorName();
+  const { buyerId, companyName, vendorId, vendorName } = useBuyerSession();
 
   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
   const [frontierItems, setFrontierItems] = useState<CapabilityFrontierRow[]>([]);
   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
+  const [runs, setRuns] = useState<BuyerWorkflowRunRow[]>([]);
   const [loading, setLoading] = useState(true);
   const agentStatus = useAgentStatus(buyerId);
 
@@ -44,10 +59,15 @@ export default function BuyerDashboardPage() {
     let cancelled = false;
     async function load() {
       try {
-        const [reqs, frontier] = await Promise.all([getBuyerRequirements(buyerId!), getCapabilityFrontierItems(buyerId!)]);
+        const [reqs, frontier, history] = await Promise.all([
+          getBuyerRequirements(buyerId!),
+          getCapabilityFrontierItems(buyerId!),
+          getBuyerWorkflowRunHistory(buyerId!, 6),
+        ]);
         if (cancelled) return;
         setRequirements(reqs);
         setFrontierItems(frontier);
+        setRuns(history);
         if (vendorId) {
           const model = await getSolutionModel(buyerId!, vendorId);
           if (model && !cancelled) setRoi(await getRoiProjection(model.id));
@@ -64,13 +84,20 @@ export default function BuyerDashboardPage() {
 
   if (!buyerId) {
     return (
-      <div>
-        <PageHeader eyebrow="Welcome" title="Start your discovery" description="No buyer session found in this browser yet." />
-        <Card className="max-w-md p-6 text-center">
-          <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary" }))}>
-            Go to Discover <ArrowUpRight className="h-4 w-4" />
-          </Link>
-        </Card>
+      <div className="hero-glow bg-noise rounded-3xl border border-border bg-surface px-6 py-16 text-center sm:px-12">
+        <span className="mb-4 inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-gradient-to-r from-brand-50 to-accent-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-brand-600 dark:border-brand-800 dark:from-brand-950/50 dark:to-accent-500/10 dark:text-brand-300">
+          <Sparkles className="h-3 w-3" /> Deck-less Pitch
+        </span>
+        <h1 className="font-display mx-auto max-w-xl text-4xl font-semibold tracking-tight text-foreground sm:text-5xl">
+          No deck. A live model of your business, built for you.
+        </h1>
+        <p className="mx-auto mt-4 max-w-md text-sm text-muted sm:text-base">
+          Tell us what you&apos;re trying to solve — our agent builds an evidence-grounded, personalized solution you can
+          explore yourself, no sales deck required.
+        </p>
+        <Link href="/buyer/discover" className={cn(buttonVariants({ variant: "primary", size: "lg" }), "mt-8")}>
+          Start your discovery <ArrowUpRight className="h-4 w-4" />
+        </Link>
       </div>
     );
   }
@@ -78,18 +105,34 @@ export default function BuyerDashboardPage() {
   const openItems = frontierItems.filter((f) => f.status !== "resolved" && f.status !== "closed");
   const confirmedCount = requirements.filter((r) => r.status === "confirmed").length;
 
+  const stages: PipelineStage[] = [
+    { key: "discover", label: "Discover", href: "/buyer/discover", icon: Search, done: requirements.length > 0 },
+    { key: "vendor", label: "Vendor", href: "/buyer/vendors", icon: Store, done: !!vendorId },
+    { key: "solution", label: "Solution", href: "/buyer/solution", icon: Sparkles, done: !!roi },
+    { key: "scenarios", label: "Scenarios", href: "/buyer/scenarios", icon: SlidersHorizontal, done: !!roi && openItems.length === 0 },
+    { key: "handoff", label: "Handoff", href: "/buyer/handoff", icon: CalendarClock, done: agentStatus.status === "completed" },
+  ];
+
   return (
     <div>
-      <PageHeader
-        eyebrow={companyName ?? "Your organization"}
-        title="Welcome back"
-        description={vendorName ? `Here's where your ${vendorName} solution stands, and what still needs an answer.` : "Confirm a vendor to build your personalized solution."}
-        actions={
-          <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
-            Open solution workspace <ArrowUpRight className="h-4 w-4" />
-          </Link>
-        }
-      />
+      <div className="hero-glow bg-noise mb-6 overflow-hidden rounded-3xl border border-border bg-surface px-6 py-8 sm:px-8 sm:py-10">
+        <PageHeader
+          eyebrow={companyName ?? "Your organization"}
+          title="Welcome back"
+          description={
+            vendorName
+              ? `Here's where your ${vendorName} solution stands, and what still needs an answer.`
+              : "Confirm a vendor to build your personalized solution."
+          }
+          actions={
+            <Link href="/buyer/solution" className={cn(buttonVariants({ variant: "primary" }))}>
+              Open solution workspace <ArrowUpRight className="h-4 w-4" />
+            </Link>
+          }
+          className="mb-8"
+        />
+        <PipelineTracker stages={stages} />
+      </div>
 
       {agentStatus.status === "completed" && (
         <Card className="mb-6 border-brand-300 bg-gradient-to-br from-brand-50 to-accent-50 dark:border-brand-800 dark:from-brand-950/30 dark:to-accent-950/20 animate-slide-up">
@@ -200,6 +243,42 @@ export default function BuyerDashboardPage() {
               </CardContent>
             </Card>
           </div>
+
+          {runs.length > 0 && (
+            <Card className="mt-6 animate-slide-up">
+              <CardHeader>
+                <CardTitle>Agent activity</CardTitle>
+              </CardHeader>
+              <CardContent className="pt-2">
+                <ul className="space-y-1">
+                  {runs.map((run) => (
+                    <li key={run.id} className="flex items-center gap-3 rounded-lg px-2 py-2.5 hover:bg-surface-2">
+                      {run.status === "completed" ? (
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-verified" />
+                      ) : run.status === "failed" ? (
+                        <XCircle className="h-4 w-4 shrink-0 text-escalated" />
+                      ) : (
+                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-500" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm text-foreground">
+                          {run.status === "completed"
+                            ? "Agent run completed"
+                            : run.status === "failed"
+                              ? "Agent run failed"
+                              : "Agent working…"}
+                          {run.deckSyncedAt && <span className="ml-1.5 text-xs text-verified">· deck ready</span>}
+                        </p>
+                      </div>
+                      <span className="flex shrink-0 items-center gap-1 text-xs text-subtle">
+                        <Clock className="h-3 w-3" /> {formatRelativeTime(run.completedAt ?? run.startedAt)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
+          )}
         </>
       )}
     </div>

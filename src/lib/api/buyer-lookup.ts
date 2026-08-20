@@ -493,6 +493,30 @@ export async function getLatestSolutionDeck(buyerId: string): Promise<BuyerSolut
   return { id: row.id, buyerId: row.buyer_id, title: row.title, pptxUrl: row.pptx_url, status: row.status, createdAt: row.created_at };
 }
 
+// Full deck history (every generated deck, not just the newest) — the
+// solution workspace shows this so a buyer can see or re-download a
+// previous version after a What-If Scenarios re-generation (PRD §7.4), not
+// only the current one.
+export async function getBuyerSolutionDecks(buyerId: string, limit = 10): Promise<BuyerSolutionDeckRow[]> {
+  const params = new URLSearchParams({
+    select: "id,buyer_id,title,pptx_url,status,created_at",
+    buyer_id: `eq.${buyerId}`,
+    order: "created_at.desc",
+    limit: String(limit),
+  });
+  const rows = await restGet<
+    { id: string; buyer_id: string; title: string | null; pptx_url: string | null; status: "ready" | "failed"; created_at: string }[]
+  >(`buyer_solution_decks?${params}`);
+  return rows.map((row) => ({
+    id: row.id,
+    buyerId: row.buyer_id,
+    title: row.title,
+    pptxUrl: row.pptx_url,
+    status: row.status,
+    createdAt: row.created_at,
+  }));
+}
+
 // ---- buyer_workflow_runs (run-completion tracking) -------------------------
 // See supabase-buyer/migrations/0004_buyer_workflow_runs.sql — the durable,
 // server-side record of "does this run exist and has it finished", used by
@@ -508,6 +532,38 @@ export interface BuyerWorkflowRunRow {
   deckSyncedAt: string | null;
   completedAt: string | null;
   startedAt: string;
+}
+
+// Full history (not just the latest), for the dashboard's activity feed and
+// the solution workspace's "past runs" section — see getBuyerSolutionDecks
+// just below for the matching deck-history read.
+export async function getBuyerWorkflowRunHistory(buyerId: string, limit = 10): Promise<BuyerWorkflowRunRow[]> {
+  const params = new URLSearchParams({
+    select: "id,workflow_run_id,buyer_id,status,deck_synced_at,completed_at,started_at",
+    buyer_id: `eq.${buyerId}`,
+    order: "started_at.desc",
+    limit: String(limit),
+  });
+  const rows = await restGet<
+    {
+      id: string;
+      workflow_run_id: string;
+      buyer_id: string | null;
+      status: "running" | "completed" | "failed";
+      deck_synced_at: string | null;
+      completed_at: string | null;
+      started_at: string;
+    }[]
+  >(`buyer_workflow_runs?${params}`);
+  return rows.map((row) => ({
+    id: row.id,
+    workflowRunId: row.workflow_run_id,
+    buyerId: row.buyer_id,
+    status: row.status,
+    deckSyncedAt: row.deck_synced_at,
+    completedAt: row.completed_at,
+    startedAt: row.started_at,
+  }));
 }
 
 export async function getLatestBuyerWorkflowRun(buyerId: string): Promise<BuyerWorkflowRunRow | null> {

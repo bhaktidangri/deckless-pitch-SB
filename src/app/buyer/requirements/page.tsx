@@ -2,13 +2,13 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent } from "@/components/ui/card";
 import { buttonVariants } from "@/components/ui/button";
 import { RequirementCard } from "@/components/shared/requirement-card";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getBuyerRequirements, getClientRealityProfile, type BuyerRequirementRow, type ClientRealityProfileRow } from "@/lib/api/buyer-lookup";
-import { getStoredBuyerId } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { cn, formatCurrencyINR, formatNumber } from "@/lib/utils";
 import type { Requirement } from "@/lib/types";
 
@@ -16,7 +16,7 @@ import type { Requirement } from "@/lib/types";
 // Summary runs once on submission with no later "append a requirement"
 // tool, so there's nothing for a manual-add box here to actually persist.
 export default function RequirementsPage() {
-  const buyerId = getStoredBuyerId();
+  const { buyerId } = useBuyerSession();
   const [requirements, setRequirements] = useState<BuyerRequirementRow[]>([]);
   const [profile, setProfile] = useState<ClientRealityProfileRow | null>(null);
   const [loading, setLoading] = useState(true);
@@ -71,7 +71,7 @@ export default function RequirementsPage() {
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-2.5 lg:col-span-2">
           {loading && requirements.length === 0 ? (
-            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
+            <AgentWaitingState variant="card" title="Loading your requirements" description="Fetching what the agent has captured so far." />
           ) : requirements.length === 0 ? (
             <Card className="p-6 text-center text-sm text-muted">No requirements captured yet.</Card>
           ) : (

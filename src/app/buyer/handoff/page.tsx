@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { CalendarCheck2, CheckCircle2, Loader2, MessageSquareText } from "lucide-react";
+import { CalendarCheck2, CheckCircle2, MessageSquareText } from "lucide-react";
 import { motion } from "motion/react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -10,8 +10,10 @@ import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { FrontierCard } from "@/components/shared/frontier-card";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getCapabilityFrontierItems, getMeetingRequests, type CapabilityFrontierRow, type MeetingRequestRow } from "@/lib/api/buyer-lookup";
-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredSelectedVendorName } from "@/lib/buyer-session";
+import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
 import type { CapabilityFrontierItem } from "@/lib/types";
@@ -42,8 +44,8 @@ const statusConfig: Record<MeetingRequestRow["status"], { label: string; variant
 };
 
 export default function HandoffPage() {
-  const buyerId = getStoredBuyerId();
-  const vendorName = getStoredSelectedVendorName() ?? "your vendor";
+  const { buyerId, vendorName: storedVendorName } = useBuyerSession();
+  const vendorName = storedVendorName ?? "your vendor";
   const workflowRunIds = getStoredBuyerWorkflowRunIds();
 
   const [items, setItems] = useState<CapabilityFrontierRow[]>([]);
@@ -99,7 +101,7 @@ export default function HandoffPage() {
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
           {loading ? (
-            <p className="flex items-center gap-2 text-sm text-muted"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…</p>
+            <AgentWaitingState variant="card" title="Loading open questions" />
           ) : openItems.length === 0 ? (
             <Card className="p-6 text-center text-sm text-muted">No open questions right now.</Card>
           ) : (

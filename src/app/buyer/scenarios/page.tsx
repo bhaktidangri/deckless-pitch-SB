@@ -16,7 +16,9 @@ import {
   getSolutionModel,
   type RoiProjectionRow,
 } from "@/lib/api/buyer-lookup";
-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredSelectedVendorId, getStoredSelectedVendorName } from "@/lib/buyer-session";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn, formatNumber } from "@/lib/utils";
 import type { RoiProjection } from "@/lib/types";
@@ -40,9 +42,7 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
 // a continuous slider (PRD §7.3); this treats each debounced "settle" as one
 // approval round-trip, per the PRD's own suggested resolution.
 export default function ScenariosPage() {
-  const buyerId = getStoredBuyerId();
-  const vendorId = getStoredSelectedVendorId();
-  const vendorName = getStoredSelectedVendorName();
+  const { buyerId, vendorId, vendorName } = useBuyerSession();
   const workflowRunIds = getStoredBuyerWorkflowRunIds();
 
   const [solutionModelId, setSolutionModelId] = useState<string | null>(null);
@@ -132,9 +132,8 @@ export default function ScenariosPage() {
 
   if (loading) {
     return (
-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
-        <p className="text-sm text-muted">Loading your baseline projection…</p>
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <AgentWaitingState variant="fullpage" title="Loading your baseline projection" />
       </div>
     );
   }
@@ -214,11 +213,11 @@ export default function ScenariosPage() {
           {roi ? (
             <RoiWidget roi={toRoiProjection(roi)} />
           ) : (
-            <Card>
-              <CardContent className="py-10 text-center text-sm text-muted">
-                No baseline projection yet — this fills in once the Solution Model Agent runs Solution Scenarios.
-              </CardContent>
-            </Card>
+            <AgentWaitingState
+              variant="card"
+              title="Modelling your baseline"
+              description="This fills in once the Solution Model Agent runs Solution Scenarios."
+            />
           )}
 
           <Card className="h-[420px]">

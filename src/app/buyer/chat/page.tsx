@@ -4,12 +4,11 @@ import { Bot, Database, FileCheck2, ShoppingBag } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { LiveChatPanel } from "@/components/shared/live-chat-panel";
-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, getStoredCompanyName, getStoredSelectedVendorName } from "@/lib/buyer-session";
+import { getStoredBuyerWorkflowRunIds } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 
 export default function BuyerChatPage() {
-  const buyerId = getStoredBuyerId();
-  const vendorName = getStoredSelectedVendorName();
-  const companyName = getStoredCompanyName();
+  const { buyerId, vendorName, companyName } = useBuyerSession();
 
   return (
     <div>

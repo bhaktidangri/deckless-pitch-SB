@@ -2,13 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { AlertTriangle, ArrowRight, Clock, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import {
   addStoredBuyerWorkflowRunId,
   clearPendingBuyerSubmission,
@@ -189,28 +190,31 @@ export default function DiscoverPage() {
           title="Analyzing your submission…"
           description="The Buyer Discovery Agent is capturing your requirements and will match them against verified vendor capabilities."
         />
-        <Card className="max-w-md p-6 text-center">
-          {stage === "processing" ? (
-            <>
-              <Loader2 className="mx-auto h-6 w-6 animate-spin text-brand-500" />
-              <p className="mt-3 text-sm text-muted">This can take a minute or two while the agent works.</p>
-              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
-            </>
-          ) : (
-            <>
-              <Clock className="mx-auto h-6 w-6 text-modelled" />
-              <p className="mt-3 text-sm font-medium text-foreground">Still processing after a few minutes.</p>
-              <p className="mt-1 text-sm text-muted">
-                Your submission is running —{" "}
+        <AgentWaitingState
+          variant="fullpage"
+          title={stage === "timed-out" ? "Still processing after a few minutes" : "Setting up your workspace"}
+          description={
+            stage === "timed-out" ? (
+              <>
+                Your submission is still running — it&apos;ll load automatically once your buyer record is ready. In the
+                meantime you can{" "}
                 <button className="text-brand-600 underline dark:text-brand-400" onClick={resumePolling}>
-                  keep checking
+                  check again now
                 </button>
-                . It&apos;ll load automatically once your buyer record is ready.
-              </p>
-              {runId && <p className="mt-2 font-mono text-[11px] text-subtle">run {runId}</p>}
-            </>
-          )}
-        </Card>
+                .
+              </>
+            ) : (
+              "This usually takes a minute or two while the agent parses your submission."
+            )
+          }
+          messages={[
+            "Reading through your problem statement…",
+            "Registering your buyer record…",
+            "Cross-checking the vendor catalog…",
+            "Almost there…",
+          ]}
+        />
+        {runId && <p className="mt-3 text-center font-mono text-[11px] text-subtle">run {runId}</p>}
       </div>
     );
   }
@@ -257,9 +261,11 @@ export default function DiscoverPage() {
             </CardHeader>
             <CardContent className="space-y-2 pt-2">
               {requirements.length === 0 ? (
-                <p className="flex items-center gap-2 text-sm text-muted">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waiting for the agent to parse your submission…
-                </p>
+                <AgentWaitingState
+                  variant="card"
+                  title="Parsing your submission"
+                  description="Requirements will appear here the moment the agent extracts them."
+                />
               ) : (
                 requirements.map((r) => (
                   <div key={r.id} className="flex items-center justify-between gap-3 rounded-lg bg-surface-2 p-3">

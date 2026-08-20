@@ -3,6 +3,33 @@
 // workflow trigger response carries no buyerId of its own (same limitation
 // as the vendor trigger), so buyerId is discovered by polling the `buyers`
 // table (see buyer-lookup.ts) and then stored here for every later page.
+//
+// Every identity setter below also fires SESSION_EVENT so a long-lived
+// component (src/app/buyer/layout.tsx in particular, which never unmounts
+// while the buyer clicks around the portal) can react the instant a value
+// changes instead of only picking it up on the next full route change —
+// see src/lib/hooks/use-buyer-session.ts, the reactive read side of this.
+// Before this existed, the layout read localStorage once per its own mount
+// and had no way to notice buyerId showing up mid-session, which looked
+// exactly like "stale/cached data" even though every actual network fetch
+// was already using cache: "no-store".
+const SESSION_EVENT = "deckless-pitch:session-changed";
+
+function notifySessionChanged() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(SESSION_EVENT));
+}
+
+export function subscribeToBuyerSession(onChange: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", onChange);
+  window.addEventListener(SESSION_EVENT, onChange);
+  return () => {
+    window.removeEventListener("storage", onChange);
+    window.removeEventListener(SESSION_EVENT, onChange);
+  };
+}
+
 const BUYER_ID_KEY = "deckless-pitch:buyer-id";
 const COMPANY_NAME_KEY = "deckless-pitch:buyer-company-name";
 const SELECTED_VENDOR_ID_KEY = "deckless-pitch:selected-vendor-id";
@@ -17,6 +44,7 @@ export function getStoredBuyerId(): string | null {
 export function setStoredBuyerId(buyerId: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(BUYER_ID_KEY, buyerId);
+  notifySessionChanged();
 }
 
 export function getStoredCompanyName(): string | null {
@@ -27,6 +55,7 @@ export function getStoredCompanyName(): string | null {
 export function setStoredCompanyName(companyName: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(COMPANY_NAME_KEY, companyName);
+  notifySessionChanged();
 }
 
 // Step 3 ("Confirm Vendor Selection") is a hard gate — every page from
@@ -43,6 +72,7 @@ export function setStoredSelectedVendor(vendorId: string, companyName?: string) 
   if (typeof window === "undefined") return;
   window.localStorage.setItem(SELECTED_VENDOR_ID_KEY, vendorId);
   if (companyName) window.localStorage.setItem(SELECTED_VENDOR_NAME_KEY, companyName);
+  notifySessionChanged();
 }
 
 export function getStoredSelectedVendorName(): string | null {
@@ -58,6 +88,7 @@ export function getStoredSolutionModelId(): string | null {
 export function setStoredSolutionModelId(id: string) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(SOLUTION_MODEL_ID_KEY, id);
+  notifySessionChanged();
 }
 
 export function clearBuyerSession() {
@@ -67,6 +98,7 @@ export function clearBuyerSession() {
   window.localStorage.removeItem(SELECTED_VENDOR_ID_KEY);
   window.localStorage.removeItem(SELECTED_VENDOR_NAME_KEY);
   window.localStorage.removeItem(SOLUTION_MODEL_ID_KEY);
+  notifySessionChanged();
 }
 
 // A trigger the agent hasn't finished resolving to a buyerId yet, persisted

@@ -11,13 +11,15 @@ import { Badge } from "@/components/ui/badge";
 import { LoadingState } from "@/components/shared/loading-state";
 import { ApprovalButtons } from "@/components/shared/approval-buttons";
 import { VendorRecommendationCard } from "@/components/shared/vendor-recommendation-card";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import {
   getActiveVendorSelection,
   getVendorRecommendations,
   type VendorRecommendationRow,
 } from "@/lib/api/buyer-lookup";
 import { queryPublishedVendorSolutionDna, type PublishedVendor } from "@/lib/api/buyer-vendor-dna";
-import { getStoredBuyerId, getStoredBuyerWorkflowRunIds, setStoredSelectedVendor } from "@/lib/buyer-session";
+import { getStoredBuyerWorkflowRunIds, setStoredSelectedVendor } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { usePendingApproval } from "@/lib/hooks/use-pending-approval";
 import { cn } from "@/lib/utils";
 
@@ -47,7 +49,7 @@ function matchingCapabilityName(vendor: PublishedVendor | undefined, query: stri
 // shows the ranked comparison, but only unlocks moving on once
 // buyer_vendor_selections has an active row.
 export default function BuyerVendorsPage() {
-  const buyerId = getStoredBuyerId();
+  const { buyerId } = useBuyerSession();
   const [recommendations, setRecommendations] = useState<VendorRecommendationRow[]>([]);
   const [vendorsById, setVendorsById] = useState<Record<string, PublishedVendor>>({});
   const [activeVendorId, setActiveVendorId] = useState<string | null>(null);
@@ -166,11 +168,12 @@ export default function BuyerVendorsPage() {
         </Card>
       ) : (
         !loading && (
-          <Card className="mb-6 border-modelled-border bg-modelled-bg">
-            <CardContent className="py-4 text-sm text-foreground">
-              Waiting for the Solution Matching Agent to present your vendor choice — this appears here as soon as it&apos;s ready.
-            </CardContent>
-          </Card>
+          <AgentWaitingState
+            variant="card"
+            title="Waiting for your vendor choice"
+            description="The Solution Matching Agent will present ranked options here as soon as they're ready."
+            className="mb-6"
+          />
         )
       )}
 

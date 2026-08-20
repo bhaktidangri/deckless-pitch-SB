@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, CheckCircle2, Globe, Loader2, Sparkles } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Globe, Sparkles } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
 import { CapabilityCard } from "@/components/shared/capability-card";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { getVendorRecommendations, type VendorRecommendationRow } from "@/lib/api/buyer-lookup";
 import {
   queryApprovedVendorSolutionDna,
@@ -14,7 +15,7 @@ import {
   type ApprovedCapability,
   type PublishedVendor,
 } from "@/lib/api/buyer-vendor-dna";
-import { getStoredBuyerId, getStoredSelectedVendorId } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import type { Capability, SourceType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -43,8 +44,8 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const buyerId = getStoredBuyerId();
-  const isSelected = vendorId !== null && getStoredSelectedVendorId() === vendorId;
+  const { buyerId, vendorId: selectedVendorId } = useBuyerSession();
+  const isSelected = vendorId !== null && selectedVendorId === vendorId;
 
   useEffect(() => {
     let cancelled = false;
@@ -80,9 +81,12 @@ export default function VendorProfilePage({ params }: { params: Promise<{ id: st
 
   if (loading) {
     return (
-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
-        <p className="text-sm text-muted">Loading vendor profile…</p>
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <AgentWaitingState
+          variant="fullpage"
+          title="Loading vendor profile"
+          description="Pulling their published capabilities and evidence."
+        />
       </div>
     );
   }

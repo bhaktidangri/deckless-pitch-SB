@@ -10,9 +10,10 @@ import { buttonVariants } from "@/components/ui/button";
 import { GapCard } from "@/components/shared/gap-card";
 import { MatchRow } from "@/components/shared/match-row";
 import { RoiWidget } from "@/components/shared/roi-widget";
+import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import {
+  getBuyerSolutionDecks,
   getFitAndGapAssessment,
-  getLatestSolutionDeck,
   getRoiProjection,
   getSolutionModel,
   type BuyerSolutionDeckRow,
@@ -21,7 +22,8 @@ import {
   type SolutionMatchRow,
   type SolutionModelRow,
 } from "@/lib/api/buyer-lookup";
-import { getStoredBuyerId, getStoredSelectedVendorId, getStoredSelectedVendorName, setStoredSolutionModelId } from "@/lib/buyer-session";
+import { setStoredSolutionModelId } from "@/lib/buyer-session";
+import { useBuyerSession } from "@/lib/hooks/use-buyer-session";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import type { GapItem, RoiProjection, SolutionMatch } from "@/lib/types";
 
@@ -59,15 +61,14 @@ function toRoiProjection(r: RoiProjectionRow): RoiProjection {
 }
 
 export default function SolutionWorkspacePage() {
-  const buyerId = getStoredBuyerId();
-  const vendorId = getStoredSelectedVendorId();
-  const vendorName = getStoredSelectedVendorName();
+  const { buyerId, vendorId, vendorName } = useBuyerSession();
 
   const [matches, setMatches] = useState<SolutionMatchRow[]>([]);
   const [gaps, setGaps] = useState<GapItemRow[]>([]);
   const [model, setModel] = useState<SolutionModelRow | null>(null);
   const [roi, setRoi] = useState<RoiProjectionRow | null>(null);
   const [deck, setDeck] = useState<BuyerSolutionDeckRow | null>(null);
+  const [deckHistory, setDeckHistory] = useState<BuyerSolutionDeckRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -78,16 +79,17 @@ export default function SolutionWorkspacePage() {
     let cancelled = false;
     async function load() {
       try {
-        const [fitGap, m, deckDoc] = await Promise.all([
+        const [fitGap, m, decks] = await Promise.all([
           getFitAndGapAssessment(buyerId!, vendorId!),
           getSolutionModel(buyerId!, vendorId!),
-          getLatestSolutionDeck(buyerId!),
+          getBuyerSolutionDecks(buyerId!, 10),
         ]);
         if (cancelled) return;
         setMatches(fitGap.matches);
         setGaps(fitGap.gaps);
         setModel(m);
-        setDeck(deckDoc);
+        setDeck(decks[0] ?? null);
+        setDeckHistory(decks);
         if (m) {
           setStoredSolutionModelId(m.id);
           const roiRow = await getRoiProjection(m.id);
@@ -120,9 +122,12 @@ export default function SolutionWorkspacePage() {
 
   if (loading) {
     return (
-      <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 text-center">
-        <Loader2 className="h-6 w-6 animate-spin text-brand-500" />
-        <p className="text-sm text-muted">Loading your solution workspace…</p>
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <AgentWaitingState
+          variant="fullpage"
+          title="Loading your solution workspace"
+          description="Pulling your fit and gap assessment, ROI model, and pitch deck."
+        />
       </div>
     );
   }
@@ -166,11 +171,11 @@ export default function SolutionWorkspacePage() {
             </CardContent>
           </Card>
         ) : (
-          <Card className="border-modelled-border bg-modelled-bg">
-            <CardContent className="py-4 text-sm text-foreground">
-              The Solution Model Agent hasn&apos;t produced your executive summary yet — this fills in automatically once it does.
-            </CardContent>
-          </Card>
+          <AgentWaitingState
+            variant="card"
+            title="Building your executive summary"
+            description="The Solution Model Agent hasn't produced it yet — this fills in automatically once it does."
+          />
         )}
 
         <Card className={deck?.status === "ready" ? "border-verified-border bg-verified-bg" : undefined}>
@@ -197,6 +202,33 @@ export default function SolutionWorkspacePage() {
             )}
           </CardContent>
         </Card>
+
+        {deckHistory.length > 1 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Previous versions</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-1 pt-2">
+              {deckHistory.slice(1).map((d) => (
+                <div key={d.id} className="flex items-center justify-between gap-3 rounded-lg px-2 py-2 hover:bg-surface-2">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <FileText className="h-3.5 w-3.5 shrink-0 text-subtle" />
+                    <span className="truncate text-sm text-foreground">{d.title ?? "Solution Pitch Deck"}</span>
+                    {d.status === "failed" && <Badge variant="escalated" size="sm">failed</Badge>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <span className="text-xs text-subtle">{formatRelativeTime(d.createdAt)}</span>
+                    {d.pptxUrl && (
+                      <a href={d.pptxUrl} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline dark:text-brand-400">
+                        <Download className="h-3.5 w-3.5" />
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        )}
 
         {gaps.length > 0 && (
           <Card>
@@ -225,11 +257,11 @@ export default function SolutionWorkspacePage() {
         )}
 
         {matches.length === 0 && gaps.length === 0 && (
-          <Card>
-            <CardContent className="py-10 text-center text-sm text-muted">
-              Waiting for the Solution Matching Agent to assess fit and gaps against {vendorName ?? "your vendor"}&apos;s published capabilities.
-            </CardContent>
-          </Card>
+          <AgentWaitingState
+            variant="card"
+            title="Assessing fit and gaps"
+            description={`Comparing your requirements against ${vendorName ?? "your vendor"}'s published capabilities.`}
+          />
         )}
 
         {roi && <RoiWidget roi={toRoiProjection(roi)} />}
