@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, CircleAlert, FileSearch, Sparkles, TrendingUp, Users } from "lucide-react";
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { ArrowUpRight, CircleAlert, FileSearch, Mail, Sparkles, TrendingUp, Users } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { StatCard } from "@/components/shared/stat-card";
 import { AuditTimeline } from "@/components/shared/audit-timeline";
@@ -14,8 +15,11 @@ import {
   getVendorRecommendationsForVendor,
   getBuyersByIds,
   getVendorById,
+  getVendorInterestSeries,
+  getVendorOutreachEvents,
   type LeadBuyerRow,
   type VendorDetailRow,
+  type VendorInterestWeek,
 } from "@/lib/api/vendor-lookup";
 import { getFrontierItemsForVendor, type VendorFrontierItemRow } from "@/lib/api/vendor-frontier";
 import { getAuditEvents } from "@/lib/api/admin-lookup";
@@ -36,6 +40,8 @@ export default function VendorDashboardPage() {
   const [openFrontier, setOpenFrontier] = useState<VendorFrontierItemRow[]>([]);
   const [buyersById, setBuyersById] = useState<Record<string, LeadBuyerRow>>({});
   const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [interestSeries, setInterestSeries] = useState<VendorInterestWeek[]>([]);
+  const [outreachCount, setOutreachCount] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -48,11 +54,13 @@ export default function VendorDashboardPage() {
     let cancelled = false;
     async function load() {
       try {
-        const [v, recs, frontier, auditEvents] = await Promise.all([
+        const [v, recs, frontier, auditEvents, interest, outreach] = await Promise.all([
           getVendorById(id!),
           getVendorRecommendationsForVendor(id!),
           getFrontierItemsForVendor(id!),
           getAuditEvents(5),
+          getVendorInterestSeries(id!, 6).catch(() => []),
+          getVendorOutreachEvents(id!).catch(() => []),
         ]);
         const buyerIds = Array.from(new Set(recs.map((r) => r.buyerId)));
         const buyers = await getBuyersByIds(buyerIds);
@@ -61,6 +69,8 @@ export default function VendorDashboardPage() {
         setBuyersById(byId);
         setVendor(v);
         setEvents(auditEvents);
+        setInterestSeries(interest);
+        setOutreachCount(outreach.length);
         setEngagements(
           recs
             .filter((r) => byId[r.buyerId])
@@ -120,31 +130,39 @@ export default function VendorDashboardPage() {
         }
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard label="Active buyers" value={String(engagements.length)} icon={Users} index={0} />
         <StatCard label="Solutions generated" value={String(engagements.length)} icon={Sparkles} tone="accent" index={1} />
         <StatCard label="Open frontier items" value={String(openFrontier.length)} icon={FileSearch} tone="escalated" index={2} />
         <StatCard label="Avg. requirement fit" value={avgFit != null ? `${avgFit}%` : "—"} icon={TrendingUp} tone="verified" index={3} />
+        <StatCard label="Outreach sent" value={String(outreachCount)} icon={Mail} tone="brand" index={4} />
       </div>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-2">
-          <CardHeader className="flex-row items-center justify-between">
-            <CardTitle>Active buyer engagements</CardTitle>
-            <Link href="/vendor/buyers" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
-              View all
-            </Link>
+          <CardHeader>
+            <CardTitle>Buyer interest over time</CardTitle>
           </CardHeader>
-          <CardContent className="pt-4">
-            {engagements.length === 0 ? (
-              <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
-            ) : (
-              <div className="divide-y divide-border">
-                {engagements.slice(0, 6).map((e) => (
-                  <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
-                ))}
-              </div>
-            )}
+          <CardContent className="pt-2">
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={interestSeries} margin={{ top: 10, right: 8, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                  <XAxis dataKey="week" tick={{ fill: "var(--muted)", fontSize: 12 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
+                  <YAxis tick={{ fill: "var(--muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={32} allowDecimals={false} />
+                  <Tooltip
+                    contentStyle={{
+                      background: "var(--surface)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 10,
+                      fontSize: 12,
+                      color: "var(--foreground)",
+                    }}
+                  />
+                  <Bar dataKey="buyers" fill="var(--brand-500)" radius={[4, 4, 0, 0]} name="New buyers interested" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
           </CardContent>
         </Card>
 
@@ -157,6 +175,26 @@ export default function VendorDashboardPage() {
           </CardContent>
         </Card>
       </div>
+
+      <Card className="mt-6">
+        <CardHeader className="flex-row items-center justify-between">
+          <CardTitle>Active buyer engagements</CardTitle>
+          <Link href="/vendor/buyers" className="text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
+            View all
+          </Link>
+        </CardHeader>
+        <CardContent className="pt-4">
+          {engagements.length === 0 ? (
+            <p className="py-8 text-center text-sm text-muted">No buyers are exploring your solution yet.</p>
+          ) : (
+            <div className="divide-y divide-border">
+              {engagements.slice(0, 6).map((e) => (
+                <EngagementRow key={e.buyer.id} id={e.buyer.id} name={e.buyer.companyName} industry={e.buyer.industry} fitScore={e.fitScore} frontierOpen={e.frontierOpen} lastActive={e.buyer.createdAt} />
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card className="mt-6">
         <CardHeader className="flex-row items-center justify-between">

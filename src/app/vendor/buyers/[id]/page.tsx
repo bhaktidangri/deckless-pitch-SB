@@ -12,6 +12,7 @@ import { GapCard } from "@/components/shared/gap-card";
 import { MatchRow } from "@/components/shared/match-row";
 import { FrontierCard } from "@/components/shared/frontier-card";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
+import { EmailBuyerCard } from "@/components/shared/email-buyer-card";
 import {
   getBuyerById,
   getVendorById,
@@ -67,6 +68,7 @@ function toFrontierItem(f: VendorFrontierItemRow, buyerName: string, vendorName:
 }
 
 export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const vendorId = getStoredVendorId();
   const [buyer, setBuyer] = useState<LeadBuyerRow | null>(null);
   const [vendor, setVendor] = useState<VendorDetailRow | null>(null);
   const [gaps, setGaps] = useState<VendorSideGapRow[]>([]);
@@ -226,6 +228,16 @@ export default function VendorBuyerDetailPage({ params }: { params: Promise<{ id
               </div>
             </CardContent>
           </Card>
+
+          {vendorId && (
+            <EmailBuyerCard
+              vendorId={vendorId}
+              buyerId={buyer.id}
+              buyerCompanyName={buyer.companyName}
+              buyerEmail={buyer.email}
+              vendorCompanyName={vendor?.companyName ?? "Us"}
+            />
+          )}
 
           <Card>
             <CardHeader className="flex-row items-center justify-between">

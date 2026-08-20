@@ -98,3 +98,26 @@ export interface VendorProfile {
 export function updateVendorProfile(input: UpdateVendorProfileInput): Promise<VendorProfile> {
   return callAuthedFunction<VendorProfile>("update-vendor-profile", input);
 }
+
+export interface RecordVendorOutreachInput {
+  buyerId: string;
+  subject: string;
+  message: string;
+}
+
+export interface RecordedVendorOutreach {
+  logged: boolean;
+  id: string;
+  createdAt: string;
+  buyerEmail: string | null;
+  buyerContactName: string | null;
+  vendorCompanyName: string;
+}
+
+// Logs the outreach for the vendor's own tracking dashboard and returns the
+// buyer's contact email so the caller can open a mailto: link — this app has
+// no transactional email provider wired up, so actual sending happens
+// through the vendor's own email client, not a backend relay.
+export function recordVendorOutreach(input: RecordVendorOutreachInput): Promise<RecordedVendorOutreach> {
+  return callAuthedFunction<RecordedVendorOutreach>("record-vendor-outreach", input);
+}

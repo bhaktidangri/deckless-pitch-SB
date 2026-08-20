@@ -2,15 +2,24 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { CheckCircle2, Circle, Mail, Save } from "lucide-react";
+import { CheckCircle2, Circle, Mail, Save, Users, ArrowUpRight } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Avatar } from "@/components/ui/avatar";
 import { AgentWaitingState } from "@/components/shared/agent-waiting-state";
 import { useAuthSession } from "@/lib/hooks/use-auth-session";
-import { getVendorById, getVendorRecommendationsForVendor, countDraftCapabilities, type VendorDetailRow } from "@/lib/api/vendor-lookup";
+import {
+  getVendorById,
+  getVendorRecommendationsForVendor,
+  getBuyerVendorSelectionsForVendor,
+  getBuyersByIds,
+  countDraftCapabilities,
+  type VendorDetailRow,
+  type LeadBuyerRow,
+} from "@/lib/api/vendor-lookup";
 import { updateVendorProfile } from "@/lib/api/account";
 import { getStoredVendorId, setStoredVendorName } from "@/lib/vendor-session";
 import { cn } from "@/lib/utils";
@@ -37,6 +46,7 @@ export default function VendorProfilePage() {
 
   const [capabilityCount, setCapabilityCount] = useState(0);
   const [buyerCount, setBuyerCount] = useState(0);
+  const [interested, setInterested] = useState<{ buyer: LeadBuyerRow; fitScore: number | null }[]>([]);
 
   useEffect(() => {
     if (!vendorId) {
@@ -46,9 +56,10 @@ export default function VendorProfilePage() {
     let cancelled = false;
     async function load() {
       try {
-        const [v, recs, capCount] = await Promise.all([
+        const [v, recs, selections, capCount] = await Promise.all([
           getVendorById(vendorId!),
           getVendorRecommendationsForVendor(vendorId!),
+          getBuyerVendorSelectionsForVendor(vendorId!),
           countDraftCapabilities(vendorId!).catch(() => 0),
         ]);
         if (cancelled) return;
@@ -62,7 +73,18 @@ export default function VendorProfilePage() {
           setHq(v.hq ?? "");
           setEmployeeRange(v.employeeRange ?? "");
         }
-        setBuyerCount(recs.length);
+        // "Shown interest" = every buyer who either got a fit-scored
+        // recommendation for this vendor or actively selected it — the same
+        // two signals /vendor/buyers already treats as "exploring your
+        // solution", just rolled up to a headline count here.
+        const buyerIds = Array.from(new Set([...recs.map((r) => r.buyerId), ...selections.map((s) => s.buyerId)]));
+        const buyers = buyerIds.length > 0 ? await getBuyersByIds(buyerIds) : [];
+        if (cancelled) return;
+        const list = buyers
+          .map((buyer) => ({ buyer, fitScore: recs.find((r) => r.buyerId === buyer.id)?.fitScore ?? null }))
+          .sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
+        setInterested(list);
+        setBuyerCount(buyerIds.length);
         setCapabilityCount(capCount);
       } finally {
         if (!cancelled) setLoading(false);
@@ -226,6 +248,35 @@ export default function VendorProfilePage() {
               ))}
               <Link href="/vendor" className="mt-2 inline-block text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
                 View full dashboard
+              </Link>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Users className="h-4 w-4 text-brand-600 dark:text-brand-400" /> Buyer interest
+              </CardTitle>
+              <span className="text-lg font-bold text-foreground">{interested.length}</span>
+            </CardHeader>
+            <CardContent className="space-y-1 pt-2">
+              {interested.length === 0 ? (
+                <p className="py-2 text-sm text-muted">No buyers are exploring your solution yet.</p>
+              ) : (
+                interested.slice(0, 5).map(({ buyer, fitScore }) => (
+                  <Link
+                    key={buyer.id}
+                    href={`/vendor/buyers/${buyer.id}`}
+                    className="-mx-1 flex items-center gap-2.5 rounded-lg px-1 py-2 text-sm transition-colors hover:bg-surface-2"
+                  >
+                    <Avatar name={buyer.companyName} size="sm" />
+                    <span className="min-w-0 flex-1 truncate text-foreground">{buyer.companyName}</span>
+                    {fitScore != null && <span className="shrink-0 text-xs font-semibold text-brand-600 dark:text-brand-400">{fitScore}%</span>}
+                  </Link>
+                ))
+              )}
+              <Link href="/vendor/buyers" className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:underline dark:text-brand-400">
+                Reach out to buyers <ArrowUpRight className="h-3 w-3" />
               </Link>
             </CardContent>
           </Card>

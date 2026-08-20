@@ -3,9 +3,9 @@
 // into one flat feed for NotificationsMenu — replacing the previous static,
 // hardcoded 3-item fake array that was shown identically to every role.
 
-import { getCapabilityFrontierItems, getMeetingRequests, getBuyerWorkflowRunHistory } from "@/lib/api/buyer-lookup";
+import { getCapabilityFrontierItems, getMeetingRequests, getBuyerWorkflowRunHistory, getVendorOutreachEventsForBuyer } from "@/lib/api/buyer-lookup";
 import { getFrontierItemsForVendor, getMeetingRequestsForVendor } from "@/lib/api/vendor-frontier";
-import { getVendorRecommendationsForVendor, getBuyersByIds } from "@/lib/api/vendor-lookup";
+import { getVendorRecommendationsForVendor, getBuyersByIds, getAllVendors } from "@/lib/api/vendor-lookup";
 import { getAuditEvents, getRecentOrganizations } from "@/lib/api/admin-lookup";
 
 export interface NotificationItem {
@@ -21,13 +21,20 @@ function sortAndCap(items: NotificationItem[], limit: number): NotificationItem[
 }
 
 export async function getBuyerNotifications(buyerId: string): Promise<NotificationItem[]> {
-  const [frontier, meetings, runs] = await Promise.all([
+  const [frontier, meetings, runs, outreach] = await Promise.all([
     getCapabilityFrontierItems(buyerId).catch(() => []),
     getMeetingRequests(buyerId).catch(() => []),
     getBuyerWorkflowRunHistory(buyerId, 5).catch(() => []),
+    getVendorOutreachEventsForBuyer(buyerId).catch(() => []),
   ]);
 
+  const vendors = outreach.length > 0 ? await getAllVendors().catch(() => []) : [];
+  const vendorNameOf = (id: string) => vendors.find((v) => v.id === id)?.companyName ?? "A vendor";
+
   const items: NotificationItem[] = [];
+  for (const o of outreach) {
+    items.push({ id: `outreach-${o.id}`, tone: "brand", title: "A vendor reached out", detail: `${vendorNameOf(o.vendorId)}: ${o.subject ?? "New message"}`, time: o.createdAt });
+  }
   for (const f of frontier) {
     if (f.status === "vendor_review" || f.status === "vendor_answered" || f.status === "resolved") {
       items.push({

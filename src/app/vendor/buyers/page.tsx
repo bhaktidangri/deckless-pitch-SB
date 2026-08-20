@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight, FileSearch, Search } from "lucide-react";
+import { ArrowUpRight, FileSearch, Mail, Search } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -13,6 +13,7 @@ import {
   getVendorRecommendationsForVendor,
   getBuyerVendorSelectionsForVendor,
   getBuyersByIds,
+  getVendorOutreachEvents,
   type LeadBuyerRow,
 } from "@/lib/api/vendor-lookup";
 import { getFrontierItemsForVendor } from "@/lib/api/vendor-frontier";
@@ -24,6 +25,7 @@ interface BuyerEngagement {
   stage: string;
   fitScore: number | null;
   frontierOpen: number;
+  contacted: boolean;
 }
 
 export default function VendorBuyersPage() {
@@ -42,21 +44,23 @@ export default function VendorBuyersPage() {
     let cancelled = false;
     async function load() {
       try {
-        const [recs, selections, frontier] = await Promise.all([
+        const [recs, selections, frontier, outreach] = await Promise.all([
           getVendorRecommendationsForVendor(id!),
           getBuyerVendorSelectionsForVendor(id!),
           getFrontierItemsForVendor(id!),
+          getVendorOutreachEvents(id!).catch(() => []),
         ]);
         const buyerIds = Array.from(new Set([...recs.map((r) => r.buyerId), ...selections.map((s) => s.buyerId)]));
         const buyers = await getBuyersByIds(buyerIds);
         if (cancelled) return;
 
+        const contactedBuyerIds = new Set(outreach.map((o) => o.buyerId));
         const list: BuyerEngagement[] = buyers.map((buyer) => {
           const rec = recs.find((r) => r.buyerId === buyer.id);
           const selection = selections.find((s) => s.buyerId === buyer.id);
           const openFrontier = frontier.filter((f) => f.buyerId === buyer.id && (f.status === "open" || f.status === "vendor_review")).length;
           const stage = selection?.isActive ? "Solution Workspace" : selection ? "Vendor Selection" : "Discovery";
-          return { buyer, stage, fitScore: rec?.fitScore ?? null, frontierOpen: openFrontier };
+          return { buyer, stage, fitScore: rec?.fitScore ?? null, frontierOpen: openFrontier, contacted: contactedBuyerIds.has(buyer.id) };
         });
         list.sort((a, b) => (b.fitScore ?? 0) - (a.fitScore ?? 0));
         setEngagements(list);
@@ -113,6 +117,11 @@ export default function VendorBuyersPage() {
                   </div>
                   <div className="flex flex-wrap items-center gap-3 sm:gap-6">
                     <Badge variant="modelled">{e.stage}</Badge>
+                    {e.contacted && (
+                      <span className="flex items-center gap-1 text-xs font-medium text-verified">
+                        <Mail className="h-3.5 w-3.5" /> Contacted
+                      </span>
+                    )}
                     {e.frontierOpen > 0 && (
                       <span className="flex items-center gap-1 text-xs font-medium text-escalated">
                         <FileSearch className="h-3.5 w-3.5" /> {e.frontierOpen} open

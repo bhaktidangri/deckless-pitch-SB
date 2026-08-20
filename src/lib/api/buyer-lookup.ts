@@ -470,6 +470,32 @@ export async function getMeetingRequests(buyerId: string): Promise<MeetingReques
   }));
 }
 
+// ---- vendor_outreach_events (buyer-side: "a vendor emailed me") -----------
+// Same table vendor-lookup.ts's getVendorOutreachEvents reads scoped to a
+// vendor, filtered by buyer_id instead — feeds the buyer notification feed
+// so a buyer actually sees when a vendor reaches out, not just the vendor's
+// own outbox.
+
+export interface VendorOutreachEventForBuyerRow {
+  id: string;
+  vendorId: string;
+  subject: string | null;
+  createdAt: string;
+}
+
+export async function getVendorOutreachEventsForBuyer(buyerId: string): Promise<VendorOutreachEventForBuyerRow[]> {
+  const params = new URLSearchParams({
+    select: "id,vendor_id,subject,created_at",
+    buyer_id: `eq.${buyerId}`,
+    order: "created_at.desc",
+    limit: "10",
+  });
+  const rows = await restGet<{ id: string; vendor_id: string; subject: string | null; created_at: string }[]>(
+    `vendor_outreach_events?${params}`
+  );
+  return rows.map((r) => ({ id: r.id, vendorId: r.vendor_id, subject: r.subject, createdAt: r.created_at }));
+}
+
 // ---- buyer_solution_decks ---------------------------------------------------
 
 export interface BuyerSolutionDeckRow {

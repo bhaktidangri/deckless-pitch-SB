@@ -138,6 +138,7 @@ export interface LeadBuyerRow {
   companySize: number | null;
   contactName: string | null;
   contactRole: string | null;
+  email: string | null;
   createdAt: string;
 }
 
@@ -148,6 +149,7 @@ function mapBuyerRow(row: {
   company_size: number | null;
   contact_name: string | null;
   contact_role: string | null;
+  email: string | null;
   created_at: string;
 }): LeadBuyerRow {
   return {
@@ -157,11 +159,12 @@ function mapBuyerRow(row: {
     companySize: row.company_size,
     contactName: row.contact_name,
     contactRole: row.contact_role,
+    email: row.email,
     createdAt: row.created_at,
   };
 }
 
-const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,created_at";
+const BUYER_SELECT = "id,company_name,industry,company_size,contact_name,contact_role,email,created_at";
 
 // Batch lookup by id — used to resolve buyer names/industries for whichever
 // set of buyer_ids a vendor_recommendations/buyer_vendor_selections read
@@ -211,6 +214,32 @@ export async function getVendorRecommendationsForVendor(vendorId: string): Promi
     { id: string; buyer_id: string; fit_score: number | null; key_match: string | null; reason: string | null; confidence: number | null }[]
   >(`vendor_recommendations?${params}`);
   return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, fitScore: r.fit_score, keyMatch: r.key_match, reason: r.reason, confidence: r.confidence }));
+}
+
+// ---- interest-over-time (vendor dashboard trend chart) --------------------
+// Buckets vendor_recommendations.created_at by week, the same client-side
+// bucketing admin-lookup.ts's getPlatformActivitySeries already does for the
+// platform-wide chart — this is the vendor-scoped equivalent, showing how
+// many buyers started exploring this vendor's solution each week.
+
+export interface VendorInterestWeek {
+  week: string;
+  buyers: number;
+}
+
+export async function getVendorInterestSeries(vendorId: string, weeks = 6): Promise<VendorInterestWeek[]> {
+  const params = new URLSearchParams({ select: "created_at", vendor_id: `eq.${vendorId}`, order: "created_at.desc", limit: "500" });
+  const rows = await restGet<{ created_at: string }[]>(`vendor_recommendations?${params}`);
+  const timestamps = rows.map((r) => r.created_at);
+  const now = timestamps.length > 0 ? new Date(Math.max(...timestamps.map((t) => new Date(t).getTime()))) : new Date();
+  const buckets = new Array(weeks).fill(0);
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  for (const t of timestamps) {
+    const diff = now.getTime() - new Date(t).getTime();
+    const idx = weeks - 1 - Math.floor(diff / weekMs);
+    if (idx >= 0 && idx < weeks) buckets[idx] += 1;
+  }
+  return Array.from({ length: weeks }, (_, i) => ({ week: i === weeks - 1 ? "This wk" : `${weeks - 1 - i}w ago`, buyers: buckets[i] }));
 }
 
 // ---- buyer_vendor_selections (vendor-side: who actively picked us) --------
@@ -350,6 +379,33 @@ export async function getRealityProfileForBuyer(buyerId: string): Promise<Vendor
 // getFrontierItemsForVendor / getMeetingRequestsForVendor (vendor-frontier.ts)
 // already read these tables filtered by vendor_id only; these two add the
 // buyer_id filter for the vendor's per-buyer detail page.
+
+// ---- vendor_outreach_events (vendor-side: "who have we reached out to") --
+// Backs the "Email this buyer" flow's history panel and the vendor
+// dashboard's outreach stat/trend — logged by the record-vendor-outreach
+// edge function, read here the same public-anon-key way as every other
+// vendor-scoped table in this file.
+
+export interface VendorOutreachEventRow {
+  id: string;
+  buyerId: string;
+  channel: string;
+  subject: string | null;
+  message: string | null;
+  createdAt: string;
+}
+
+export async function getVendorOutreachEvents(vendorId: string): Promise<VendorOutreachEventRow[]> {
+  const params = new URLSearchParams({
+    select: "id,buyer_id,channel,subject,message,created_at",
+    vendor_id: `eq.${vendorId}`,
+    order: "created_at.desc",
+  });
+  const rows = await restGet<
+    { id: string; buyer_id: string; channel: string; subject: string | null; message: string | null; created_at: string }[]
+  >(`vendor_outreach_events?${params}`);
+  return rows.map((r) => ({ id: r.id, buyerId: r.buyer_id, channel: r.channel, subject: r.subject, message: r.message, createdAt: r.created_at }));
+}
 
 export async function getFrontierCountForVendor(vendorId: string): Promise<number> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error("Supabase is not configured.");
